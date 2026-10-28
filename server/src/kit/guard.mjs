@@ -297,6 +297,24 @@ function quietGrep(args) {
   }
   return false;
 }
+// A grep/rg whose pattern names a secret prints each matching line whole, and that line often carries the value
+// (`SECRET_X=hunter2`). Recursive, or fed by find/xargs, it prints those lines from every file it reaches.
+const SECRET_NAME_RE = /SECRET|TOKEN|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|AUTH|CRED|SERVICE_ROLE|API_KEY/i;
+function grepNamesSecret(prog, args) {
+  if (!GREP_PATTERN_PROGS.has(prog)) return false;
+  // -e/-f/--regexp/--file: any token may hold the pattern, so every token is checked.
+  if (args.some((a) => a === "--regexp" || a === "--file" || a.startsWith("--regexp=") || a.startsWith("--file=") || /^-[^-]*[ef]/.test(a))) {
+    return args.some((a) => SECRET_NAME_RE.test(a));
+  }
+  const rest = dropOptionValues(args, GREP_VALUE_OPTS);
+  const dd = rest.indexOf("--");
+  const at = dd >= 0 ? dd + 1 : rest.findIndex((a) => !a.startsWith("-"));
+  return at >= 0 && SECRET_NAME_RE.test(rest[at]);
+}
+function grepRecursive(prog, args) {
+  if (prog === "rg" || prog === "ag") return true; // both descend into directories by default
+  return args.some((a) => a === "--recursive" || a === "--dereference-recursive" || (/^-[^-]/.test(a) && /[rR]/.test(a)));
+}
 // readerBehind is gone: resolveCommand() (shell.mjs) already collapses xargs/parallel/find -exec
 // indirections AND every wrapper peel into the effective [program, args], so each rule just resolves
 // the segment once instead of routing through its own peel subset.
@@ -422,6 +440,9 @@ function ruleSecret(ctx) {
     const [prog, args] = resolveCommand(seg);
     if (prog === null) continue;
     if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
+    if (grepNamesSecret(prog, args) && (grepRecursive(prog, args) || ["xargs", "find", "parallel"].includes(bareProg) || (consumerFed ??= feedsConsumer(ctx)))) {
+      soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${prog}\` searches for a secret name across many files (recursive, or fed by find): matching lines carry their values`, suggestion: R1_SUGGESTION };
+    }
     // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)
     // or `-out -` (openssl's own convention for "write to stdout", not a file literally named "-") both
     // still print to the transcript.

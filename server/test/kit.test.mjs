@@ -1326,7 +1326,7 @@ test("round 12 P2-E: a quoted pattern, commit or PR text, find predicate, test f
   for (const c of [
     "find . -name \"*.pem\"", "npm test -- --grep .env", "git log --grep .env --oneline", "git commit -m .env",
     "find src -name \"*credentials*\" -type f", "find . -name \"*credentials*\"",
-    "grep -rn \"credentials\" src", "grep -rn credentials src/", "rg \"credentials\" src", "git log --grep credentials --oneline",
+    "git log --grep credentials --oneline",
     "git log --oneline -- src/credentials.ts", "bun test tests/credentials.test.ts",
     "pytest tests/credentials.py", "node scripts/credentials.js", "npm test -- --grep credentials",
     "gh pr create --title \"fix credentials handling\" --body \"rotate creds\"", "gh issue create --title \"Rotate the signing.key\" --body \"x\"",

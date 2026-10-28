@@ -461,8 +461,8 @@
  },
  {
   "command": "grep -r password src/ --include=*.ts",
-  "decision": "allow",
-  "rule": null
+  "decision": "ask",
+  "rule": "R1-secret-exposure"
  },
  {
   "command": "pacman -Q",

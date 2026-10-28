@@ -329,9 +329,9 @@
 {"id": "g279", "expected": "allow", "why": "round 11 negative: rm of a secret file deletes, does not print.", "input": {"command": "rm .env"}}
 {"id": "g280", "expected": "block", "why": "round 11 class: a private key copied out of ~/.ssh is still an id_ key.", "input": {"command": "cat backup/id_ed25519"}}
 {"id": "g281", "expected": "block", "why": "round 11 class: a suffixed private key name outside ~/.ssh.", "input": {"command": "cat ./id_rsa_work"}}
-{"id":"g282","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"credentials\" src"}}
-{"id":"g283","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn credentials src/"}}
-{"id":"g284","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"rg \"credentials\" src"}}
+{"id":"g282","expected":"ask","why":"round 14 RELABEL (was allow): recursive grep for a secret name now asks (P2-C rule; matching lines print values).","input":{"command":"grep -rn \"credentials\" src"}}
+{"id":"g283","expected":"ask","why":"round 14 RELABEL (was allow): recursive grep for a secret name now asks (P2-C rule; matching lines print values).","input":{"command":"grep -rn credentials src/"}}
+{"id":"g284","expected":"ask","why":"round 14 RELABEL (was allow): rg is recursive by default; a secret-name pattern now asks (P2-C rule).","input":{"command":"rg \"credentials\" src"}}
 {"id":"g285","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git log --grep credentials --oneline"}}
 {"id":"g286","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git log --oneline -- src/credentials.ts"}}
 {"id":"g287","expected":"ask","why":"round 13 P2-3: a bare credentials word operand (test filter) asks; round 12 had this as allow, which the reviewer flagged as wrongly allowed.","input":{"command":"npx vitest run credentials"}}
@@ -395,3 +395,16 @@
 {"id":"g345","expected":"ask","why":"round 13 P2-3: git add of a bare credentials path asks.","input":{"command":"git add credentials"}}
 {"id":"g346","expected":"block","why":"round 13: a bare-word ask must not shadow a later block in the same command.","input":{"command":"sort credentials; shred /dev/sda"}}
 {"id":"g347","expected":"block","why":"round 13: a bare-word ask must not shadow a later secret-store block in the same command.","input":{"command":"sort credentials && cat ~/.ssh/config"}}
+{"id":"g348","expected":"ask","why":"round 14 P2-C: recursive grep for a secret name prints matching values from every file.","input":{"command":"grep -rn SECRET_X ."}}
+{"id":"g349","expected":"ask","why":"round 14 P2-C: find-fed xargs grep for a secret name searches many files.","input":{"command":"find . -type f | xargs grep -n SECRET_X"}}
+{"id":"g350","expected":"ask","why":"round 14 P2-C: rg is recursive by default; a secret-name pattern asks.","input":{"command":"rg SECRET_X"}}
+{"id":"g351","expected":"ask","why":"round 14 P2-C: find -exec grep for a secret name searches many files.","input":{"command":"find . -exec grep -n SECRET_X {} \\;"}}
+{"id":"g352","expected":"ask","why":"round 14 P2-C: recursive grep of a home dir for an API_KEY name prints values.","input":{"command":"grep -R API_KEY ~"}}
+{"id":"g353","expected":"ask","why":"round 14 P2-C: case-insensitive recursive grep for a secret name prints values.","input":{"command":"grep -rni secret ."}}
+{"id":"g354","expected":"ask","why":"round 14 P2-C: explicit -e pattern is checked as a secret name under recursion.","input":{"command":"grep -rn -e SECRET_X ."}}
+{"id":"g355","expected":"ask","why":"round 14 P2-C: long --recursive flag counts as recursive.","input":{"command":"grep --recursive SECRET_X ."}}
+{"id":"g356","expected":"ask","why":"round 14 P2-C: a recursive credential-word grep asks (documented false positive on text).","input":{"command":"grep -rn \"credentials\" src"}}
+{"id":"g357","expected":"allow","why":"round 14: non-recursive single-file grep for a secret name is allowed.","input":{"command":"grep -n SECRET_X .env.example"}}
+{"id":"g358","expected":"allow","why":"round 14: names-only quiet form under recursion lists files, prints no values.","input":{"command":"grep -rln SECRET_X ."}}
+{"id":"g359","expected":"allow","why":"round 14: recursive text search with no secret-name pattern is allowed.","input":{"command":"grep -rn TODO ."}}
+{"id":"g360","expected":"block","why":"round 14: a recursive secret-name grep into a secret store still blocks.","input":{"command":"grep -rn SECRET_X ~/.ssh"}}

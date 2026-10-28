@@ -108,7 +108,7 @@ test("round 13 P2-3: a bare credential word ask yields to a later block in the s
   }
 });
 
-test("round 13 benign sweep: every row keeps the decision and rule it had at 42ac63f", async () => {
+test("round 13 benign sweep: every row keeps the decision and rule it had at 42ac63f, except the round-14 recursive name-grep ask", async () => {
   const rows = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "fixtures", "benign-sweep.json"), "utf8"));
   for (const row of rows) {
     const r = await guardCommand({ command: row.command, cwd: "/home/u/proj", tool: "Bash" }, noJev);
@@ -118,7 +118,7 @@ test("round 13 benign sweep: every row keeps the decision and rule it had at 42a
 });
 
 test("round 13 grep pattern is text: a secret-looking pattern allows, a secret file operand still blocks", async () => {
-  for (const cmd of ['grep -rn "e.key" src', 'grep -rn ".env" .', 'grep -rn "publicKey.pem" src', 'grep -rn "credentials" src']) {
+  for (const cmd of ['grep -rn "e.key" src', 'grep -rn ".env" .', 'grep -rn "publicKey.pem" src']) {
     const r = await guardCommand({ command: cmd, cwd: "/home/u/proj", tool: "Bash" }, noJev);
     assert.equal(r.decision, "allow", cmd);
   }
@@ -133,4 +133,41 @@ test("round 13 shell -c: the script is analyzed as its own commands, so a wrappe
   const read = await guardCommand({ command: "bash -c 'cat ~/.ssh/id_rsa'", cwd: "/home/u/proj", tool: "Bash" }, noJev);
   assert.equal(read.decision, "block");
   assert.equal(read.rule, "R1-secret-exposure");
+});
+
+test("round 14 P2-C: a recursive or find-fed grep for a secret name asks, and such a grep really prints the value", async () => {
+  const fx = fixtureHome();
+  const proj = join(fx, "proj");
+  writeFileSync(join(proj, "app.ts"), "const cfg = { SECRET_X: 'hunter2' }; // SECRET_X=hunter2\n");
+  // The leak is real: a recursive search for the name prints the value on the matching line.
+  assert.ok(run("grep -rn SECRET_X .", proj).includes("hunter2"));
+  const asks = [
+    "grep -rn SECRET_X .",
+    "find . -type f | xargs grep -n SECRET_X",
+    "grep -rn SECRET_X src/config/",
+    "rg SECRET_X",
+    "grep -R API_KEY ~",
+    "find . -exec grep -n SECRET_X {} \\;",
+    "grep -rni secret .",
+    "grep -rn -e SECRET_X .",
+    "grep -rnePRIVATE_KEY .",
+    "grep --recursive SECRET_X .",
+    "find . -name '*.ts' | grep -n SECRET_X",
+    "grep -n SECRET_X $(find . -name '*.env')",
+    'grep -rn "credentials" src',
+    'rg "credentials" src',
+  ];
+  for (const cmd of asks) {
+    const r = await guard(cmd, proj, fx);
+    assert.equal(r.decision, "ask", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+  // Non-recursive, names-only, and text searches stay allowed.
+  for (const cmd of ["grep -n SECRET_X src/app.ts", "grep -n SECRET_X .env.example", "grep -rln SECRET_X .", "grep -rn TODO ."]) {
+    const r = await guard(cmd, proj, fx);
+    assert.equal(r.decision, "allow", cmd);
+  }
+  // A secret store in the path still blocks; the ask does not weaken it.
+  const blocked = await guard(`grep -rn SECRET_X ${fx}/.ssh`, proj, fx);
+  assert.equal(blocked.decision, "block");
 });

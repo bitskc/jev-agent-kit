@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-397 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
+410 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
@@ -143,10 +143,18 @@ word, soft deferral, exfil-soft-as-block, dotenv basename, credentials chain, gr
 `--`-handling), and the `-c` exemption. Each revert fails at least one test; the unmutated tree passes. Corpus: guard 397 rows,
 99.0% accuracy, 98.2% catch-recall, 0.0% false-alarm rate (base 372 rows, 98.9%, 98.0%, 0.0%).
 
+Round 14 (PR #30 verdict comment 6481017991, reviewed at `1a4e992`) closes the one open P2 (P2-C). A recursive grep/rg whose pattern names a secret now asks, and so does a grep fed by find/xargs/parallel or a `find -exec`. "Recursive" means `-r`, `-R`, `--recursive`, `--dereference-recursive`, or rg/ag (recursive by default). The leak was real at base: `grep -rn SECRET_X .` printed `hunter2` from a fixture `.env`. The rule asks rather than blocks, because the pattern is an identifier and searching for a name is routine. Quiet forms (`-l`, `-c`, `-q`) and non-recursive single-file greps stay allowed. The `round 14 P2-C` case in `server/test/secret-tiers.test.mjs` fails at `1a4e992` and passes at HEAD (server 123/123; hooks 15/15; `tests/test-scripts.sh` 41/0). The benign sweep row `grep -r password src/ --include=*.ts` is the only sweep row whose decision changed (allow to ask); it is pinned in `fixtures/benign-sweep.json`. Mutation: eight single-point reverts of the new logic (loop rule, rg/ag recursion, find/xargs/parallel fed check, feedsConsumer, name regex, short `-r`/`-R`, `--recursive`, explicit `-e`/`-f`); each fails at least one test, and the unmutated tree has zero failures. Corpus: g348 to g360 added (9 ask, 3 allow, 1 block). Rows g282 to g284, my round-12 allow labels for recursive `credentials` greps, are relabeled allow to ask. These labels are self-authored, and the relabels follow the rule rather than an independent check. Offline guard: 410 rows, 99.0% accuracy, 98.3% catch-recall, 100.0% precision, 0.0% false-alarm rate. The four misses are the same Jev-scored rows as before (g55, g68, g69, r08).
+
+Known false positives, deliberate: the name match is case-insensitive, so `grep -rn author .` and `grep -rn tokenize src` ask (AUTH matches). `rg SECRET_X src/app.ts` asks because rg is always recursive. Bare `PRIVATE` is not in the name list (only `PRIVATE[_-]?KEY`), so `grep -rn PRIVATE .` allows; this is a known gap.
+
+Disclosed softening, from round 13: `jq . credentials` was `block` at the PR base (`main`) and at `42ac63f`, and became `ask` at `1a4e992` when the round-13 bare-credential-word rule landed. Neither the round-13 RESULTS entry nor the round-13 reply mentioned it. It remains `ask` at HEAD; reviewer acknowledgement is requested.
+
+Pre-existing verdict items, not fixed here, filed as issues: subshell `(cat .env)` (#72), glob `cat .*` (#73), indirection `xargs -a .env cat` (#74), `/proc/self/environ` (#75), `${!v}` (#76), `echo $DATABASE_URL` (#77), `cp .env /dev/stdout` (#78), `find ~/.ssh -print` over-block (#79), `user_request` TypeError at `guard.mjs:1652` (#80), and the P4 `.env.example/../.env` note (#81).
+
 
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 397 | 99.0% | 98.2% | 100.0% | **0.0%** |
+| guard | 410 | 99.0% | 98.3% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's
