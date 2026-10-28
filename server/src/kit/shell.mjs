@@ -155,6 +155,8 @@ const SUDO_SHORT_VALUE = new Set("ugpCUrtDRTh".split(""));
 const SUDO_LONG_VALUE = new Set(["--user", "--group", "--prompt", "--close-from", "--other-user", "--role",
   "--type", "--chdir", "--chroot", "--command-timeout", "--host", "--login-class"]);
 export const ELEVATED_PROGS = new Set(["sudo", "doas"]);
+// -c/--command as a script operand (flock/script/sg): the value IS a shell script, not argv.
+const SCRIPT_OPTS = new Set(["-c", "--command"]);
 const WRAPPER_SPECS = {
   env: { valueOpts: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
          spliceOpts: new Set(["-S", "--split-string"]), envAssignments: true },
@@ -194,14 +196,27 @@ const WRAPPER_SPECS = {
     "--rlimit-nofile", "--rlimit-nproc", "--rlimit-fsize", "--rlimit-sigpending", "--interface",
     "--veth-name", "--bridge", "--netmask", "--ip6", "--mtu", "--defaultgw", "--shell",
     "--protocol", "--chroot", "--overlay", "--whitelist", "--env"]) },
-  chroot: { valueOpts: new Set(["--userspec", "--groups"], ), operands: 1 },
+  chroot: { valueOpts: new Set(["--userspec", "--groups"]), operands: 1 },
+  flock: { valueOpts: new Set(["-w", "--timeout", "-E", "--conflict-exit-code"]), operands: 1, scriptOpts: SCRIPT_OPTS },
+  strace: { valueOpts: new Set(["-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-X"]) },
+  ltrace: { valueOpts: new Set(["-a", "-A", "-D", "-e", "-n", "-o", "-p", "-s", "-u"]) },
+  unbuffer: {},
+  "xvfb-run": { valueOpts: new Set(["-e", "-f", "-n", "-s", "-w", "--error-file", "--auth-file", "--server-num", "--server-args", "--wait"]) },
+  script: { valueOpts: new Set(["-E", "--echo", "-T", "--log-timing", "-I", "--log-in", "-O", "--log-out", "-B", "--log-io", "-m", "--logging-format"]), scriptOpts: SCRIPT_OPTS },
+  sg: { operands: 1, scriptOpts: SCRIPT_OPTS },
+  numactl: { valueOpts: new Set(["-N", "--cpunodebind", "-m", "--membind", "-C", "--physcpubind", "-i", "--interleave", "-p", "--preferred"]) },
+  prlimit: { valueOpts: new Set(["-p", "--pid"]) },
+  cgexec: { valueOpts: new Set(["-g"]) },
+  "dbus-run-session": { valueOpts: new Set(["--config-file"]) },
+  torsocks: { valueOpts: new Set(["-a", "-P"]) },
+  setarch: { operands: 1, flagsAfterOperands: true },
 };
 // Shell keywords and compound-syntax markers that precede the real command: `if true; then cat x; fi`,
 // `{ cat x; }`, `( cat x )`, `! cat x`, `case x in y) cat x;; esac`, `for v in a; do cat x; done`.
 // rdCommand historically knew a SUBSET of these and programOf knew none -- a rule routing through
 // programOf saw "if"/"{"/"!(" as the program and missed everything behind it.
 const KEYWORD_SKIP = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until",
-  "in", "esac", "select", "coproc", "{", "}", "!", "time"]);
+  "in", "esac", "select", "coproc", "{", "}", "!"]);
 const base = (p) => p.slice(p.lastIndexOf("/") + 1);
 const stripHeadMarks = (t) => t.replace(/^[({!]+/, "");
 const isCaseLabel = (t) => t.endsWith(")") && !t.includes("(");
@@ -242,23 +257,29 @@ export function peelCommand(toksIn, opts = {}) {
       toks = k >= 0 ? toks.slice(k + 1) : [];
       continue;
     }
+    if (t0 === "time") { let k = 1; while (k < toks.length && toks[k] === "-p") k++; toks = toks.slice(k); continue; }
     if (KEYWORD_SKIP.has(t0)) { toks = toks.slice(1); continue; }
     if (ASSIGN_RE.test(t0)) { toks = toks.slice(1); continue; }
     const prog = base(t0);
     if (stopAt && stopAt.has(prog)) return toks;
+    if (prog === "ip" && toks[1] === "netns" && toks[2] === "exec" && toks.length > 3) { toks = toks.slice(4); continue; }
     const spec = WRAPPER_SPECS[prog];
     if (!spec) return toks;
     if (spec.runuserStyle) {
       // runuser [opts] [-] [user] cmd...: the first bare positional is the user ONLY when a command
       // still follows it, never when it IS the command (`runuser -u root bash -c ...` already named
       // the user via -u).
+      // runuser -c/--command: the script IS the command. Hand the whole invocation to scriptOf (suScript)
+      // so its -c text is unwrapped exactly as su -c is; peeling past -c would lose the script.
+      const cmdOpt = (t) => t === "-c" || t === "--command" || t.startsWith("--command=") || (t.length > 2 && t.startsWith("-c") && !t.startsWith("--"));
       let i = 1;
       let namedUser = false;
       while (i < toks.length) {
         const t = toks[i];
+        if (cmdOpt(t)) return ["runuser", ...toks.slice(1)];
         if (t === "--") { i++; break; }
         if (!t.startsWith("-") || t === "-") break;
-        if (["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-c", "--command"].includes(t)) {
+        if (["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"].includes(t)) {
           if (t === "-u" || t === "--user") namedUser = true;
           i += 2;
           continue;
@@ -269,6 +290,7 @@ export function peelCommand(toksIn, opts = {}) {
       // The first bare positional is the USER only when -u/--user didn't already name one and a
       // command still follows it (`runuser bob ls` vs `runuser -u bob ls`).
       if (!namedUser && i < toks.length && i + 1 < toks.length && !toks[i].startsWith("-")) i++;
+      if (i < toks.length && cmdOpt(toks[i])) return ["runuser", ...toks.slice(1)];
       if (i < toks.length && toks[i] === "--") i++;
       toks = toks.slice(i);
       continue;
@@ -281,6 +303,12 @@ export function peelCommand(toksIn, opts = {}) {
         i++;
         if (spec.joinAfterDashDash) return toks.slice(i).length ? ["bash", ...toks.slice(i)] : [];
         break;
+      }
+      if (spec.scriptOpts) {
+        // script/sg/flock -c 'cmd': the option's value IS a shell script; hand it to bash -c so the
+        // script-unwrap canonicalization reads it exactly as an explicit bash -c.
+        if (spec.scriptOpts.has(t) && i + 1 < toks.length) return ["bash", "-c", toks[i + 1]];
+        if (t.startsWith("--command=")) return ["bash", "-c", t.slice("--command=".length)];
       }
       if (!t.startsWith("-") || t === "-") break;
       if (spec.envAssignments && ASSIGN_RE.test(t)) { i++; continue; }
@@ -326,6 +354,8 @@ export function peelCommand(toksIn, opts = {}) {
     }
     const operands = spec.operandsIfNoOpts && sawValueOpt ? 0 : (spec.operands || 0);
     i += operands;
+    if (spec.flagsAfterOperands) while (i < toks.length && toks[i].startsWith("-") && toks[i] !== "-") i++;
+    if (spec.scriptOpts && i + 1 < toks.length && spec.scriptOpts.has(toks[i])) return ["bash", "-c", toks[i + 1]];
     if (i >= toks.length) {
       // The wrapper IS the command (bare `env` dumps the environment, bare `xargs` echoes stdin):
       // surface it as the program with its own args, not as a resolved-nothing.
@@ -343,6 +373,59 @@ export function programOf(segment) {
   const toks = peelCommand(words(segment), { stopAt: ELEVATED_PROGS });
   if (!toks.length) return [null, []];
   return [base(toks[0]), toks.slice(1)];
+}
+
+// ── command-word folding (guard's expandedSegments only) ─────────────────────────────────────────
+// A command word that a literal-printing substitution or a literal-assigned variable builds --
+// `$(echo rm) -rf /`, `` `echo rm` -rf / ``, `r$(echo m) -rf /`, `x=rm; $x -rf /` -- folds to its
+// literal text before any rule reads the segment. Only the COMMAND word (past VAR=val prefixes,
+// keywords and declaration builtins) is folded; a value not provable from literal text in the same
+// script stays opaque (disclosed limit: runtime-computed values).
+const FOLD_SUBST_RE = /\$\(\s*(?:echo(?:\s+-[neE]+)*|printf)\s+([^\s()$`'"\\;&|<>%]+)\s*\)|`\s*(?:echo(?:\s+-[neE]+)*|printf)\s+([^\s()$`'"\\;&|<>%]+)\s*`/g;
+const FOLD_VAR_RE = /\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g;
+const FOLD_WORD_RE = /^(\s*[({!]*\s*)((?:\$\([^()]*\)|`[^`]*`|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|[^\s;&|()$`'"<>\\])+)/;
+const LITERAL_VALUE_RE = /^[^\s$`'"\\;&|<>()]*$/;
+const DECL_BUILTINS = new Set(["export", "local", "readonly", "declare", "typeset"]);
+
+function foldText(text, vars) {
+  return text.split(/('[^']*')/).map((piece, idx) => {
+    if (idx % 2 === 1) return piece; // single-quoted: never expanded
+    return piece
+      .replace(FOLD_SUBST_RE, (_m, a, b) => a ?? b)
+      .replace(FOLD_VAR_RE, (m, a, b) => (vars.has(a ?? b) ? vars.get(a ?? b) : m));
+  }).join("");
+}
+
+/** Fold the command word of each segment of ONE script, in order. `vars` tracks literal assignments made
+ *  by earlier segments of this same script; a reassignment to a non-literal (or one followed by a quote)
+ *  forgets the name. Callers fold each origin group (raw command, each unwrapped body, each heredoc) with
+ *  its own call so one group's variables never leak into another. */
+export function foldCommandWords(segments) {
+  const vars = new Map();
+  return segments.map((seg) => {
+    let out = "";
+    let rest = seg;
+    for (;;) {
+      const m = FOLD_WORD_RE.exec(rest);
+      if (!m) break;
+      const [whole, prefix, word] = m;
+      const after = rest.slice(whole.length);
+      out += prefix;
+      rest = after;
+      if (KEYWORD_SKIP.has(word) || DECL_BUILTINS.has(word)) { out += word; continue; }
+      if (ASSIGN_RE.test(word)) {
+        const eq = word.indexOf("=");
+        const name = word.slice(0, eq);
+        const value = foldText(word.slice(eq + 1), vars);
+        if (LITERAL_VALUE_RE.test(value) && !/^['"\\]/.test(after)) vars.set(name, value); else vars.delete(name);
+        out += word.slice(0, eq + 1) + value;
+        continue;
+      }
+      out += foldText(word, vars);
+      break; // the first real command word is folded; nothing after it is a command word
+    }
+    return out + rest;
+  });
 }
 
 // ── wrapper unwrap: bash -c/sh -c/eval/xargs/find -exec/su/ssh/..., shared by every rule ──────────────

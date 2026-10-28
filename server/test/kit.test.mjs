@@ -1093,6 +1093,41 @@ test("round 5 P1: quick wins — env -S, extra shells/interps, os.system literal
   }
 });
 
+// ── round 6 (PR #30 verdict F1-F3): command-word folding, runuser -c, wrapper coverage ─────────────
+test("round 6 F1: a command word built by a literal-printing substitution or a literal-assigned variable is folded before every rule", async () => {
+  for (const c of ["$(echo rm) -rf /", "`echo rm` -rf /", "r$(echo m) -rf /", "x=rm; $x -rf /", "$(echo /bin/rm) -rf /", "$(printf rm) -rf ~"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R7-root-delete", c);
+  }
+});
+test("round 6 F1 controls: folding leaves non-command words and ordinary $VAR uses alone", async () => {
+  for (const c of ["echo $(echo hi)", "ls $(echo src)", "x=hello; echo $x"]) assert.equal((await g(c)).decision, "allow", c);
+});
+test("round 6 F2: runuser -c/--command unwraps its script the way su -c does, wherever -c sits", async () => {
+  for (const c of ["runuser root -c 'rm -rf /'", "runuser -l root -c 'rm -rf /'", "runuser -c 'rm -rf /' root", "runuser root -c 'cat ~/.env'"]) {
+    assert.equal((await g(c)).decision, "block", c);
+  }
+  assert.equal((await g("runuser -u root -- ls")).decision, "allow");
+  assert.equal((await g("runuser -l root -c 'ls /tmp'")).decision, "allow");
+});
+test("round 6 F4: a runuser -c script with a recursive rm on an xargs placeholder asks; a relative runuser -c rm allows", async () => {
+  assert.equal((await g("echo x | xargs -I{} runuser -u root bash -c 'rm -rf {}'")).decision, "ask");
+  assert.equal((await g("echo x | xargs -I{} runuser root -c 'rm -rf {}'")).decision, "ask");
+  assert.equal((await g("runuser root -c 'rm -rf ./build'")).decision, "allow");
+});
+test("round 6 F3: wrappers that run their operand as the command are peeled, not taken as the program", async () => {
+  for (const c of [
+    "flock /tmp/l rm -rf /", "strace rm -rf /", "ltrace rm -rf /", "unbuffer rm -rf /", "xvfb-run rm -rf /",
+    "script -c 'rm -rf /' /dev/null", "sg root -c 'rm -rf /'", "ip netns exec ns rm -rf /", "numactl -N 0 rm -rf /",
+    "prlimit --nofile=1 rm -rf /", "cgexec -g cpu:x rm -rf /", "dbus-run-session rm -rf /", "setarch x86_64 rm -rf /",
+    "torsocks rm -rf /", "time -p rm -rf /",
+  ]) {
+    assert.equal((await g(c)).decision, "block", c);
+  }
+  for (const c of ["flock /tmp/l ls", "strace -o /tmp/t.log ls", "time -p ls"]) assert.equal((await g(c)).decision, "allow", c);
+});
+
 test("upstream resolution: gateway wins, then typesafe, then none; overrides", () => {
   assert.equal(resolveUpstream({}), null);
   let u = resolveUpstream({ TYPESAFE_API_KEY: "t" });

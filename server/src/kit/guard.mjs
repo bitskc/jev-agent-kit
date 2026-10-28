@@ -9,7 +9,7 @@
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
 import {
-  ASSIGN_RE, crontabCommands, expand, firstPositional, indirectInvokes, inputScripts, normalizePath,
+  ASSIGN_RE, crontabCommands, expand, firstPositional, foldCommandWords, indirectInvokes, inputScripts, normalizePath,
   programOf, redact, redactCap, resolveCommand, scriptOf, shellDashCScript, SHELL_WRAPPER_PROGS,
   interpScriptText,
   splitPipelines, splitSegments, stripHeredocs, stripRedirects, substLiteral, substitutedSegments,
@@ -1284,8 +1284,8 @@ export async function guardCommand(input, deps = {}) {
     segments: rawSegments,
     unwrappedScripts,
     inputScripts: inScripts,
-    expandedSegments: [...rawSegments, ...unwrappedScripts.flatMap((s) => splitSegments(stripHeredocs(s))),
-      ...inputBodies.flatMap((s) => splitSegments(stripHeredocs(s)))],
+    expandedSegments: [...foldCommandWords(rawSegments), ...unwrappedScripts.flatMap((s) => foldCommandWords(splitSegments(stripHeredocs(s)))),
+      ...inputBodies.flatMap((s) => foldCommandWords(splitSegments(stripHeredocs(s))))],
   };
   const out = {
     tool: "kit_guard_command", decision: "allow", score: 0, reason: "No rule matched: nothing here reaches outside the working tree or prints a secret.",
