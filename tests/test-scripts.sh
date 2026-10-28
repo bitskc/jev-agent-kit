@@ -28,6 +28,10 @@ ok "$([ -x "$H/.local/share/jev-agent-skills/hooks/honest/jev-honest-activate.js
 P="$tmp/My Project"; mkdir -p "$P"
 HOME=$H bash "$root/install.sh" --project "$P" >/dev/null
 ok "$([ -f "$P/.claude/skills/jev-honest/SKILL.md" ] && [ -f "$P/.omp/skills/jev-honest/SKILL.md" ] && echo yes)" yes "install: --project path with spaces"
+ok "$([ -f "$H/.local/share/jev-agent-skills/skills/jev-honest/SKILL.md" ] && echo yes)" yes "install: --project also populates \$share/skills for the honest hook's own lookup"
+actcfg="$tmp/actcfg"; mkdir -p "$actcfg"; printf 'standard\n' > "$actcfg/.jev-honest-active"
+actlen=$(CLAUDE_CONFIG_DIR="$actcfg" node "$H/.local/share/jev-agent-skills/hooks/honest/jev-honest-activate.js" | wc -c)
+ok "$([ "$actlen" -gt 3000 ] && echo yes)" yes "install: --project activate output is the real SKILL.md (len=$actlen), not the ~700-char fallback"
 
 # ── update.sh --timer: ExecStart quoting; --check on a missing release ─────────
 stub="$tmp/bin"; mkdir -p "$stub"

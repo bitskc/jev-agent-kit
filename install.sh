@@ -20,6 +20,11 @@ fi
 share="$HOME/.local/share/jev-agent-skills"; bin="$HOME/.local/bin"
 mkdir -p "$share" "$bin"
 rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py "$share"/hooks/honest/*.js
+# jev-honest-runtime.js resolves SKILL.md relative to its own install location ($share/hooks/honest/.. -> $share/skills)
+# first, falling back to ~/.claude/skills only if that's absent. Without this, --omp-only and --project installs
+# never populate $share/skills, so the honest hook silently falls back to a ~700-char hardcoded summary instead
+# of the real, level-filtered skill body.
+rm -rf "$share/skills" && cp -r "$here/skills" "$share/skills"
 install -m 755 "$here/scripts/jev-call.sh" "$bin/jev-call"
 install -m 755 "$here/update.sh" "$bin/jev-update"
 copy_skills() { mkdir -p "$1"; for d in "$here"/skills/*/; do n=$(basename "$d"); rm -rf "$1/$n"; cp -r "$d" "$1/$n"; done; echo "skills -> $1"; }
