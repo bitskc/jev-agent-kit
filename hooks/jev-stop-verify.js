@@ -46,8 +46,9 @@
 //           reply" in prose, so this is the same promise with a tool call behind it.
 //
 // Never blocks when this turn has no edits (nothing to verify or disclose; the gate reads only the edits since the
-// user's last real prompt) or when stop_hook_active is set (the
-// loop guard: never block the same stop twice). Fails open — allows the stop — on any error: a missing or
+// user's last real prompt; a Bash command that writes a project file counts as an edit). A stop that follows a block
+// (stop_hook_active) is re-verified, but at most MAX_CONSECUTIVE_BLOCKS blocks in a row: the next stop is allowed
+// unverified (loop bound, see decide()). Fails open — allows the stop — on any error: a missing or
 // malformed transcript, an unreachable/erroring/slow (>3s hard cap per MCP call) jev-mcp worker, or a
 // missing JEV_MCP_URL/JEV_MCP_TOKEN. Needs JEV_MCP_URL + JEV_MCP_TOKEN in the environment (same as the
 // guard hook).
@@ -59,6 +60,7 @@
 // even though outbound calls to a real external host work fine — confirmed while building this).
 'use strict';
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const rt = require('./honest/jev-honest-runtime.js');
 const { redact } = require('./jev-redact.js');
@@ -66,6 +68,31 @@ const crypto = require('crypto');
 // Edit-tool set, shared by both parsers. Must equal server/src/kit/verify.mjs MUTATING_TOOLS: the drift sentinel in
 // jev-stop-verify.test.mjs asserts that, so a tool added on one side cannot silently go unseen by the other.
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+
+// Bash commands that write a project file. Writes by tool name (EDIT_TOOLS) cannot see these, so a Bash write (sed -i,
+// a redirect into the repo, tee, cp/mv/rm, git apply) is checked separately here. Deliberately narrow: a read-only
+// command (npm test, git status, ls > /tmp/x) is not an edit. Targets under /tmp, /var/tmp, /dev or $TMPDIR are scratch.
+const SCRATCH_TARGET_RE = /^(?:\/tmp\/|\/var\/tmp\/|\/dev\/|\$TMPDIR|&)/;
+// Returns one label per project-file write found; empty means the command wrote nothing project-side.
+function bashWriteTargets(command) {
+  const labels = [];
+  for (const raw of String(command || '').split(/\|\||&&|[;|&\n]/)) {
+    const seg = raw.trim();
+    if (!seg) continue;
+    const bare = seg.replace(/'[^']*'|"[^"]*"/g, '""'); // quoted text is data, not a path or an operator
+    const label = 'bash: ' + seg.slice(0, 200);
+    const redirects = [...bare.matchAll(/(?<![<>\d=-])>>?\s*([^\s;&|)<>]*)/g)].map((m) => m[1]);
+    if (redirects.some((t) => t && !SCRATCH_TARGET_RE.test(t))) { labels.push(label); continue; }
+    if (/\bsed\b[^|]*?\s(?:-[A-Za-z]*i[A-Za-z]*(?:\.\S*)?|--in-place(?:=\S*)?)(?=\s|$)/.test(bare) || /\bperl\b[^|]*?\s-[a-z]*i[a-z]*(?=\s|$)/.test(bare)) { labels.push(label); continue; }
+    if (/^git\s+apply\b/.test(bare) && !/\s--(?:check|stat|summary|numstat)\b/.test(bare)) { labels.push(label); continue; }
+    const words = bare.replace(/^sudo\s+/, '').split(/\s+/);
+    if (/^(?:cp|mv|rm|dd|truncate|patch|install|tee)$/.test(words[0])) {
+      const args = words.slice(1).filter((a) => a && !a.startsWith('-'));
+      if (args.some((a) => !SCRATCH_TARGET_RE.test(a))) labels.push(label);
+    }
+  }
+  return labels;
+}
 
 // Hard cap: 3s per MCP call, regardless of JEV_GUARD_TIMEOUT (which may still set something *lower*, e.g.
 // for a CI pipeline that wants to fail open even faster). A malformed JEV_GUARD_TIMEOUT (unset, empty, or
@@ -142,7 +169,11 @@ function parseForVerify(lines) {
         if (c.type === 'tool_use') {
           callSeq += 1;
           if (EDIT_TOOLS.has(c.name)) { fileChanges += 1; lastEditCall = callSeq; }
-          if (c.name === 'Bash') bashCalls.push({ seq: callSeq, id: c.id, command: (c.input && c.input.command) || '' });
+          if (c.name === 'Bash') {
+            const command = (c.input && c.input.command) || '';
+            bashCalls.push({ seq: callSeq, id: c.id, command });
+            if (bashWriteTargets(command).length) { fileChanges += 1; lastEditCall = callSeq; }
+          }
         }
       }
     }
@@ -185,7 +216,12 @@ function parseForHonest(lines) {
           edits.push((c.input && (c.input.file_path || c.input.notebook_path)) || '(unknown file)');
           lastEditCall = callSeq;
         }
-        if (c.name === 'Bash') bashCalls.push({ seq: callSeq, id: c.id, command: (c.input && c.input.command) || '' });
+        if (c.name === 'Bash') {
+          const command = (c.input && c.input.command) || '';
+          bashCalls.push({ seq: callSeq, id: c.id, command });
+          const writes = bashWriteTargets(command);
+          if (writes.length) { edits.push(...writes); lastEditCall = callSeq; }
+        }
       }
     }
     if (d.type === 'user' && Array.isArray(content)) {
@@ -245,6 +281,13 @@ const TABLE_ROW_RE = /^\|.*\|$/;
 const TABLE_SEPARATOR_RE = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/;
 const FENCE_OPEN_RE = /^```[\w+.-]*$/;
 const FENCE_CLOSE_RE = /^```\s*$/;
+// A fence with a blank or prose info string (text, md, ...) whose body has no code-shaped line is prose and gets
+// judged. Anything else (a code language, or a code-shaped body) is code and stays skipped.
+const PROSE_FENCE_INFO = new Set(['', 'text', 'txt', 'md', 'markdown', 'plaintext', 'prose']);
+const CODE_SHAPED_RE = /[{};]|=>|\/\/|^\s*(\$|>|#!)\s|^\s{4,}|\t/;
+// A sentence ending in "?" is a question (not a claim) only when it opens like one.
+// "All tests pass and the build is clean, so it is ready to merge?" is a declarative claim.
+const QUESTION_START_RE = /^(?:should|shall|would|could|can|may|might|will|do|does|did|is|are|was|were|am|have|has|had|want|need|how|what|when|where|which|who|whom|whose|why)\b/i;
 // One non-table, non-fenced, non-blockquote-prefix line (or table cell) -> zero or more claim strings.
 function claimsFromSegment(rawSegment, shortOut) {
   let text = (rawSegment || '').trim();
@@ -267,8 +310,9 @@ function claimsFromSegment(rawSegment, shortOut) {
     // sentence is wrapped — "**All tests pass** and the build is clean." previously left a stray
     // trailing "**" because the old regex only anchored to the very start/end of the string.
     const s = sentence.replace(/\*\*|__/g, '').trim();
-    if (s.length < 10 || s.endsWith('?')) {
-      if (!s.endsWith('?') && /[A-Za-z0-9]/.test(s)) shortOut.push(s.slice(0, 500));
+    const isQuestion = s.endsWith('?') && QUESTION_START_RE.test(s);
+    if (s.length < 10 || isQuestion) {
+      if (!isQuestion && /[A-Za-z0-9]/.test(s)) shortOut.push(s.slice(0, 500));
       continue;
     }
     claims.push(s.slice(0, 500));
@@ -286,7 +330,16 @@ function splitClaims(message) {
     if (FENCE_OPEN_RE.test(line)) {
       let close = -1;
       for (let j = i + 1; j < lines.length && close < 0; j++) if (FENCE_CLOSE_RE.test(lines[j].trim())) close = j;
-      if (close >= 0) i = close;
+      if (close >= 0) {
+        const body = lines.slice(i + 1, close);
+        if (PROSE_FENCE_INFO.has(line.slice(3).trim()) && !body.some((b) => CODE_SHAPED_RE.test(b))) {
+          // Prose fence: splice its body in place of the fence and judge it like any other text.
+          lines.splice(i, close - i + 1, ...body);
+          i--;
+        } else {
+          i = close;
+        }
+      }
       continue;
     }
     if (!line) continue;
@@ -401,9 +454,50 @@ async function mcpCall(toolName, args, fetchImpl) {
 // transcript line can still shape-mismatch past the parsers' own null-guards in a way nothing anticipated),
 // so this wrapper is the hook's actual fail-open guarantee, not just the per-step note()+return-null calls
 // inside decideInner.
-async function decide(hookInput, opts) {
+const MAX_CONSECUTIVE_BLOCKS = 2;
+// Consecutive-block count for the loop bound, per session (transcript path, else session_id). Transient turn state
+// under the OS temp dir, not config. Any allowed stop clears it.
+function blockStatePath(hook) {
+  const key = crypto.createHash('sha1').update(String(hook.transcript_path || hook.session_id || 'anon')).digest('hex');
+  return path.join(os.tmpdir(), 'jev-stop-gate', key + '.json');
+}
+function readBlockCount(file) {
   try {
-    return await decideInner(hookInput, opts);
+    const n = JSON.parse(fs.readFileSync(file, 'utf8')).blocks;
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+// False when the count cannot be recorded. The caller then allows the stop: a block that cannot be counted could loop.
+function writeBlockCount(file, n) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ blocks: n }));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+function clearBlockCount(file) {
+  try { fs.unlinkSync(file); } catch (e) { /* no count recorded */ }
+}
+async function decide(hookInput, opts) {
+  const hook = hookInput || {};
+  try {
+    const stateFile = blockStatePath(hook);
+    // Loop bound (P1-B): a stop after a block is re-verified, up to MAX_CONSECUTIVE_BLOCKS blocks in a row. The stop
+    // after that is allowed without a check (the bounded residual; visible with JEV_GUARD_DEBUG=1).
+    const priorBlocks = hook.stop_hook_active ? readBlockCount(stateFile) : 0;
+    if (hook.stop_hook_active && priorBlocks >= MAX_CONSECUTIVE_BLOCKS) {
+      note('loop guard: ' + priorBlocks + ' consecutive blocks on this stop chain, allowing unverified');
+      clearBlockCount(stateFile);
+      return null;
+    }
+    const result = await decideInner(hook, opts);
+    if (!result) { clearBlockCount(stateFile); return null; }
+    if (!writeBlockCount(stateFile, priorBlocks + 1)) { note('block count unwritable, failing open'); return null; }
+    return result;
   } catch (e) {
     note('decide() threw, failing open: ' + (e && e.message));
     return null;
@@ -412,7 +506,6 @@ async function decide(hookInput, opts) {
 
 async function decideInner(hookInput, { fetchImpl } = {}) {
   const hook = hookInput || {};
-  if (hook.stop_hook_active) { note('loop guard: stop_hook_active, allowing'); return null; }
   // Explicit off (env or config) wins over everything, including the strict-level auto-engage below.
   if (rt.explicitStopGate() === 'off') { note('stop gate explicitly off'); return null; }
 
@@ -541,4 +634,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, EDIT_TOOLS };
+module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS };

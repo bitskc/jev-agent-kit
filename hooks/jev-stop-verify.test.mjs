@@ -144,13 +144,70 @@ test("timeout cap: a JEV_GUARD_TIMEOUT larger than 3s is still capped near 3s, n
   assert.ok(elapsed < 4000, `expected the hard 3s cap to apply despite JEV_GUARD_TIMEOUT=30, took ${elapsed}ms`);
 });
 
-test("loop guard: stop_hook_active never blocks and never calls the stub", async () => {
-  fresh(); setBaseEnv({ gate: "both" });
-  const { fetchImpl, calls } = stubFetch(() => { throw new Error("must not be called"); });
-  const transcript = writeTranscript(editedOneFile());
-  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed, all tests pass.", stop_hook_active: true }, { fetchImpl });
-  assert.equal(out, null);
-  assert.equal(calls.length, 0);
+test("loop guard (P1-B): a stop after a block is re-verified, then bounded: two consecutive blocks, then allowed", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(classifyAll("misrepresented"));
+  const msg = { transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." };
+  const first = await stopGate.decide({ ...msg }, { fetchImpl });
+  assert.equal(first && first.decision, "block");
+  const second = await stopGate.decide({ ...msg, stop_hook_active: true }, { fetchImpl });
+  assert.equal(second && second.decision, "block", "a stop after a block is re-verified, not skipped");
+  const callsBeforeThird = calls.length;
+  const third = await stopGate.decide({ ...msg, stop_hook_active: true }, { fetchImpl });
+  assert.equal(third, null, "the stop after two consecutive blocks is allowed");
+  assert.equal(calls.length, callsBeforeThird, "the capped stop makes no check");
+});
+
+test("loop guard (P1-B): a rewrite that now verifies clears the count; a later block is counted fresh", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const bad = stubFetch(classifyAll("misrepresented"));
+  const good = stubFetch(classifyAll("verified"));
+  const msg = { transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." };
+  const first = await stopGate.decide({ ...msg }, { fetchImpl: bad.fetchImpl });
+  assert.equal(first && first.decision, "block");
+  const cleared = await stopGate.decide({ ...msg, stop_hook_active: true }, { fetchImpl: good.fetchImpl });
+  assert.equal(cleared, null, "a rewrite that verifies is allowed");
+  const again = await stopGate.decide({ ...msg, stop_hook_active: true }, { fetchImpl: bad.fetchImpl });
+  assert.equal(again && again.decision, "block", "the count restarted after an allowed stop");
+});
+
+// ── PR #31 verdict 6478437376 regressions: P1-A (Bash writes), P2-C ('?' claims), P2-E (prose fences) ──
+test("NEW-8 (P1-A): a Bash write to a project file counts as an edit; the false claim is judged", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(classifyAll("misrepresented"));
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("t1", "Bash", { command: "sed -i 's/x/y/' src/parser.js" }), toolResult("t1", "")]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed the parser bug and all tests pass now." }, { fetchImpl });
+  assert.ok(calls.some((c) => c.name === "jev_classify"), "a Bash write must reach jev_classify");
+  assert.equal(out && out.decision, "block");
+});
+
+test("NEW-8 control: read-only and scratch-only Bash commands are not edits", async () => {
+  for (const command of ["npm test", "ls > /tmp/x", "npm test 2>&1 | tail -5", "echo ok > /dev/null", "tee /dev/null"]) {
+    fresh(); setBaseEnv({ gate: "honest" });
+    const { fetchImpl, calls } = stubFetch(() => { throw new Error("must not be called"); });
+    const transcript = writeTranscript([userPrompt("Check the build."), assistantToolUse("t1", "Bash", { command }), toolResult("t1", "ok")]);
+    const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+    assert.equal(out, null, command);
+    assert.equal(calls.length, 0, command);
+  }
+});
+
+test("NEW-8 unit: bashWriteTargets flags project-file writes and ignores reads and scratch output", () => {
+  const writes = ["sed -i 's/x/y/' src/parser.js", "perl -pi -e 's/a/b/' f.js", "cat > src/x.js <<'EOF'\nx\nEOF", "echo hi >> notes.md", "tee out.txt", "cp a b", "rm -f build/x", "git apply fix.patch", "npm test && sed --in-place 's/a/b/' f.js"];
+  const reads = ["npm test", "git status", "cat src/x.js", "ls > /tmp/x", "grep -n 'a > b' f.js", "git apply --check fix.patch", "perl -Mstrict -e 'print 1'"];
+  for (const c of writes) assert.ok(stopGate.bashWriteTargets(c).length > 0, `expected a write: ${JSON.stringify(c)}`);
+  for (const c of reads) assert.deepEqual(stopGate.bashWriteTargets(c), [], `expected no write: ${JSON.stringify(c)}`);
+});
+
+test("NEW-9 (P2-C): a declarative sentence ending in '?' is still a claim; a real question is not", () => {
+  assert.deepEqual(stopGate.splitClaims("All tests pass and the build is clean, so it is ready to merge?"), ["All tests pass and the build is clean, so it is ready to merge?"]);
+  for (const q of ["Should I run the tests again?", "Is the build clean?", "Want me to run the tests?"]) assert.deepEqual(stopGate.splitClaims(q), [], q);
+});
+
+test("NEW-10 (P2-E): prose in a text/unlabeled fence is judged; code-shaped or code-labelled fences stay skipped", () => {
+  assert.ok(stopGate.splitClaims("Status:\n```\nAll tests pass and the build is clean, ready to merge.\n```\nDone.").includes("All tests pass and the build is clean, ready to merge."));
+  assert.deepEqual(stopGate.splitClaims("```js\nAll tests pass and it is fixed.\n```"), []);
+  assert.deepEqual(stopGate.splitClaims("```\nfunction f() { return 1; }\n```"), []);
 });
 
 test("timeout: the server never responds, hook fails open within its own (overridden, short) cap", async () => {
