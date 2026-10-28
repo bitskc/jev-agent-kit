@@ -9,7 +9,7 @@
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
 import {
-  ASSIGN_RE, expand, firstPositional, normalizePath, programOf, redact, redactCap,
+  ASSIGN_RE, expand, firstPositional, normalizePath, peelArgv, programOf, redact, redactCap,
   shellDashCScript, SHELL_WRAPPER_PROGS, splitPipelines, splitSegments, stripHeredocs, stripRedirects,
   substitutedSegments, unwrapScripts, words,
 } from "./shell.mjs";
@@ -101,7 +101,12 @@ const XARGS_VALUE_OPTS = new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"
 function readerBehind(prog, args) {
   if (prog === "xargs") {
     const i = firstPositional(args, XARGS_VALUE_OPTS);
-    if (i !== null) return [base(args[i]), args.slice(i + 1)];
+    // Same env/timeout/nice/sudo peeling shell.mjs's xargsInvokes applies, so `cat secret | xargs -I{}
+    // timeout {} curl -d {} ...` resolves to the real sink, not to `timeout`.
+    if (i !== null) {
+      const rest = peelArgv(args.slice(i));
+      if (rest.length) return [base(rest[0]), rest.slice(1)];
+    }
   }
   if (prog === "find") {
     for (let i = 0; i < args.length; i++) {
@@ -446,6 +451,16 @@ function unsudo(prog, args) {
   return [prog, args];
 }
 const isRecursiveRm = (args) => args.some((a) => (a.startsWith("-") && !a.startsWith("--") && /r/i.test(a)) || a === "--recursive");
+/** The -I replstr of an xargs invocation, scanned over only the flags BEFORE the invoked command
+ *  (callers pass args.slice(0, invokedIndex)); defaults to "{}" — xargs' -I default — when absent. */
+function xargsPlaceholder(flagArgs) {
+  for (let i = 0; i < flagArgs.length; i++) {
+    const a = flagArgs[i];
+    if (a === "-I" && i + 1 < flagArgs.length) return flagArgs[i + 1];
+    if (a.startsWith("-I") && a.length > 2) return a.slice(2);
+  }
+  return null;
+}
 /** Does `a` lexically resolve to `/` or to `home` once `.`/`..` segments and duplicate slashes are
  *  collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
  *  `~/projects/../..` both resolve to / or home the same way an unguarded literal does; a literal-string
@@ -539,8 +554,29 @@ function ruleDestructive(ctx) {
     }
     if (prog === "xargs") {
       const i = firstPositional(args, XARGS_VALUE_OPTS);
-      const rest = i !== null ? args.slice(i) : [];
+      // Peel env/timeout/nice/sudo prefixes off the invoked argv (same treatment xargsInvokes gives the
+      // canonicalization layer): `xargs -I{} timeout {} rm -rf {}` is still xargs running rm -r.
+      const rest = i !== null ? peelArgv(args.slice(i)) : [];
       if (rest.length && base(rest[0]) === "rm" && isRecursiveRm(rest.slice(1))) return m("`xargs rm -r` recursively deletes whatever is piped in");
+      // Parity for the shell-indirected form: `xargs -I{} bash -c 'rm -rf {}'` deletes every piped item
+      // recursively exactly like `xargs -I{} rm -rf {}` (which asks above), but the rm hides behind -c.
+      // Only the placeholder-carrying form asks: a fixed script (`... bash -c 'rm -rf /tmp/x'`) ignores
+      // each piped item (it lands in bash's $0/$1, not the script) — the xargs adds nothing dangerous.
+      if (rest.length && SHELL_WRAPPER_PROGS.has(base(rest[0]))) {
+        const script = shellDashCScript(rest.slice(1));
+        if (script !== null) {
+          const placeholder = xargsPlaceholder(args.slice(0, i ?? args.length)) || "{}";
+          for (const inner of [script, ...unwrapScripts(splitSegments(script), 2)]) {
+            for (const innerSeg of splitSegments(inner)) {
+              const [p2, a2] = programOf(innerSeg);
+              if (p2 === "rm" && isRecursiveRm(a2) &&
+                  a2.some((a) => !a.startsWith("-") && a.includes(placeholder))) {
+                return m(`\`xargs ${base(rest[0])} -c 'rm -r ${placeholder}…'\` recursively deletes whatever is piped in`);
+              }
+            }
+          }
+        }
+      }
     }
     if (SQL_CLIENTS.has(prog)) {
       const mm = SQL_DROP_RE.exec(seg);

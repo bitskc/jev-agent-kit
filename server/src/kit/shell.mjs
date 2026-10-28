@@ -22,6 +22,10 @@ export function splitSegments(command) {
     const ch = s[i];
     if (quote) {
       buf.push(ch);
+      // `\"` inside a double-quoted run is an escaped quote, not a closer — the same rule words() and
+      // splitPipelines() apply. Without it, `bash -c "bash -c \"rm -rf /\""` shredded the inner -c's
+      // script at its \" boundary and every downstream rule saw mangled text.
+      if (ch === "\\" && quote === '"' && i + 1 < n) { buf.push(s[i + 1]); i += 2; continue; }
       if (ch === quote) quote = null;
       i++;
       continue;
@@ -64,6 +68,14 @@ export function words(segment) {
     const ch = s[i];
     if (quote) {
       if (ch === quote) { quote = null; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < n && '"\\$`'.includes(s[i + 1])) {
+        buf += s[i + 1]; i++; inWord = true; continue;
+      }
+      // Inside double quotes bash only unescapes \" \\ \$ \` (and \newline); every other backslash
+      // pair stays literal. Dequoting the four real escapes is what makes a nested -c script survive one
+      // more tokenization round as ONE token: `bash -c "bash -c \"echo hi\""` -> `bash -c "echo hi"`,
+      // exactly the script the inner bash would receive. Before this, `\"` inside a double-quoted run
+      // closed the quote early and shredded the nested script into several tokens.
       buf += ch; inWord = true;
       continue;
     }
@@ -158,13 +170,73 @@ export function shellDashCScript(args) {
   if (!hasC) return null;
   return args.slice(i).join(" ").trim().replace(/^['"]+|['"]+$/g, "");
 }
+// ── peeling env/timeout/nice/sudo/... off an argv (programOf's loop, as a reusable primitive) ──────────
+// sudo/doas only appear in xargs' invoked argv (programOf itself deliberately leaves them to callers'
+// unsudo, so the R5-sudo rule still sees `sudo` as the program). Value-taking short options inside a
+// bundled short-option run take the NEXT argv element only when they're the last char (sudo -u root);
+// an attached value (sudo -uroot) stays inside the same token.
+const SUDO_VALUE_SHORT = new Set("ugpCUrtDRTh".split(""));
+const SUDO_VALUE_LONG = new Set(["--user", "--group", "--prompt", "--close-from", "--other-user", "--role",
+  "--type", "--chdir", "--chroot", "--command-timeout", "--host"]);
+const DOAS_VALUE_OPTS = new Set(["-u", "-C"]);
+/** The same assignment/env/timeout/skip-prefix peeling programOf() applies to a segment's tokens, plus
+ *  sudo/doas, run on an already-tokenized argv — for resolving what an xargs/reader indirection actually
+ *  invokes (`xargs -I{} timeout {} bash -c 'rm -rf {}'` -> bash's -c script) where the caller holds argv,
+ *  not text. Iterates until no more prefixes peel. Returns the remaining argv (possibly empty). */
+export function peelArgv(toksIn) {
+  let toks = toksIn;
+  for (;;) {
+    if (!toks.length) return [];
+    if (ASSIGN_RE.test(toks[0])) { toks = toks.slice(1); continue; }
+    const head = base(toks[0]);
+    if (VALUE_WRAPPERS.has(head)) {
+      const rest = wrappedCommand(toks);
+      if (rest === null) return toks;
+      toks = rest;
+      continue;
+    }
+    if (head === "sudo" || head === "doas") {
+      let i = 1;
+      while (i < toks.length) {
+        const t = toks[i];
+        if (t === "--") { i++; break; }
+        if (!t.startsWith("-") || t.length < 2) break;
+        if (t.startsWith("--")) { i += SUDO_VALUE_LONG.has(t) ? 2 : 1; continue; }
+        i++;
+        for (let j = 1; j < t.length; j++) {
+          const valOpt = head === "sudo" ? SUDO_VALUE_SHORT.has(t[j]) : DOAS_VALUE_OPTS.has("-" + t[j]);
+          if (valOpt) { if (j === t.length - 1) i++; break; }
+        }
+      }
+      toks = toks.slice(i);
+      continue;
+    }
+    if (SKIP_PREFIX.has(toks[0])) {
+      toks = toks.slice(1);
+      while (toks.length && toks[0].startsWith("-")) {
+        const flag = toks[0];
+        toks = toks.slice(1);
+        if (["-n", "-p", "-o", "-e", "-i"].includes(flag) && toks.length && !toks[0].startsWith("-")) {
+          if (/^[+-]*\d+$/.test(toks[0])) toks = toks.slice(1);
+        }
+      }
+      continue;
+    }
+    return toks;
+  }
+}
 /** The real [program, args] a `xargs ...` invocation runs, same unwrap readerBehind() in guard.mjs already
  *  does for secret-read detection, duplicated here (guard.mjs can't be imported from shell.mjs) so the
- *  wrapper-expansion below also sees through `xargs -I{} bash -c 'rm -rf {}'`-style indirection. */
+ *  wrapper-expansion below also sees through `xargs -I{} bash -c 'rm -rf {}'`-style indirection. The
+ *  invoked argv gets the SAME prefix peeling a bare command line would (env/nice/timeout/sudo/...):
+ *  without it `xargs -I{} timeout {} bash -c 'rm -rf /'` resolved to `timeout` — not a shell wrapper —
+ *  and the -c script was never unwrapped. */
 function xargsInvokes(prog, args) {
   if (prog !== "xargs") return null;
   const i = firstPositional(args, XARGS_VALUE_OPTS);
-  return i === null ? null : [base(args[i]), args.slice(i + 1)];
+  if (i === null) return null;
+  const rest = peelArgv(args.slice(i));
+  return rest.length ? [base(rest[0]), rest.slice(1)] : null;
 }
 /** Every shell-script body reachable by peeling off a `bash -c`/`sh -c`/`eval`/`xargs ... <real command>`
  *  wrapper around any of `segments`, recursively, up to `maxDepth` levels -- raw, unsplit text, so a caller
@@ -384,7 +456,10 @@ export function splitPipelines(command) {
   const flushPipeline = () => { flushSeg(); if (segs.length) pipelines.push(segs); segs = []; };
   while (i < n) {
     const ch = s[i];
-    if (quote) { buf.push(ch); if (ch === quote) quote = null; i++; continue; }
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
+      buf.push(ch); if (ch === quote) quote = null; i++; continue;
+    }
     if (ch === "'" || ch === '"') { quote = ch; buf.push(ch); i++; continue; }
     if (ch === "\\" && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
     if (ch === ";" || ch === "\n") { flushPipeline(); i++; continue; }
