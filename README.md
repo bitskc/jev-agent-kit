@@ -172,7 +172,7 @@ curl -s -X POST "$JEV_MCP_URL" -H "authorization: Bearer $JEV_MCP_TOKEN" \
 ## Tests
 
 - `cd server && npm test` — offline, mocked Jev (guard rules, tier resolution, verify evidence rules).
-- `node --test hooks/honest/*.test.mjs` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file.
+- `node --test "hooks/honest/**/*.test.mjs"` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file.
 - `bash tests/test-scripts.sh` — `install.sh`, `update.sh --timer`, statusline badge, `jev-call` exit codes, with stubbed network.
 - `bash tests/test-hook.sh` — live guard hook against your worker (needs `JEV_MCP_URL` + `JEV_MCP_TOKEN`).
 
