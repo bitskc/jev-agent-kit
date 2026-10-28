@@ -1,6 +1,6 @@
 ---
 name: jev-issue-triage
-description: For a backlog sweep of many open issues (hundreds to thousands — rank, dedupe, or close already-done/stale items), batch-classify them with jev-mcp jev_classify into action buckets, then verify only the close-candidates against the repo before closing. Cheap first pass (~1.5k tokens per 64 issues) that tells you which issues deserve an agent look instead of reading every one.
+description: For a backlog sweep of many open issues (hundreds to thousands — rank, dedupe, or close already-done/stale items), batch-classify them with jev-mcp jev_classify into action buckets, then verify only the close-candidates against the repo before closing. Cheap first pass (~14k small-model tokens per batch of 64 short issues) that tells you which issues deserve an agent look instead of reading every one.
 ---
 
 # jev-issue-triage
@@ -49,7 +49,7 @@ Send title + labels + a short body excerpt (~200 chars; full bodies blow the bat
 
 - Batch ≤64 items per call. 1-2K issues ≈ 20-30 batches — script the loop, don't hand-feed it.
 - `context` matters: tell jev the repo name and that it can't see code, so "looks done" lands in `already_done_candidate` not `open_work`.
-- Tune `minimum_margin` up (~0.6) so anything borderline goes to `manual_review` instead of a confident wrong bucket.
+- Tune `minimum_margin` up (~0.6) so anything borderline comes back `decision: "review"` for you to read; it raises the auto bar, it does not move items into the `manual_review` class.
 
 ## Step 3: verify close-candidates, never auto-close
 
@@ -62,7 +62,7 @@ For every `already_done_candidate`, `duplicate_candidate`, `stale`:
 
 ## Step 4: rank what's left
 
-For the surviving `open_work` items, optionally score them against your priorities with `jev_decide` ("which of these top-N should be done first") or just sort by label/age — but ranking is a separate decision pass, don't fold it into the same classify call.
+For the surviving `open_work` items, optionally score them against your priorities with `jev_decide` (2-6 candidates per call: "which of these six should be done first") or `jev_rerank` (up to 250 candidates scored against one priority query) or just sort by label/age — but ranking is a separate decision pass, don't fold it into the same classify call.
 
 ## Hard rules
 

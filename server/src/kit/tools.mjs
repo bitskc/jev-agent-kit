@@ -70,7 +70,8 @@ export function registerKitTools(server, getEnv, opts = {}) {
       checks: z.array(strict({
         command: z.string().max(2000).describe("The check command that was run."),
         output: z.string().max(60000).optional().describe("Its output (runner summary is read from the tail)."),
-        passed: z.boolean().optional().describe("Override the detected pass/fail."),
+        exit_code: z.number().int().optional().describe("The check's exit status. 0 with no failure summary counts as passed; lets silent runners (tsc, lint) verify."),
+        passed: z.boolean().optional().describe("Override the detected pass/fail. Use only when the runner's output is unrecognised and exit_code is unavailable."),
       })).max(50).optional().describe("Checks run after the changes."),
       threshold: z.number().min(0.5).max(1).optional().describe(`P(claims done) needed to block. Default ${DEFAULT_THRESHOLD}.`),
     }),

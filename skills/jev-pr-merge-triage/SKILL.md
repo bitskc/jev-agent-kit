@@ -8,7 +8,7 @@ description: Before merging a PR (or spending an agent pass on "are the review c
 A PR's merge blockers are two different problems:
 
 1. **Status blockers** — deterministic facts: unresolved threads, outdated flags, failing required checks, missing approvals, merge conflicts. Query these; don't classify them.
-2. **Content blockers** — among the open threads, which ones say something that must actually be fixed? That is bounded judgement over supplied text, which is what `jev_classify` does for ~1-1.5k tokens a batch instead of a full agent read of every comment.
+2. **Content blockers** — among the open threads, which ones say something that must actually be fixed? That is bounded judgement over supplied text, which is what `jev_classify` does for a few thousand small-model tokens a batch (measured: 20 threads of ~450 chars = 4.6k input + 1.3k output) instead of a full agent read of every comment.
 
 Use this as a first pass when the PR has open review comments and you want to know "is anything here real work, or is it all noise/cosmetic/already-handled" before spawning a reviewer or replying thread-by-thread.
 

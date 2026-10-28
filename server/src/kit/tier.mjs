@@ -39,14 +39,30 @@ export function validLadder(l) {
   return true;
 }
 
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Loose containment that respects word edges: a name must sit between non-alphanumeric boundaries (or the
+ * string's ends), so "fable" doesn't match inside "fableforge" and "claude" doesn't match inside "notclaude".
+ * A hyphen/underscore-separated collision (e.g. "cloudflare-worker", a real Meta model "Llama-4-Scout") is an
+ * unavoidable false positive of a substring heuristic; it only ever pushes the verdict toward "over_tiered" or
+ * "under_tiered" (both logged, never both-ways-blocking: over can warn/block, under is always allow-only), so
+ * it stays in the safe direction rather than granting unearned trust.
+ */
+const wordMatch = (haystack, name) => new RegExp(`(?:^|[^a-z0-9])${escapeRegex(name)}(?:[^a-z0-9]|$)`).test(haystack);
+
 /** Resolve a free-form agent type or model string to a rung. */
 export function rungFor(chosen, ladder) {
   const t = (chosen || "").trim();
   for (const rung of ladder) if (rung.includes(t)) return { rung: rung[0], recognised: true };
   const low = t.toLowerCase();
-  // family-name containment, e.g. "claude-sonnet-4-5" -> sonnet's rung
+  // Specific family first, vendor prefix stripped: "claude-fable-5-1" -> fable, "claude-haiku-4-5" -> haiku's rung.
+  // Without this the generic "claude" alias (director) wins for every claude-* id, including fable.
+  const stripped = low.replace(/^(?:anthropic\/)?claude-/, "");
   for (const rung of ladder) {
-    for (const n of rung.slice(1)) if (n.length >= 4 && low.includes(n.toLowerCase())) return { rung: rung[0], recognised: true, via: "family" };
+    for (const n of rung) if (n.length >= 4 && n !== "claude" && wordMatch(stripped, n.toLowerCase())) return { rung: rung[0], recognised: true, via: "family" };
+  }
+  // generic family-name containment, e.g. "claude-3" -> director
+  for (const rung of ladder) {
+    for (const n of rung.slice(1)) if (n.length >= 4 && wordMatch(low, n.toLowerCase())) return { rung: rung[0], recognised: true, via: "family" };
   }
   if (DIRECTOR_PREFIXES.some((p) => t.startsWith(p))) return { rung: ladder[Math.max(0, ladder.length - UNKNOWN_RUNG_FROM_TOP)][0], recognised: true };
   return { rung: ladder[Math.max(0, ladder.length - UNKNOWN_RUNG_FROM_TOP)][0], recognised: false };

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "jev-agent-kit",
+  "description": "The decision layer your coding agent is missing: command guard, dispatch sizing, verify-before-done, triage, and Honest Jev.",
+  "owner": { "name": "bitskc / Andy Hayes", "url": "https://github.com/bitskc" },
+  "plugins": [
+    {
+      "name": "jev-agent-kit",
+      "description": "Jev MCP skills + hooks: guard risky commands, right-size sub-agents, verify before done, triage PRs/issues, Honest Jev claims check.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

@@ -131,6 +131,111 @@ test("checkSummary", () => {
   assert.equal(checkSummary("Tests: 2 failed, 8 passed, 10 total"), "fail");
   assert.equal(checkSummary("test result: ok. 5 passed"), "pass");
 });
+test("checkSummary: mocha and npm lifecycle failures are recognised", () => {
+  assert.equal(checkSummary("  5 passing (40ms)\n  2 failing\n\nnpm ERR! Test failed."), "fail");
+  assert.equal(checkSummary("  12 passing (90ms)\n"), "pass");
+  assert.equal(checkSummary("npm ERR! code ELIFECYCLE\nnpm ERR! errno 1"), "fail");
+});
+test("checkSummary: a fail signal after an early 'passing' line still reports fail (ordering regression)", () => {
+  // mocha's run passed but a later lifecycle step in the same combined command failed.
+  assert.equal(checkSummary("12 passing (3s)\nnpm ERR! code ELIFECYCLE\nnpm ERR! Test failed."), "fail");
+  // a combined build+test command: tests passed, the build step after them did not.
+  assert.equal(checkSummary("5 passing (1s)\nsrc/foo.ts(10,5): error TS2345: argument of type"), "fail");
+});
+test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
+  const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },
+    outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });
+  // bare command name, no output: not evidence
+  let r = await verifyDone({ file_changes: 2, final_message: "Fixed, all tests pass", checks: [{ command: "npm test" }] }, j);
+  assert.equal(r.verified, false); assert.equal(r.evidence.fresh_checks[0].passed, false); assert.match(r.notes.join(" "), /exit_code/);
+  // unrecognised output on a check command: still not evidence
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npm test", output: "something unparseable" }] }, j);
+  assert.equal(r.verified, false);
+  // exit_code 0 with silent runner (tsc): verified
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npx tsc --noEmit", output: "", exit_code: 0 }] }, j);
+  assert.equal(r.verified, true);
+  // exit_code 0 but output shows a failure: failure wins
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npm test", output: "  2 failing", exit_code: 0 }] }, j);
+  assert.equal(r.verified, false);
+  // non-check command with no evidence is ignored, not counted either way
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "ls -la" }] }, j);
+  assert.equal(r.evidence.fresh_checks.length, 0);
+});
+test("verify_done supplied checks: a non-check command never verifies, even with exit_code 0 or a fabricated pass summary", async () => {
+  // P0: exit_code/summary branches must require CHECK_COMMAND, or any command can claim victory by attaching exit_code: 0.
+  let r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "cd /tmp", exit_code: 0 }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "cd /tmp", output: "12 passing" }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "ls -la", exit_code: 0 }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  // a real check command still verifies on its own merits
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 0 }] });
+  assert.equal(r.verified, true);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 1 }] });
+  assert.notEqual(r.verified, true);
+});
+test("rungFor: claude-* ids resolve to their own family, not the generic director alias", async () => {
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-fable-5-1" }, noJev)).chosen.tier, "fable");
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-haiku-4-5" }, noJev)).chosen.tier, "scout");
+  assert.equal((await sizeDispatch({ description: "x", model: "anthropic/claude-opus-4" }, noJev)).chosen.tier, "director");
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-3" }, noJev)).chosen.tier, "director");
+  const unknown = await sizeDispatch({ description: "x", model: "llama-9" }, noJev);
+  assert.equal(unknown.chosen.tier, "director"); assert.equal(unknown.chosen.recognised, false);
+});
+test("rungFor: a family name embedded in a longer word is not a false-positive match", async () => {
+  // "fable" inside "fableforge" and "claude" inside "notclaude" must not match: these are not
+  // the jev-family models, and a substring match here would misattribute a tier by accident.
+  const fableforge = await sizeDispatch({ description: "x", model: "my-fableforge-9b" }, noJev);
+  assert.equal(fableforge.chosen.tier, "director"); assert.equal(fableforge.chosen.recognised, false);
+  const notclaude = await sizeDispatch({ description: "x", model: "notclaude-cheap-7b" }, noJev);
+  assert.equal(notclaude.chosen.tier, "director"); assert.equal(notclaude.chosen.recognised, false);
+  // a real model whose name is itself hyphen-bounded "Scout" (Meta's Llama-4-Scout) still resolves
+  // via the family heuristic; this is the unavoidable floor of a substring match and is documented.
+  assert.equal((await sizeDispatch({ description: "x", model: "Llama-4-Scout-17B-16E" }, noJev)).chosen.tier, "scout");
+});
+test("redact: name-based keys, quoted passphrases, CLI option values and aws secrets never reach upstream", async () => {
+  const { redact } = await import("../src/kit/shell.mjs");
+  const leaks = [
+    ["export ENCRYPTION_KEY=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "9f86d081"],
+    ['PASSWORD="correct horse battery staple"', "horse"],
+    ["curl -u admin:Tr0ub4dor https://api.internal/v1", "Tr0ub4dor"],
+    ["aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUt"],
+    ["mysql -u root --password hunter2hunter2", "hunter2"],
+    ["MY_DEPLOY_KEY=abc123 ./deploy.sh", "abc123"],
+    ["mysql -h db -p sup3rsecret", "sup3rsecret"],
+  ];
+  for (const [input, secret] of leaks) assert.ok(!redact(input).includes(secret), `leaked: ${redact(input)}`);
+  const benignCommands = [
+    "ls -la src/key_store.rs", 'git commit -m "release: bump version"', "echo $HOME/.ssh",
+    "mkdir -p DIR", "cp -p src dst", "scp -p file.txt host:/tmp", "ssh -p 22 user@host",
+    "docker run -p 8080:80 image", "sort -u file.txt", "git push -u origin main", "psql -p 5432 -U app",
+  ];
+  for (const benign of benignCommands) assert.equal(redact(benign), benign);
+  assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).rule, "R9-commit-secret");
+});
+test("guardCommand R9: kebab-case text starting 'sk-' is not an OpenAI key; a real one still blocks", async () => {
+  const falsePositives = [
+    'git commit -m "style: sk-three-bounce-animation-timing"',
+    'git commit -m "add sk-SK-translations-for-settings-page"',
+    'git commit -m "rename sk-component-library-theme-tokens"',
+    'git commit -m "docs: sk-accessibility-guidelines-update"',
+  ];
+  for (const c of falsePositives) assert.notEqual((await g(c)).decision, "block", `false-blocked: ${c}`);
+  assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).decision, "block");
+  assert.equal((await g('git commit -m "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789"')).decision, "block");
+  assert.equal((await g('git commit -m "key is sk-aBcD1234567890aBcD1234567890"')).decision, "block");
+});
+test("redact: a cap-sized (20000 char) hyphenated command never goes quadratic", async () => {
+  // the name-based and URL-credential rules had unbounded [a-z0-9_-]*/[a-z0-9+.-]* quantifiers that could
+  // catastrophically backtrack on a long run of name-like characters with no real match (549ms observed pre-fix).
+  const { redact } = await import("../src/kit/shell.mjs");
+  const payload = "a-b-c-d-e-f-g-h-".repeat(1250); // 20000 chars: the server's own command input cap
+  const t0 = Date.now();
+  redact(payload);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 100, `redact took ${ms}ms on a 20000-char input, expected well under 100ms`);
+});
 const jl = (...l) => l.map((x) => JSON.stringify(x)).join("\n");
 const turn = (extra) => jl(
   { type: "user", message: { content: "fix the bug" } },
@@ -186,4 +291,14 @@ test("askUpstream hits {base}/v1/systemone with bearer and TypeSafe shapes", asy
   assert.equal(r.answers.q.noul, 0.9); assert.equal(r.upstream, "vercel-ai-gateway");
   const bad = async () => ({ ok: false, status: 402, text: async () => "no credits secret-body" });
   await assert.rejects(askUpstream(up, {}, { q: {} }, { fetchImpl: bad }), (e) => /HTTP 402/.test(e.message) && !/secret-body|gk/.test(e.message));
+});
+test("guard.mjs firstBlockingHit: url_credentials scheme must not go quadratic, and still matches a real credential", async () => {
+  const { firstBlockingHit } = await import("../src/kit/guard.mjs");
+  const payload = "a-".repeat(9975); // ~20000 chars, the server's own command input cap
+  const t0 = Date.now();
+  firstBlockingHit(payload);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 50, `firstBlockingHit took ${ms}ms on a 20000-char input, expected well under 50ms`);
+  const hit = firstBlockingHit("creds: postgres://admin:s3cr3tPassw0rd@db.internal:5432/app");
+  assert.equal(hit && hit.kind, "url_credentials");
 });

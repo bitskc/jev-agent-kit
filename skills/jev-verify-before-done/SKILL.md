@@ -19,11 +19,11 @@ Tool: `kit_verify_done` on the `jev` MCP server (Claude Code: `mcp__jev__kit_ver
   "final_message": "your draft final message",
   "file_changes": 3,
   "checks": [
-    {"command": "npm test", "output": "<last ~50 lines of real output>"}
+    {"command": "npm test", "output": "<last ~50 lines of real output>", "exit_code": 0}
   ]
 }
 ```
-- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command` + the output tail. **Paste real output — a bare command name is not evidence.** The tool auto-detects pass/fail from recognised runner summaries (Jest/pytest/cargo/go/vitest/bun/eslint/tsc/build banners); **a check command it can't parse counts as passed** — `npm test` failing with `2 failing` and no recognised summary still verifies. The only hard evidence is a recognised pass banner or an explicit `passed:true`, so paste output the tool can read and never set `passed:true` to assert a run the output doesn't show.
+- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command`, the output tail, and `exit_code`. A check counts as passed only on hard evidence: a recognised runner summary (node:test, Jest, pytest, cargo, go, vitest, bun, mocha, mix, dotnet, Maven/Gradle, eslint, tsc) reporting no failures, or `exit_code: 0` with no failure in the output. **A bare command name, or output the tool can't parse with no `exit_code`, is not evidence** — it stays in `checks` as unproven and never verifies, and the response `notes` tell you so. `exit_code` is what lets silent runners (`tsc --noEmit`, lint) verify. `passed: true` overrides detection; use it only when both the output and the exit code are unavailable, and only for a run that happened.
 - Optional `threshold` (0.5-1, default 0.75): how sure the server must be that you claim done before it blocks.
 
 ## Act on the result

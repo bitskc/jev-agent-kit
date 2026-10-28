@@ -230,8 +230,18 @@ const SECRET_RULES = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, REDACTED],
   [/(authorization\s*[:=]\s*)(?:basic|bearer|token)?\s*\S+/gi, `$1${REDACTED}`],
   [/\b(bearer\s+)[\w.-]{16,}/gi, `$1${REDACTED}`],
-  [/((?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key|passw(?:or)?d|passphrase|token|secret|credentials?)[a-z0-9_-]*["']?\s*[=:]\s*["']?)([^\s"'&;]+)/gi, `$1${REDACTED}`],
-  [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]*:[^\s/@]+@/gi, `$1${REDACTED}@`],
+  // name-based: anything ending in key/pass/pwd/auth/cookie/session/signature/token/secret, plus the classic words;
+  // a quoted value runs to the closing quote (multi-word passphrases), an unquoted one to the next delimiter.
+  [/((?:\b[a-z0-9_-]{0,64}(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key|passw(?:or)?d|passphrase|credentials?|_key|_pass|_pwd|_auth|_cookie|_session|_signature|token|secret)[a-z0-9_-]{0,64})["']?\s*[=:]\s*)("([^"]*)"|'([^']*)'|[^\s"'&;]+)/gi, `$1${REDACTED}`],
+  // CLI option values, scoped to avoid eating -p/-u on unrelated programs (mkdir -p, cp -p, scp -p, ssh -p,
+  // docker -p, sort -u, git push -u, psql/redis-cli -p are a port or a flag, not a secret):
+  // --password x, --token x, --api-key x, --secret x, --auth x (any program); -u/--user only for a user:pass shape;
+  // -p as a password only for the few CLIs where -p truly means password (mysql family, mongosh, sshpass, smbclient).
+  [/((?:^|\s)(?:--password|--passwd|--token|--api-key|--secret|--auth)\s+)(\S+)/gi, `$1${REDACTED}`],
+  [/((?:^|\s)(?:-u|--user|--username)\s+)(\S+:\S+)/gi, `$1${REDACTED}`],
+  [/(\b(?:mysql|mariadb|mysqldump|mongosh|sshpass|smbclient)\b[^|;&\n]*?\s-p\s*)(\S+)/gi, `$1${REDACTED}`],
+  [/((?:aws_)?secret_access_key\s+)(\S+)/gi, `$1${REDACTED}`],
+  [/\b([a-z][a-z0-9+.-]{0,63}:\/\/)[^\s/@:]*:[^\s/@]+@/gi, `$1${REDACTED}@`],
   [/\bsk-[A-Za-z0-9_-]{8,}/g, REDACTED],
   [/\bapikey_[A-Za-z0-9_]+/g, REDACTED],
   [/\b[sr]k_(?:live|test)_[A-Za-z0-9]{10,}/g, REDACTED],

@@ -228,7 +228,9 @@ export const R7_SUGGESTION = "Hard to reverse: ask first unless the human alread
 const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3", "sqlcmd", "duckdb", "clickhouse-client", "cockroach", "mongosh", "mongo"]);
 const SQL_DROP_RE = /\bDROP\s+(DATABASE|SCHEMA|TABLE)\b/i;
 const DD_HARMLESS = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/fd/"];
-const PIPE_TO_SHELL_RE = /\b(curl|wget)\b[^|;&\n]*\|\s*(?:(?:\S*\/)?sudo\s+(?:-[A-Za-z]*[ugpCUrtDRTh]\s+\S+\s+|--(?:user|group)\s+\S+\s+|-\S+\s+)*)?(?:(?:\S*\/)?env\s+)?(?:\S*\/)?(?:ba|z|da|k)?sh\b(?:\s+-[^\s-]\S*)*\s*(?:--?(?:\s|$)|$|[;&|\n)])/;
+// sudo option group: a value-taking flag's value may not itself start with "-", so "-u -u -u ..." has one parse
+// (each "-u" is the bare-flag branch) instead of Fib(n) — the ambiguity was a catastrophic-backtracking DoS.
+const PIPE_TO_SHELL_RE = /\b(curl|wget)\b[^|;&\n]*\|\s*(?:(?:\S*\/)?sudo\s+(?:-[A-Za-z]*[ugpCUrtDRTh]\s+(?!-)\S+\s+|--(?:user|group)\s+(?!-)\S+\s+|-\S+\s+)*)?(?:(?:\S*\/)?env\s+)?(?:\S*\/)?(?:ba|z|da|k)?sh\b(?:\s+-[^\s-]\S*)*\s*(?:--?(?:\s|$)|$|[;&|\n)])/;
 const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env", "--super-prefix"]);
 const REDIS_VALUE_OPTS = new Set(["-h", "-p", "-s", "-a", "-u", "-n", "-r", "-i", "-d", "--user", "--pass",
   "--sni", "--cacert", "--cacertdir", "--cert", "--key", "--tls-ciphers", "--tls-ciphersuites", "--pattern",
@@ -472,7 +474,7 @@ const HIGH_PRECISION = [
   ["github_pat", new RegExp(LEFT + "github_pat_[A-Za-z0-9_]{20,}")],
   ["github_token", new RegExp(LEFT + "gh[pousr]_[A-Za-z0-9]{20,}")],
   ["anthropic_key", new RegExp(LEFT + "sk-ant-[A-Za-z0-9_\\-]{20,}")],
-  ["openai_key", new RegExp(LEFT + "sk-[A-Za-z0-9]{20,}")],
+  ["openai_key", new RegExp(LEFT + "sk-(?:(?:proj|svcacct)-[A-Za-z0-9_\\-]{20,}|[A-Za-z0-9]{20,})")],
   ["slack_token", new RegExp(LEFT + "xox[baprs]-[A-Za-z0-9-]{10,}")],
   ["google_api_key", new RegExp(LEFT + "AIza[0-9A-Za-z_\\-]{35}")],
   ["gitlab_token", new RegExp(LEFT + "glpat-[\\w-]{20}")],
@@ -480,7 +482,7 @@ const HIGH_PRECISION = [
   ["npm_token", new RegExp(LEFT + "npm_[A-Za-z0-9]{36}")],
   ["private_key", /-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/],
   ["jwt", new RegExp(LEFT + "eyJ[\\w-]{10,}\\.eyJ")],
-  ["url_credentials", new RegExp(LEFT + "\\w[\\w+.-]*://[^/\\s:@]+:[^/\\s:@]+@")],
+  ["url_credentials", new RegExp(LEFT + "\\w[\\w+.-]{0,255}://[^/\\s:@]+:[^/\\s:@]+@")],
   ["typesafe_key", new RegExp(LEFT + "apikey_[A-Za-z0-9_]{16,}")],
 ];
 const PLACEHOLDER_WORDS = ["example", "placeholder", "dummy", "changeme", "redacted", "sample", "fake", "your_", "xxxx",

@@ -24,6 +24,7 @@ import json
 import os
 import signal
 import sys
+import urllib.error
 import urllib.request
 
 URL = os.environ.get("JEV_MCP_URL", "").strip()
@@ -46,12 +47,36 @@ def _alarm(_signum, _frame):
     raise TimeoutError("hard timeout")
 
 
+class RedirectRefused(Exception):
+    """The endpoint tried to redirect the call: the server answered (just not sanely), so this is not an
+    outage to fail open on — same class as ServerRejected, never a silent allow."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # A redirect would re-send the bearer to whatever host/scheme the 3xx names. Never follow one.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RedirectRefused("redirect refused (%s -> %s)" % (code, newurl[:80]))
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+# Server-side input caps (server/src/kit/tools.mjs). Anything longer would be rejected by the schema, and a
+# schema rejection must not turn into a silent allow, so oversized input is answered with "ask" before any call.
+CAPS = {"command": 20000, "file_path": 2000, "cwd": 1000, "home": 500, "description": 1000}
+
+
+class ServerRejected(Exception):
+    """The server answered but refused the call: the server is up, so this is not an outage to fail open on."""
+
+
 def call_guard(args):
     token = os.environ.get("JEV_MCP_TOKEN", "").strip()
-    if not token:
-        fail_open("JEV_MCP_TOKEN is not set")
     if not URL:
         fail_open("JEV_MCP_URL is not set")
+    if not URL.startswith("https://"):
+        fail_open("JEV_MCP_URL must be https:// (got %r)" % URL[:40])
+    if not token:
+        fail_open("JEV_MCP_TOKEN is not set")
     body = json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "kit_guard_command", "arguments": args},
@@ -62,8 +87,15 @@ def call_guard(args):
         "authorization": "Bearer " + token,
         "user-agent": "jev-guard-hook/1.0",  # Cloudflare 403s the default Python-urllib UA
     })
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-        raw = resp.read().decode("utf-8", "replace")
+    try:
+        with _opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 4xx (bad/revoked token, Cloudflare block, bad request): the server answered and refused the call,
+        # same class as a JSON-RPC error -- ask, never a silent allow. 5xx/network stays an outage: fail open.
+        if 400 <= e.code < 500:
+            raise ServerRejected("HTTP %d from the guard endpoint" % e.code)
+        raise
     # The server answers JSON or a single SSE `data:` frame.
     payload = None
     for line in raw.splitlines():
@@ -76,11 +108,13 @@ def call_guard(args):
                 break
             except ValueError:
                 continue
-    if not payload or "result" not in payload:
-        raise ValueError("no JSON-RPC result")
-    result = payload["result"]
+    if not payload:
+        raise ValueError("no JSON-RPC payload")
+    if "error" in payload:  # JSON-RPC error: the server is up and refused this call (bad input, unknown tool)
+        raise ServerRejected(str(payload["error"].get("message", payload["error"]))[:200])
+    result = payload.get("result") or {}
     if result.get("isError"):
-        raise ValueError("tool error")
+        raise ServerRejected(str((result.get("content") or [{}])[0].get("text", "tool error"))[:200])
     return json.loads(result["content"][0]["text"])
 
 
@@ -103,13 +137,17 @@ def main():
     if tool == "Bash" and ti.get("command"):
         args = {"tool": "Bash", "command": str(ti["command"])}
         if ti.get("description"):
-            args["description"] = str(ti["description"])[:500]
+            args["description"] = str(ti["description"])
     elif tool in ("Read", "NotebookRead") and (ti.get("file_path") or ti.get("notebook_path")):
         args = {"tool": "Read", "file_path": str(ti.get("file_path") or ti.get("notebook_path"))}
+    elif tool == "Grep" and ti.get("pattern") and ti.get("output_mode") == "content":
+        # output_mode defaults to files_with_matches (paths only, no content); only "content" mode prints
+        # matching lines verbatim, so only that mode is judged as the grep command it is (R1 secret reader).
+        args = {"tool": "Bash", "command": "grep -r %s %s" % (json.dumps(str(ti["pattern"])), json.dumps(str(ti.get("path") or ".")))}
     else:
         sys.exit(0)  # not a tool this guard covers
     if event.get("cwd"):
-        args["cwd"] = event["cwd"]
+        args["cwd"] = str(event["cwd"])
     home = os.environ.get("JEV_GUARD_HOME") or os.path.expanduser("~")
     if home and home != "~":
         args["home"] = home
@@ -118,11 +156,25 @@ def main():
             args["ask_at"] = float(os.environ["JEV_GUARD_ASK_AT"])
         except ValueError:
             pass
+    # Oversized input would be rejected by the server schema; a rejection is not a reason to run it unguarded.
+    for key, cap in CAPS.items():
+        if key in args and len(args[key]) > cap:
+            if key in ("command", "file_path"):
+                if MODE == "shadow":
+                    sys.stderr.write("jev-guard (shadow): would ask: %s exceeds %d chars\n" % (key, cap))
+                    sys.exit(0)
+                emit("ask", "Jev guard: %s is %d chars, over the %d-char limit the guard can judge; confirm it by hand." % (key, len(args[key]), cap))
+            args[key] = args[key][:cap]
 
     try:
         signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, TIMEOUT + 0.5)
         r = call_guard(args)
+    except (ServerRejected, RedirectRefused) as e:  # server reachable but refused/redirected the call: ask, never allow silently
+        if MODE == "shadow":
+            sys.stderr.write("jev-guard (shadow): would ask: server rejected call: %s\n" % str(e)[:200])
+            sys.exit(0)
+        emit("ask", "Jev guard could not judge this call (server rejected it: %s); confirm it by hand." % str(e)[:200])
     except Exception as e:  # timeout, DNS, HTTP error, bad JSON ... all fail open
         fail_open("%s: %s" % (type(e).__name__, str(e)[:120]))
     finally:

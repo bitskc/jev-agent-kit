@@ -23,7 +23,7 @@ Tools on the `jev` MCP server (Claude Code: `mcp__jev__jev_classify`, `mcp__jev_
   ]
 }
 ```
-- Up to 64 items per call: batch them, do not loop one call per item. Send short excerpts, not whole documents.
+- Up to 64 items per call: batch them, do not loop one call per item. Send short excerpts, not whole documents (each item's `text` is truncated at 2000 chars server-side).
 - **Class descriptions carry the decision.** Say what belongs, what does not, which wins when two overlap, plus one example. Add a `manual_review` class if you want an explicit escape hatch; the tool never invents one.
 - Read `results[].decision`: `auto` (top probability >= 0.85 and margin >= 0.5) means accept `classification`; `review` means send to a human or a stronger model. Do not lower the thresholds to make the review pile smaller.
 - Use `probabilities` and `margin` when you need to rank or sample what to double-check. `summary.by_class` gives the counts.
@@ -41,7 +41,7 @@ Tools on the `jev` MCP server (Claude Code: `mcp__jev__jev_classify`, `mcp__jev_
   "requirements": ["Works with ESM", "No test rewrites"]
 }
 ```
-- Provide facts in `evidence` (measurements, file contents), the user's real constraints in `priorities`, and add "gather more evidence" or "do nothing" as candidates when they are genuine options.
+- Provide facts in `evidence` (measurements, file contents), the user's real constraints in `priorities`, and add "gather more evidence" or "do nothing" as candidates when they are genuine options. Candidate `id`s must match `^[a-z][a-z0-9_-]*$`, and `requirements` is capped at 3 checks.
 - `recommendation.selected` plus `confidence`. If `escaped: true` (it chose `ask_user`, `investigate`, or `none`), do that instead of forcing a pick. High probability is not proof: still check cheap facts yourself.
 - One call per unchanged decision. Do not re-ask to get a nicer answer.
 
