@@ -1,0 +1,7 @@
+{
+  "name": "jev-agent-kit",
+  "version": "0.2.0",
+  "description": "Jev decision tools for coding agents: command guard, dispatch sizing, verify-before-done, PR and issue triage, and Honest Jev — the claims-vs-evidence layer with off/soft/standard/strict levels and a statusline badge.",
+  "author": { "name": "bitskc / Andy Hayes", "url": "https://github.com/bitskc" },
+  "hooks": "./hooks/claude-plugin-hooks.json"
+}
