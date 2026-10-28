@@ -19,7 +19,7 @@ if [ "$target" = auto ]; then
 fi
 share="$HOME/.local/share/jev-agent-skills"; bin="$HOME/.local/bin"
 mkdir -p "$share" "$bin"
-rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py
+rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py "$share"/hooks/honest/*.js
 install -m 755 "$here/scripts/jev-call.sh" "$bin/jev-call"
 install -m 755 "$here/update.sh" "$bin/jev-update"
 copy_skills() { mkdir -p "$1"; for d in "$here"/skills/*/; do n=$(basename "$d"); rm -rf "$1/$n"; cp -r "$d" "$1/$n"; done; echo "skills -> $1"; }
@@ -29,9 +29,9 @@ fi
 if [ "$target" = claude ] || [ "$target" = both ]; then
   copy_skills "${project:-$HOME}/.claude/skills"
 fi
-echo "hooks  -> $share/hooks   (omp TS hook: $share/hooks/omp/jev-guard.ts)"
+echo "hooks  -> $share/hooks   (Claude: honest/*.js + jev-guard-hook.sh; omp: omp/jev-honest.ts + omp/jev-guard.ts)"
 echo "helper -> $bin/jev-call  (make sure $bin is on PATH)"
-echo "update -> $bin/jev-update  (re-pull skills; --timer for weekly auto-sync)"
+echo "update -> $bin/jev-update  (re-pull the latest release; --check to compare; --timer for weekly auto-sync)"
 cat <<MSG
 
 Next (nothing below was done for you):
@@ -40,7 +40,9 @@ Next (nothing below was done for you):
  2. Add the MCP server: see config/omp-mcp.json (-> ~/.omp/agent/mcp.json or .omp/mcp.json)
     or config/claude-mcp.json (-> .mcp.json), or:
       claude mcp add --transport http jev "\$JEV_MCP_URL" --header "Authorization: Bearer \$JEV_MCP_TOKEN"
- 3. Optional guard hook: Claude Code -> merge config/claude-settings-hook.json into ~/.claude/settings.json
-                         omp         -> cp $share/hooks/omp/jev-guard.ts ~/.omp/agent/hooks/pre/
- 4. Restart the agent (omp: /reload-plugins, then /mcp list, /mcp test jev)
+ 3. Hooks (Honest Jev levels + statusline badge, and the guard):
+      Claude Code -> easiest: install as a plugin instead (/plugin marketplace add bitskc/jev-agent-kit), hooks wire themselves;
+                     manual: merge config/claude-settings-hook.json into ~/.claude/settings.json
+      omp         -> cp $share/hooks/omp/jev-honest.ts $share/hooks/omp/jev-guard.ts ~/.omp/agent/hooks/pre/
+ 4. Restart the agent (omp: /reload-plugins, then /mcp list, /mcp test jev), then: /honest-jev standard
 MSG
