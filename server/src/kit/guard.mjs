@@ -474,7 +474,7 @@ const HIGH_PRECISION = [
   ["github_pat", new RegExp(LEFT + "github_pat_[A-Za-z0-9_]{20,}")],
   ["github_token", new RegExp(LEFT + "gh[pousr]_[A-Za-z0-9]{20,}")],
   ["anthropic_key", new RegExp(LEFT + "sk-ant-[A-Za-z0-9_\\-]{20,}")],
-  ["openai_key", new RegExp(LEFT + "sk-(?:proj-|svcacct-)?[A-Za-z0-9_\\-]{20,}")],
+  ["openai_key", new RegExp(LEFT + "sk-(?:(?:proj|svcacct)-[A-Za-z0-9_\\-]{20,}|[A-Za-z0-9]{20,})")],
   ["slack_token", new RegExp(LEFT + "xox[baprs]-[A-Za-z0-9-]{10,}")],
   ["google_api_key", new RegExp(LEFT + "AIza[0-9A-Za-z_\\-]{35}")],
   ["gitlab_token", new RegExp(LEFT + "glpat-[\\w-]{20}")],

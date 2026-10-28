@@ -214,6 +214,18 @@ test("redact: name-based keys, quoted passphrases, CLI option values and aws sec
   for (const benign of benignCommands) assert.equal(redact(benign), benign);
   assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).rule, "R9-commit-secret");
 });
+test("guardCommand R9: kebab-case text starting 'sk-' is not an OpenAI key; a real one still blocks", async () => {
+  const falsePositives = [
+    'git commit -m "style: sk-three-bounce-animation-timing"',
+    'git commit -m "add sk-SK-translations-for-settings-page"',
+    'git commit -m "rename sk-component-library-theme-tokens"',
+    'git commit -m "docs: sk-accessibility-guidelines-update"',
+  ];
+  for (const c of falsePositives) assert.notEqual((await g(c)).decision, "block", `false-blocked: ${c}`);
+  assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).decision, "block");
+  assert.equal((await g('git commit -m "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789"')).decision, "block");
+  assert.equal((await g('git commit -m "key is sk-aBcD1234567890aBcD1234567890"')).decision, "block");
+});
 test("redact: a cap-sized (20000 char) hyphenated command never goes quadratic", async () => {
   // the name-based and URL-credential rules had unbounded [a-z0-9_-]*/[a-z0-9+.-]* quantifiers that could
   // catastrophically backtrack on a long run of name-like characters with no real match (549ms observed pre-fix).
