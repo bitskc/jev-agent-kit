@@ -48,6 +48,12 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["set -eo pipefail; npm test | tail -5", "  12 passing (3s)", 0],
     ["bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0],
     ["set -o pipefail; bash -c 'npm test | tail -5'", "  12 passing (3s)", 0],
+    ["set -o pipefail; set +o pipefail -e; npm test | tail -5", "  12 passing (3s)", 0],
+    ["set +o pipefail -e; set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0],
+    ["set -o pipefail; /bin/bash -c 'npm test | tail -5'", "  12 passing (3s)", 0],
+    ["set -o pipefail; ksh -c 'npm test | tail -5'", "  12 passing (3s)", 0],
+    ["bash -o pipefail -c 'npm test' | tail -5", "  12 passing (3s)", 0],
+    ["/bin/bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0],
   ];
   for (const [command, output, exit] of cases) {
     assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);

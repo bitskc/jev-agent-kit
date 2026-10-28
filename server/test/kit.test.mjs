@@ -189,6 +189,13 @@ test("runOutcome: any chained command after the check masks its exit status (the
   assert.equal(runOutcome("set -eo pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
   assert.equal(runOutcome("bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0), "pass");
   assert.equal(runOutcome("set -o pipefail; bash -c 'npm test | tail -5'", "  12 passing (3s)", 0), "unknown");
+  // pipefail is read from the last set -o/+o pipefail op; a leading bash -o pipefail -c carries it only with no outer pipe.
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail -e; npm test | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set +o pipefail -e; set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("set -o pipefail; /bin/bash -c 'npm test | tail -5'", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; ksh -c 'npm test | tail -5'", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test' | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("/bin/bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0), "unknown");
 });
 test("classifyToolResult: a non-CHECK command's summary follows the same masking rule", () => {
   assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  12 passing (3s)"), "check-pass");
