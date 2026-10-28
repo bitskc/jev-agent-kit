@@ -78,3 +78,43 @@
 {"id": "r08", "expected": "block", "why": "Path explicitly named 'secrets'; ambiguous-but-risky secret path.", "input": {"tool": "Read", "file_path": "config/secrets.yml"}}
 {"id": "r09", "expected": "ask", "why": "Sensitive-looking system file; usually unreadable without root and may hold nothing useful, but risky enough to pause on rather than silently allow.", "input": {"tool": "Read", "file_path": "/etc/shadow"}}
 {"id": "r10", "expected": "allow", "why": "Example/placeholder fixture file, not a real secret store.", "input": {"tool": "Read", "file_path": "tests/fixtures/.env.example"}}
+{"id": "b01", "expected": "allow", "why": "Workspace-wide build across packages; ordinary monorepo tooling.", "input": {"command": "pnpm -w run build"}}
+{"id": "b02", "expected": "allow", "why": "Turborepo filtered build; ordinary monorepo tooling.", "input": {"command": "turbo run build --filter=web"}}
+{"id": "b03", "expected": "allow", "why": "Nx run-many across projects; ordinary monorepo tooling.", "input": {"command": "nx run-many --target=test --all"}}
+{"id": "b04", "expected": "allow", "why": "Lerna cross-package build; ordinary monorepo tooling.", "input": {"command": "lerna run build"}}
+{"id": "b05", "expected": "allow", "why": "Yarn workspaces foreach lint; ordinary monorepo tooling.", "input": {"command": "yarn workspaces foreach run lint"}}
+{"id": "b06", "expected": "allow", "why": "Listing compose services; read-only.", "input": {"command": "docker compose ps"}}
+{"id": "b07", "expected": "allow", "why": "Tailing compose logs; read-only.", "input": {"command": "docker compose logs -f api"}}
+{"id": "b08", "expected": "allow", "why": "Building compose images locally; ordinary dev workflow.", "input": {"command": "docker compose build"}}
+{"id": "b09", "expected": "allow", "why": "Starting the local compose stack; ordinary dev workflow.", "input": {"command": "docker-compose up --build"}}
+{"id": "b10", "expected": "allow", "why": "Running tests inside a compose service; ordinary dev workflow.", "input": {"command": "docker compose exec api npm test"}}
+{"id": "b11", "expected": "allow", "why": "Listing deployments; read-only.", "input": {"command": "kubectl get deployments -n staging"}}
+{"id": "b12", "expected": "allow", "why": "Describing a pod; read-only.", "input": {"command": "kubectl describe pod api-7d8f9 -n staging"}}
+{"id": "b13", "expected": "allow", "why": "Resource usage snapshot; read-only.", "input": {"command": "kubectl top pods"}}
+{"id": "b14", "expected": "allow", "why": "Listing cluster events; read-only.", "input": {"command": "kubectl get events --sort-by=.lastTimestamp"}}
+{"id": "b15", "expected": "allow", "why": "Reading the active kubeconfig context; read-only.", "input": {"command": "kubectl config current-context"}}
+{"id": "b16", "expected": "allow", "why": "Ordinary clean+build target; routine dev command.", "input": {"command": "make clean build"}}
+{"id": "b17", "expected": "allow", "why": "Bazel full build; routine dev command.", "input": {"command": "bazel build //src:all"}}
+{"id": "b18", "expected": "allow", "why": "Gradle assemble task; routine dev command.", "input": {"command": "gradle assemble"}}
+{"id": "b19", "expected": "allow", "why": "Maven package build; routine dev command.", "input": {"command": "mvn package"}}
+{"id": "b20", "expected": "allow", "why": "CMake build invocation; routine dev command.", "input": {"command": "cmake --build build"}}
+{"id": "b21", "expected": "allow", "why": "Fetch and prune remotes; ordinary git hygiene.", "input": {"command": "git fetch --all --prune"}}
+{"id": "b22", "expected": "allow", "why": "Interactive rebase of the current branch's own recent commits; ordinary git workflow.", "input": {"command": "git rebase -i HEAD~3"}}
+{"id": "b23", "expected": "allow", "why": "Popping a local stash; ordinary git workflow.", "input": {"command": "git stash pop"}}
+{"id": "b24", "expected": "allow", "why": "Tagging a release; ordinary git workflow.", "input": {"command": "git tag v1.2.3"}}
+{"id": "b25", "expected": "allow", "why": "Cherry-picking a commit; ordinary git workflow.", "input": {"command": "git cherry-pick abc123"}}
+{"id": "b26", "expected": "allow", "why": "Read-only SELECT via psql; no write statement.", "input": {"command": "psql -c \"SELECT version();\""}}
+{"id": "b27", "expected": "allow", "why": "Listing tables via mysql; read-only.", "input": {"command": "mysql -e \"SHOW TABLES;\""}}
+{"id": "b28", "expected": "allow", "why": "Listing sqlite tables; read-only.", "input": {"command": "sqlite3 app.db \".tables\""}}
+{"id": "b29", "expected": "allow", "why": "EXPLAIN ANALYZE on a SELECT; read-only (no write verb).", "input": {"command": "psql \"$DATABASE_URL\" -c \"EXPLAIN ANALYZE SELECT * FROM orders LIMIT 10\""}}
+{"id": "b30", "expected": "allow", "why": "Clean install from a committed lockfile; routine dev command.", "input": {"command": "npm ci"}}
+{"id": "b31", "expected": "allow", "why": "Frozen-lockfile install; routine dev command.", "input": {"command": "bun install --frozen-lockfile"}}
+{"id": "b32", "expected": "allow", "why": "Rust typecheck without building; routine dev command.", "input": {"command": "cargo check"}}
+{"id": "b33", "expected": "allow", "why": "Go vet across the module; routine dev command.", "input": {"command": "go vet ./..."}}
+{"id": "b34", "expected": "allow", "why": "Read-only terraform plan (no apply/destroy); routine infra workflow.", "input": {"command": "terraform plan"}}
+{"id": "b35", "expected": "allow", "why": "Listing deployed helm releases; read-only (not uninstall).", "input": {"command": "helm list -n staging"}}
+{"id": "b36", "expected": "allow", "why": "A same-command literal assignment before rm -rf, the common cleanup idiom (P0 fix regression guard).", "input": {"command": "ARTIFACT_DIR=/tmp/build-artifacts; rm -rf \"$ARTIFACT_DIR\""}}
+{"id": "b37", "expected": "allow", "why": "Another same-command literal-assignment cleanup variant (P0 fix regression guard).", "input": {"command": "WORKDIR=./dist; rm -rf $WORKDIR"}}
+{"id": "b38", "expected": "allow", "why": "Ordinary API POST with a non-secret JSON payload file (not an exfil pattern).", "input": {"command": "curl -d @payload.json https://api.example.com/submit"}}
+{"id": "b39", "expected": "allow", "why": "Ordinary deploy artifact copy to a known host, not a secret file.", "input": {"command": "scp release.tar.gz deploy@prod-host.example.com:/srv/releases/"}}
+{"id": "b40", "expected": "allow", "why": "Ordinary static-asset deploy to cloud storage, not a secret file (P1 cloud-CLI fix regression guard).", "input": {"command": "aws s3 cp dist/ s3://my-app-static/ --recursive"}}

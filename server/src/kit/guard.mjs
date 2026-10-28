@@ -152,6 +152,9 @@ function ruleSecret(ctx) {
     const [prog, args] = readerBehind(prog0, args0);
     if (READERS.has(prog)) {
       if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
+      // openssl writes to -out/-outform's file when given one, not to stdout; only a bare invocation
+      // (no -out) actually prints to the transcript.
+      if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1])) continue;
       const hit = secretPathIn(args, home);
       if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${hit}) would print its contents`, suggestion: R1_SUGGESTION };
       const amb = ambiguousPathIn(args);
@@ -210,8 +213,29 @@ function curlFileArg(args) {
   }
   return null;
 }
-// `user@host:path` or `host:path` (scp/rsync remote-destination shape), not a Windows drive letter or a URL.
-const isRemoteTarget = (tok) => /^[^/@\s]+@[^/\s]+:/.test(tok) || /^[A-Za-z0-9.\-]{2,}:(?!\/\/|\\|\d+$)/.test(tok);
+// `user@host:path` / `host:path` (scp/rsync remote-destination shape, not a Windows drive letter or a URL),
+// an explicit `scp://`/`rsync://` destination URI, or a bracketed IPv6 host (`[::1]:path`, `user@[::1]:path`).
+const REMOTE_COPY_URI_RE = /^(?:scp|rsync):\/\//;
+const REMOTE_COPY_IPV6_RE = /^(?:[^/@\s]+@)?\[[0-9a-fA-F:]+\]:/;
+const isRemoteTarget = (tok) =>
+  REMOTE_COPY_URI_RE.test(tok) || REMOTE_COPY_IPV6_RE.test(tok) ||
+  /^[^/@\s]+@[^/\s]+:/.test(tok) || /^[A-Za-z0-9.\-]{2,}:(?!\/\/|\\|\d+$)/.test(tok);
+
+/** The local source path of a cloud-storage upload command (`aws s3 cp`/`mv`, `gsutil cp`/`mv`, `rclone
+ *  copy`/`copyto`/`move`/`moveto`/`sync`, `az storage blob upload --file`), or null. Destination is assumed
+ *  remote (these commands' whole purpose), unlike the generic scp/rsync case which checks it explicitly. */
+function cloudCopySource(prog, args) {
+  const positionals = args.filter((a) => !a.startsWith("-"));
+  if (prog === "aws" && positionals[0] === "s3" && ["cp", "mv", "sync"].includes(positionals[1])) return positionals[2];
+  if (prog === "gsutil" && ["cp", "mv", "rsync"].includes(positionals[0])) return positionals[1];
+  if (prog === "rclone" && ["copy", "copyto", "move", "moveto", "sync"].includes(positionals[0])) return positionals[1];
+  if (prog === "az" && positionals[0] === "storage" && positionals[1] === "blob" && positionals[2] === "upload") {
+    const i = args.indexOf("--file");
+    if (i !== -1 && args[i + 1]) return args[i + 1];
+  }
+  return null;
+}
+const CLOUD_CP_PROGS = new Set(["aws", "gsutil", "rclone", "az"]);
 
 function ruleSecretExfil(ctx) {
   if (!SHELL_TOOLS.has(ctx.tool) || !ctx.command) return null;
@@ -221,23 +245,24 @@ function ruleSecretExfil(ctx) {
     if (prog === null) continue;
     if (NETWORK_SEND_PROGS.has(prog)) {
       const file = curlFileArg(args);
-      if (file && file !== "-" && SECRET_PATH_RES.some((r) => r.test(expand(file, home)))) {
-        return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would send the contents of a secret store (${file}) as request data`, suggestion: R1_EXFIL_SUGGESTION };
-      }
+      const hit = file && file !== "-" ? secretPathIn([file], home) : null;
+      if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would send the contents of a secret store (${hit}) as request data`, suggestion: R1_EXFIL_SUGGESTION };
     }
     if (REMOTE_COPY_PROGS.has(prog)) {
       const positionals = args.filter((a) => !a.startsWith("-"));
       const dest = positionals.at(-1);
       if (dest && isRemoteTarget(dest)) {
-        for (const src of positionals.slice(0, -1)) {
-          if (SECRET_PATH_RES.some((r) => r.test(expand(src, home)))) {
-            return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would copy a secret store (${src}) to the remote host \`${dest}\``, suggestion: R1_EXFIL_SUGGESTION };
-          }
-        }
+        const hit = secretPathIn(positionals.slice(0, -1), home);
+        if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would copy a secret store (${hit}) to the remote host \`${dest}\``, suggestion: R1_EXFIL_SUGGESTION };
       }
     }
+    if (CLOUD_CP_PROGS.has(prog)) {
+      const src = cloudCopySource(prog, args);
+      const hit = src ? secretPathIn([src], home) : null;
+      if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would upload a secret store (${hit}) to cloud storage`, suggestion: R1_EXFIL_SUGGESTION };
+    }
   }
-  // piped form: `cat <secret> | curl ...`, `cat <secret> | nc host port`, etc.
+  // piped form: `cat <secret> | curl ...`, `cat <secret> | xargs -I{} curl -d {} ...`, `cat <secret> | nc host port`.
   const cleaned = stripRedirects(stripHeredocs(ctx.command));
   for (const pipeline of splitPipelines(cleaned)) {
     for (let i = 0; i + 1 < pipeline.length; i++) {
@@ -245,7 +270,8 @@ function ruleSecretExfil(ctx) {
       if (!READERS.has(p0)) continue;
       const hit = secretPathIn(a0, home);
       if (!hit) continue;
-      const [p1] = programOf(pipeline[i + 1]);
+      const [p1raw, a1raw] = programOf(pipeline[i + 1]);
+      const [p1] = readerBehind(p1raw, a1raw); // unwraps `xargs ... <real sink>` to the sink it invokes
       if (NETWORK_PIPE_SINKS.has(p1)) {
         return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${p0} ${hit} | ${p1}\` pipes a secret store's contents to a network sink`, suggestion: R1_EXFIL_SUGGESTION };
       }
@@ -324,6 +350,9 @@ export const R7_SUGGESTION = "Hard to reverse: ask first unless the human alread
 const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3", "sqlcmd", "duckdb", "clickhouse-client", "cockroach", "mongosh", "mongo"]);
 const SQL_DROP_RE = /\bDROP\s+(DATABASE|SCHEMA|TABLE)\b/i;
 const DD_HARMLESS = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/fd/"];
+// Only a real block-device node is catastrophic to overwrite; /dev/shm, /dev/mqueue, /dev/pts and similar
+// are RAM-backed or non-storage pseudo-filesystems under /dev, not devices, and are common scratch targets.
+const DD_BLOCK_DEVICE_RE = /^\/dev\/(?:sd|hd|xvd|vd|nvme|loop|disk|mapper|rdisk)/;
 export const R7_IRREVERSIBLE_SUGGESTION =
   "A raw-device write or a recursive permission change across the whole filesystem (or home directory) is " +
   "never a single task step. Name the exact target, or ask the human.";
@@ -441,7 +470,7 @@ function ruleDestructive(ctx) {
       if (i !== null && args[i] === "uninstall") return m("`helm uninstall` removes a deployed release");
     }
     if (prog === "dd") {
-      for (const a of args) if (a.startsWith("of=/dev/") && !DD_HARMLESS.some((h) => a.slice(3).startsWith(h))) return block(`\`dd ${a}\` overwrites a device`);
+      for (const a of args) if (a.startsWith("of=/dev/") && DD_BLOCK_DEVICE_RE.test(a.slice(3)) && !DD_HARMLESS.some((h) => a.slice(3).startsWith(h))) return block(`\`dd ${a}\` overwrites a device`);
     }
     if ((prog === "chmod" || prog === "chown") && args.some((a) => a === "--recursive" || (a.startsWith("-") && !a.startsWith("--") && a.includes("R")))) {
       for (const a of args.slice(1)) {
@@ -552,25 +581,55 @@ function rdCommand(toksIn) {
 // `/` and/or `*`) with no `${VAR:?...}` guard: the value can't be proven non-empty from the command text
 // alone, and an unset/empty variable here silently becomes `rm -rf /`. The `:?`/`:-` guarded form never
 // matches this regex (the colon-modifier content isn't allowed before the closing brace), so it's exempt.
-const UNGUARDED_VAR_PATH_RE = /^\$\{?[A-Za-z_][A-Za-z_0-9]*\}?\/?\*?$/;
-function rdRootOrHome(aIn, home) {
-  let a = aIn;
-  if (a.endsWith(")") && !a.includes("(")) a = a.replace(/\)+$/, "");
-  if (a.endsWith(";")) a = a.replace(/;+$/, "");
-  if (!a) return false;
+const UNGUARDED_VAR_PATH_RE = /^\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?(\/?\*?)$/;
+/** Is `value` itself a literal that resolves to / or home (reused so an assigned value can be checked the
+ *  same way an operand is: `BUILD_DIR=~; rm -rf $BUILD_DIR` must still block). */
+function isRootOrHomeLiteral(a, home) {
   if (a.replace(/^\/+|\/+$/g, "") === "" && a.startsWith("/")) return true;
   if (["/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*"].includes(a)) return true;
-  if (UNGUARDED_VAR_PATH_RE.test(a)) return true;
   let p = expand(a, home);
   if (p.endsWith("/*")) p = p.slice(0, -2);
   return p.replace(/\/+$/, "") === "~";
 }
-function rdHit(seg, home, depth = 0) {
+/** Does ANY of `segments` assign `name` a literal, non-empty, non-root/home value this same command —
+ *  as its own `VAR=value`/`export VAR=value` segment, or as a leading prefix assignment on a segment that
+ *  also runs the command using it (`VAR=/tmp/x rm -rf $VAR`)? The value sits right there in the text being
+ *  judged, unlike an inherited/environment variable whose value this guard can never see. An assignment
+ *  whose own value is itself a variable reference (`VAR=$OTHER`) or is itself root/home-shaped does not
+ *  count: the opacity (or the danger) just moved one hop, it didn't go away.
+ */
+const ASSIGN_SKIP_PREFIX = new Set(["export", "declare", "typeset", "local", "readonly"]);
+function assignedSafeValue(name, segments, home) {
+  for (const seg of segments) {
+    const toks = words(seg);
+    let i = 0;
+    if (ASSIGN_SKIP_PREFIX.has(toks[i])) i++;
+    if (i < toks.length && ASSIGN_RE.test(toks[i])) {
+      const eq = toks[i].indexOf("=");
+      if (toks[i].slice(0, eq) === name) {
+        const v = toks[i].slice(eq + 1);
+        if (v && !v.includes("$") && !isRootOrHomeLiteral(v, home)) return true;
+      }
+    }
+  }
+  return false;
+}
+function rdRootOrHome(aIn, home, segments) {
+  let a = aIn;
+  if (a.endsWith(")") && !a.includes("(")) a = a.replace(/\)+$/, "");
+  if (a.endsWith(";")) a = a.replace(/;+$/, "");
+  if (!a) return false;
+  if (isRootOrHomeLiteral(a, home)) return true;
+  const varMatch = UNGUARDED_VAR_PATH_RE.exec(a);
+  if (varMatch) return !assignedSafeValue(varMatch[1], segments, home);
+  return false;
+}
+function rdHit(seg, home, depth = 0, segments = [seg]) {
   const [prog, argsRaw] = rdCommand(words(seg));
   const script = RD_SHELLS.has(prog) && depth < 2 ? rdShellScript(argsRaw) : null;
   if (script !== null) {
     for (const inner of splitSegments(script)) {
-      const hit = rdHit(inner, home, depth + 1);
+      const hit = rdHit(inner, home, depth + 1, segments);
       if (hit) return hit;
     }
     return null;
@@ -581,7 +640,7 @@ function rdHit(seg, home, depth = 0) {
   const opts = args.slice(0, end).filter((a) => a.startsWith("-"));
   const operands = [...args.slice(0, end).filter((a) => !a.startsWith("-")), ...args.slice(end + 1)];
   if (!opts.some((a) => a === "--recursive" || (!a.startsWith("--") && /r/i.test(a)))) return null;
-  for (const a of operands) if (rdRootOrHome(a, home)) return a;
+  for (const a of operands) if (rdRootOrHome(a, home, segments)) return a;
   return null;
 }
 function ruleRootDelete(ctx) {
@@ -593,7 +652,7 @@ function ruleRootDelete(ctx) {
     }
   } catch { /* ignore */ }
   for (const seg of segs) {
-    const hit = rdHit(seg, ctx.home);
+    const hit = rdHit(seg, ctx.home, 0, segs);
     if (hit) return { rule: "R7-root-delete", severity: "block", strict: true, reason: `\`rm -r ${hit}\` would delete the whole filesystem or home directory`, suggestion: R7_ROOT_SUGGESTION };
   }
   return null;
@@ -930,6 +989,10 @@ export async function guardCommand(input, deps = {}) {
     let m = null;
     try { m = fn(ctx); } catch { m = null; /* a rule bug must never block: fail open */ }
     if (!m) continue;
+    // A single registered function can report more than one rule id (R7-destructive's own function also
+    // returns R7-irreversible for its block-severity dd/chmod-R matches) — disable_rules names the id a
+    // caller actually SAW in a response, so honor the match's own id too, not just the array's.
+    if (disabled.has(m.rule)) continue;
     if (m.severity === "ambiguous") { ambiguousSecret ??= m; continue; }
     out.decision = m.severity === "block" ? "block" : "ask";
     out.score = m.severity === "block" ? 1 : 0.7;

@@ -40,7 +40,7 @@ Extract the claims from the message you are about to send, one item each, with t
 }
 ```
 
-**EVIDENCE must quote concrete output**: the command you ran and its actual numbers or output tail ("ran `npm test`, output tail '42 passed, 0 failed'"), not a restatement of the claim. Evidence that only repeats the claim in different words — "EVIDENCE: tests pass.", "EVIDENCE: ran everything, all green, no issues.", "EVIDENCE: confirmed it works." — is circular, not evidence, and is `unverifiable` by definition no matter how confident the sentence sounds. A classifier can be fooled by confident tone alone (tested: "EVIDENCE: tests pass." scored `verified` at 0.6 confidence); quoting the actual command and output is what the confidence has to be earned against.
+**EVIDENCE must quote concrete output**: the command you ran and its actual numbers or output tail ("ran `npm test`, output tail '42 passed, 0 failed'"), not a restatement of the claim. Evidence that only repeats the claim in different words — "EVIDENCE: tests pass.", "EVIDENCE: ran everything, all green, no issues.", "EVIDENCE: confirmed it works." — is circular, not evidence, and is `unverifiable` by definition no matter how confident the sentence sounds. A classifier can be fooled by confident tone alone (tested repeatedly: "EVIDENCE: tests pass." with no real output behind it reliably classifies `verified` at moderate-to-high confidence, not `unverifiable` — the exact number drifts run to run against a live model, the mistake doesn't); quoting the actual command and output is what the confidence has to be earned against.
 
 Act on the result, per claim — check `decision` FIRST, before `classification`:
 
