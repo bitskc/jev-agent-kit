@@ -94,6 +94,12 @@ big=$(python3 -c 'import json;print(json.dumps({"tool_name":"Bash","tool_input":
 ok "$(printf '%s' "$big" | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" ask "guard: oversized command -> ask, no call"
 ok "$(ev Bash '{"command":"cat .env"}' | JEV_MCP_TOKEN=t JEV_MCP_URL=http://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" none "guard: http:// URL -> fail open, token never sent"
 ok "$(ev Bash '{"command":"ls"}' | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp JEV_GUARD_TIMEOUT=0.3 bash "$hook" 2>/dev/null | dec)" none "guard: unreachable server -> fail open"
+bigpattern=$(python3 -c 'import json;print(json.dumps({"tool_name":"Grep","tool_input":{"pattern":"x"*20001,"output_mode":"content"},"cwd":"/tmp"}))')
+ok "$(printf '%s' "$bigpattern" | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" ask "guard: Grep output_mode=content -> judged (oversized pattern asks)"
+fwmpattern=$(python3 -c 'import json;print(json.dumps({"tool_name":"Grep","tool_input":{"pattern":"x"*20001,"output_mode":"files_with_matches"},"cwd":"/tmp"}))')
+ok "$(printf '%s' "$fwmpattern" | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" none "guard: Grep output_mode=files_with_matches -> skipped, no secret-content exposure to judge"
+defpattern=$(python3 -c 'import json;print(json.dumps({"tool_name":"Grep","tool_input":{"pattern":"x"*20001},"cwd":"/tmp"}))')
+ok "$(printf '%s' "$defpattern" | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" none "guard: Grep with no output_mode (defaults to files_with_matches) -> skipped"
 redirect_test=$(python3 - "$root" <<'PYEOF'
 import sys, io, json, importlib.util, os
 root = sys.argv[1]

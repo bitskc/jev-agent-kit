@@ -140,8 +140,9 @@ def main():
             args["description"] = str(ti["description"])
     elif tool in ("Read", "NotebookRead") and (ti.get("file_path") or ti.get("notebook_path")):
         args = {"tool": "Read", "file_path": str(ti.get("file_path") or ti.get("notebook_path"))}
-    elif tool == "Grep" and ti.get("pattern"):
-        # Grep in content mode prints matching lines verbatim: judge it as the grep command it is (R1 secret reader).
+    elif tool == "Grep" and ti.get("pattern") and ti.get("output_mode") == "content":
+        # output_mode defaults to files_with_matches (paths only, no content); only "content" mode prints
+        # matching lines verbatim, so only that mode is judged as the grep command it is (R1 secret reader).
         args = {"tool": "Bash", "command": "grep -r %s %s" % (json.dumps(str(ti["pattern"])), json.dumps(str(ti.get("path") or ".")))}
     else:
         sys.exit(0)  # not a tool this guard covers

@@ -94,6 +94,10 @@ test("parseRuleCommand: quoted, natural-language, list, remove, disable, and exp
     { action: "add", when: "deploying to prod", ask: "did migrations run?", evidence: "", repo: false });
   assert.deepEqual(rt.parseRuleCommand('/honest-jev rule add "x" -> "y" evidence: "z"'),
     { action: "add", when: "x", ask: "y", evidence: "z", repo: false });
+  // the jev-honest alias (same as parseCommand's level-switch alias) must also match rule commands
+  assert.deepEqual(rt.parseRuleCommand("jev-honest rule list"), { action: "list" });
+  assert.deepEqual(rt.parseRuleCommand('/jev-honest rule add "x" -> "y"'),
+    { action: "add", when: "x", ask: "y", evidence: "", repo: false });
   // a "repo" substring inside when/ask/evidence is not a scope marker: stays user-global
   assert.deepEqual(rt.parseRuleCommand("honest-jev rule add: when touching the repo ask is CI green evidence CI link"),
     { action: "add", when: "touching the repo", ask: "is CI green", evidence: "CI link", repo: false });
@@ -172,6 +176,22 @@ test("defaultLevel: env beats config file beats off", () => {
   process.env.JEV_HONEST_DEFAULT_LEVEL = "strict";
   assert.equal(rt.defaultLevel(), "strict");
   assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false);
+});
+test("activate/subagent: a config-default level is never persisted, so editing the config takes effect next session", () => {
+  const d = fresh();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-")); process.env.XDG_CONFIG_HOME = xdg; delete process.env.JEV_HONEST_DEFAULT_LEVEL;
+  fs.mkdirSync(path.join(xdg, "jev")); fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"soft"}');
+  assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: soft/);
+  assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false); // never persisted: a default resolution is not an explicit choice
+  fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"strict"}');
+  assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: strict/); // picks up the edited config, not frozen at "soft"
+  const sub = JSON.parse(run("jev-honest-subagent.js"));
+  assert.match(sub.hookSpecificOutput.additionalContext, /level: strict/); // subagent independently resolves the same live default
+  // an explicit switch still persists and still wins over the config default
+  assert.match(run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "/honest-jev soft" })), /^HONEST JEV LEVEL CHANGED/);
+  assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "soft\n");
+  fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"strict"}');
+  assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: soft/); // explicit choice still beats the (now different) default
 });
 
 test("hooks end to end: fresh install is silent; prompt switch writes flag and injects; subagent mirrors; off persists", () => {

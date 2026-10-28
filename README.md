@@ -80,6 +80,8 @@ Switch with **`/honest-jev soft|standard|strict|off`** (Claude Code and omp), or
 
 **Rules** are user-authored standing checks — reusable, not a dedicated merge gate. A rule is `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`; when its situation applies, Honest Jev injects it so the model must answer the question with evidence before making the claim. Three layers merge, later wins on the same id: built-in examples (one ships by default: "presenting a PR as ready to merge" asks whether it's really gstack-reviewed) → user global `~/.config/jev/rules.json` → repo `.jev/rules.json` (committable, so a team shares rules). Author one on the fly, no file editing: `honest-jev rule add: when presenting a PR as ready to merge ask "Is it gstack-reviewed?" evidence "a CLEAN review record for this PR number"` (add a trailing `--repo`/`(repo)`, or lead with `repo` right after `add`/`remove`/`disable`, to target the repo layer instead — a `when`/`ask` that just mentions "the repo" stays user-global); `honest-jev rule list` / `rule remove <id>` / `rule disable <id>` manage what's active.
 
+`.jev/rules.json` is in the same trust class as `CLAUDE.md`: whoever can land a commit on the repo layer can steer every session and subagent's `when`/`ask`/`evidence` text. Review it like you'd review any other committed instructions file — a hostile PR adding a repo-layer rule is a prompt-injection vector, not a bypass of anything Honest Jev itself checks.
+
 ## Install
 
 ### Claude Code (plugin, recommended)

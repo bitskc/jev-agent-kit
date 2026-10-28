@@ -124,7 +124,7 @@ function slugify(text) {
 // Repo scope is explicit only: a trailing " --repo" or " (repo)" on the whole command, or a leading "repo "
 // (or "repo: ") right after add/remove/disable — never a loose "repo" substring inside when/ask/evidence
 // (a rule about "pushing to the repo" must not silently target the repo layer).
-const RULE_CMD = /^[/@$]?(?:[a-z0-9-]+:)?honest-jev\s+rule\s+(.+)$/is;
+const RULE_CMD = /^[/@$]?(?:[a-z0-9-]+:)?(?:honest-jev|jev-honest)\s+rule\s+(.+)$/is;
 const TRAILING_REPO = /^(.*?)\s+(?:--repo|\(repo\))\s*$/i;
 const LEADING_REPO = /^repo:?\s+(.*)$/i;
 function parseRuleCommand(prompt) {

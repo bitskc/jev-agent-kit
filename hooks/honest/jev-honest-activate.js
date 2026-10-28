@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // Honest Jev — Claude Code SessionStart hook (startup|resume|clear|compact).
-// 1. Resolves the level (flag file written earlier in this install > configured default > off).
-// 2. Writes the flag so the statusline badge and SubagentStart see it.
+// 1. Resolves the level (explicit flag file > configured default > off).
+// 2. Re-persists only an already-explicit flag (a level resolved purely from the configured default is never
+//    written here, so editing JEV_HONEST_DEFAULT_LEVEL / config.json honestLevel takes effect on the very next
+//    SessionStart instead of being frozen by this session's one-time resolution). SubagentStart independently
+//    resolves the same default, so it sees a config-only level even though the flag stays unwritten.
 // 3. Emits the level-filtered skill body as session context.
 // 4. If settings.json has no statusLine mentioning jev-honest, nudges the agent to offer wiring it — composed
 //    with any existing statusLine command (ponytail etc.), never replacing it.
@@ -9,10 +12,11 @@ const fs = require('fs');
 const path = require('path');
 const rt = require('./jev-honest-runtime');
 
-const level = rt.readLevel() || rt.defaultLevel();
+const explicit = rt.readLevel();
+const level = explicit || rt.defaultLevel();
 if (level === 'off') { process.exit(0); } // leave the flag as-is: an explicit off must survive resume/clear/compact
 
-try { rt.setLevel(level); } catch { /* flag is best-effort */ }
+if (explicit) { try { rt.setLevel(explicit); } catch { /* flag is best-effort */ } }
 
 let out = rt.instructions(level);
 

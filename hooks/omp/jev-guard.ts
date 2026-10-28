@@ -93,11 +93,12 @@ export default function jevGuard(pi: ExtensionAPI) {
     try {
       let args: Record<string, unknown> | null = null;
       if (isToolCallEventType("bash", event)) {
-        args = { tool: "Bash", command: String(event.input.command ?? ""), cwd: ctx.cwd, home: process.env.HOME };
+        args = { tool: "Bash", command: String(event.input?.command ?? ""), cwd: ctx.cwd, home: process.env.HOME };
       } else if (event.toolName === "read" && (event.input?.path || event.input?.file_path)) {
         args = { tool: "Read", file_path: String(event.input.path ?? event.input.file_path), cwd: ctx.cwd, home: process.env.HOME };
-      } else if (event.toolName === "grep" && event.input?.pattern) {
-        // grep in content mode prints matching lines verbatim: judge it as the grep command it is (R1 secret reader)
+      } else if (event.toolName === "grep" && event.input?.pattern && event.input?.output_mode === "content") {
+        // output_mode defaults to files_with_matches (paths only, no content); only "content" mode prints
+        // matching lines verbatim, so only that mode is judged as the grep command it is (R1 secret reader)
         args = { tool: "Bash", command: `grep -r ${JSON.stringify(String(event.input.pattern))} ${JSON.stringify(String(event.input.path ?? "."))}`, cwd: ctx.cwd, home: process.env.HOME };
       }
       if (!args) return;
