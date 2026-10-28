@@ -15,7 +15,9 @@ export function splitSegments(command) {
   const segs = [];
   let buf = [];
   let quote = null;
-  const s = command || "";
+  // Real bash deletes backslash-newline pairs BEFORE tokenizing (line continuation); folding them here,
+  // outside quotes, keeps `rm -rf \<newline>/` one `/` token the way bash sees it.
+  const s = (command || "").replace(/\\\r?\n/g, "");
   const n = s.length;
   let i = 0;
   while (i < n) {
@@ -61,13 +63,18 @@ export function words(segment) {
   const out = [];
   let buf = "";
   let quote = null;
+  let ansiC = false; // inside a $'...' ANSI-C quoted run: bash decodes \xNN/\n/\t/... escapes
   let inWord = false;
   const s = segment || "";
   const n = s.length;
   for (let i = 0; i < n; i++) {
     const ch = s[i];
     if (quote) {
-      if (ch === quote) { quote = null; continue; }
+      if (ch === quote) { quote = null; ansiC = false; continue; }
+      if (ansiC && ch === "\\" && i + 1 < n) {
+        const [decoded, len] = ansiEscape(s.slice(i));
+        buf += decoded; i += len - 1; inWord = true; continue; // for-loop continue still runs i++
+      }
       if (ch === "\\" && quote === '"' && i + 1 < n && '"\\$`'.includes(s[i + 1])) {
         buf += s[i + 1]; i++; inWord = true; continue;
       }
@@ -78,6 +85,11 @@ export function words(segment) {
       // closed the quote early and shredded the nested script into several tokens.
       buf += ch; inWord = true;
       continue;
+    }
+    // $'...' ANSI-C quoting and $"..." locale quoting: the `$` is consumed by the quote, not part of the
+    // word's value -- `$'/'` is just `/` to the shell, and `$'\x2eenv'` decodes byte-for-byte to `.env`.
+    if (ch === "$" && i + 1 < n && (s[i + 1] === "'" || s[i + 1] === '"')) {
+      quote = s[i + 1]; ansiC = s[i + 1] === "'"; i++; inWord = true; continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
     if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
@@ -91,61 +103,258 @@ export function words(segment) {
   return out;
 }
 
-const SKIP_PREFIX = new Set(["nice", "time", "command", "exec", "builtin", "stdbuf", "nohup", "ionice"]);
-const VALUE_WRAPPERS = new Set(["env", "timeout"]);
-const ENV_VALUE_OPTS = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]);
-const TIMEOUT_VALUE_OPTS = new Set(["-s", "--signal", "-k", "--kill-after"]);
-const base = (p) => p.slice(p.lastIndexOf("/") + 1);
-
-function wrappedCommand(toks) {
-  const wrapper = base(toks[0]);
-  let i = 1;
-  const valueOpts = wrapper === "env" ? ENV_VALUE_OPTS : TIMEOUT_VALUE_OPTS;
-  while (i < toks.length) {
-    const t = toks[i];
-    if (t === "--") { i++; break; }
-    if (t.startsWith("-") && t.length > 1) { i += valueOpts.has(t) ? 2 : 1; continue; }
-    if (wrapper === "env" && ASSIGN_RE.test(t)) { i++; continue; }
-    break;
+/** Decode one ANSI-C escape at s[0]==="\\" inside a $'...' run: \xNN and the common one-char escapes.
+ *  Returns [decodedChar, charsConsumed]. Unknown escapes keep the char but drop the backslash, matching
+ *  bash's own "unrecognised escape = literal char" behaviour closely enough for path/flag matching. */
+function ansiEscape(s) {
+  const c = s[1];
+  if (c === "x") {
+    const m = /^[0-9a-fA-F]{1,2}/.exec(s.slice(2));
+    if (m) return [String.fromCodePoint(parseInt(m[0], 16)), 2 + m[0].length];
+    return ["x", 2];
   }
-  if (wrapper === "timeout") i++;
-  const rest = toks.slice(i);
-  return rest.length ? rest : null;
+  if (c === "u") {
+    const m = /^[0-9a-fA-F]{1,4}/.exec(s.slice(2));
+    if (m) return [String.fromCodePoint(parseInt(m[0], 16)), 2 + m[0].length];
+    return ["u", 2];
+  }
+  if (c >= "0" && c <= "7") {
+    const m = /^[0-7]{1,3}/.exec(s.slice(1));
+    return [String.fromCodePoint(parseInt(m[0], 8)), 1 + m[0].length];
+  }
+  const ONE = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\x0b", e: "\x1b", E: "\x1b" };
+  return [ONE[c] !== undefined ? ONE[c] : c, 2];
 }
 
-/** First real command word of a segment, past VAR=val and wrappers. Returns [program, args]. */
-export function programOf(segment) {
-  let toks = words(segment);
-  while (toks.length) {
-    if (ASSIGN_RE.test(toks[0])) { toks = toks.slice(1); continue; }
-    if (VALUE_WRAPPERS.has(base(toks[0]))) {
-      const rest = wrappedCommand(toks);
-      if (rest === null) break;
-      toks = rest;
+// ── ONE shared command-resolution layer ──────────────────────────────────────
+// Every rule used to peel a different subset of wrappers (programOf knew env/timeout/nice/stdbuf,
+// rdCommand knew doas, peelArgv knew sudo, nobody knew pkexec/systemd-run/nsenter/...), and a rule whose
+// walk lacked a wrapper silently missed the command behind it. Now there is exactly one argv walk:
+// peelCommand() below, driven by WRAPPER_SPECS, and programOf()/resolveCommand()/unwrapScripts()' walk
+// are three thin consumers of it.
+//
+// WRAPPER_SPECS[prog] = {
+//   valueOpts:  tokens that consume the FOLLOWING argv element as their value (spaced form). An
+//               `--opt=val` / `-oval` attached form never consumes the next element.
+//   flags:      tokens that are pure flags (consumed, value never eaten). Unknown option-looking tokens
+//               are conservatively skipped as flags: under-skipping (treating a value as the command)
+//               resolves to the wrong program, while over-skipping (eating the command as a value)
+//               resolves to nothing -- and a miss on the WRONG program is still a miss either way, so
+//               the flag default is the safer side.
+//   shortValue: single chars that take a value inside a bundled short-option run (sudo -u root ->
+//               'u' consumes the next token only when it's the LAST char of the bundle).
+//   operands:   bare non-option tokens consumed before the command (timeout's duration, chroot's
+//               new-root, taskset's mask).
+//   operandsIfNoOpts: consume `operands` only when no valueOpt was actually seen (taskset -c consumes
+//               the cpu mask AS the -c value, so the operand rule must not eat the program too).
+//   spliceOpts: tokens whose VALUE is itself a command line to splice back into the argv walk
+//               (env -S 'cmd args' splits that string and keeps resolving through it).
+//   joinAfterDashDash: after `--`, the remaining tokens join into ONE script string (capsh -- -c 'x').
+// }
+const SUDO_SHORT_VALUE = new Set("ugpCUrtDRTh".split(""));
+const SUDO_LONG_VALUE = new Set(["--user", "--group", "--prompt", "--close-from", "--other-user", "--role",
+  "--type", "--chdir", "--chroot", "--command-timeout", "--host", "--login-class"]);
+export const ELEVATED_PROGS = new Set(["sudo", "doas"]);
+const WRAPPER_SPECS = {
+  env: { valueOpts: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
+         spliceOpts: new Set(["-S", "--split-string"]), envAssignments: true },
+  timeout: { valueOpts: new Set(["-s", "--signal", "-k", "--kill-after"]), operands: 1 },
+  nice: { valueOpts: new Set(["-n", "--adjustment"]) },
+  ionice: { valueOpts: new Set(["-c", "--class", "-n", "--classdata", "-p", "--pid"]) },
+  stdbuf: { valueOpts: new Set(["-i", "-o", "-e"]) },
+  taskset: { valueOpts: new Set(["-c", "--cpu-list", "-p", "--pid"]), operands: 1, operandsIfNoOpts: true },
+  chrt: { valueOpts: new Set(["-p", "--pid"]), operands: 1, operandsIfNoOpts: true },
+  sudo: { valueOpts: SUDO_LONG_VALUE, shortValue: SUDO_SHORT_VALUE },
+  doas: { valueOpts: new Set(["-u", "-C"]), shortValue: new Set("uC".split("")) },
+  runuser: { runuserStyle: true },
+  // Everything after `--` is bash -c's script, not argv -- handled by joinAfterDashDash.
+  capsh: { joinAfterDashDash: true },
+  // plain peels: no operand before the command; leading options skipped (listed value-opts consumed).
+  nohup: {}, exec: {}, command: {}, builtin: {}, time: {}, pkexec: { valueOpts: new Set(["-u", "--user"]) }, setsid: {}, fakeroot: {},
+  eatmydata: {}, proxychains: {}, proxychains4: {}, busybox: {},
+  watch: { valueOpts: new Set(["-n", "--interval"]) },
+  unshare: { valueOpts: new Set(["-S", "-G", "--setuid", "--setgid", "-w", "--wd",
+    "--map-user", "--map-group"]) },
+  nsenter: { valueOpts: new Set(["-t", "--target", "-r", "--root", "-w", "--wd", "-S", "--setuid",
+    "-G", "--setgid"]) },
+  setpriv: { valueOpts: new Set(["--reuid", "--regid", "--groups", "--supp-groups", "--inh-caps",
+    "--ambient-caps", "--bounding-set", "--no-new-privs", "--selinux-label", "--apparmor-profile",
+    "--rlimit-as", "--rlimit-core", "--rlimit-cpu", "--rlimit-data", "--rlimit-fsize", "--rlimit-memlock",
+    "--rlimit-nofile", "--rlimit-nproc", "--rlimit-rss", "--rlimit-stack", "--securebits"]) },
+  chpst: { valueOpts: new Set(["-u", "-U", "-b", "-e", "-m", "-d", "-o", "-f", "-c", "-n"]) },
+  "flatpak-spawn": { valueOpts: new Set(["--env", "--forward-fd", "--watch-fd", "--env-fd",
+    "--expose-pids", "--directory", "--sandbox-expose", "--sandbox-expose-ro", "--sandbox-expose-fd",
+    "--sandbox-expose-fd-ro", "--unset-env"]) },
+  "systemd-run": { valueOpts: new Set(["--unit", "--uid", "--gid", "--nice", "--working-directory",
+    "--setenv", "--on-active", "--on-boot", "--on-startup", "--on-unit-active", "--on-unit-inactive",
+    "--on-calendar", "--timer-property", "--property", "-p", "--description", "--slice",
+    "--pty-delay"]) },
+  firejail: { valueOpts: new Set(["--profile", "--dns", "--hosts-file", "--private-home",
+    "--name", "--hostname", "--nice", "--cpu", "--rlimit-as", "--rlimit-cpu",
+    "--rlimit-nofile", "--rlimit-nproc", "--rlimit-fsize", "--rlimit-sigpending", "--interface",
+    "--veth-name", "--bridge", "--netmask", "--ip6", "--mtu", "--defaultgw", "--shell",
+    "--protocol", "--chroot", "--overlay", "--whitelist", "--env"]) },
+  chroot: { valueOpts: new Set(["--userspec", "--groups"], ), operands: 1 },
+};
+// Shell keywords and compound-syntax markers that precede the real command: `if true; then cat x; fi`,
+// `{ cat x; }`, `( cat x )`, `! cat x`, `case x in y) cat x;; esac`, `for v in a; do cat x; done`.
+// rdCommand historically knew a SUBSET of these and programOf knew none -- a rule routing through
+// programOf saw "if"/"{"/"!(" as the program and missed everything behind it.
+const KEYWORD_SKIP = new Set(["if", "then", "elif", "else", "fi", "do", "done", "while", "until",
+  "in", "esac", "select", "coproc", "{", "}", "!", "time"]);
+const base = (p) => p.slice(p.lastIndexOf("/") + 1);
+const stripHeadMarks = (t) => t.replace(/^[({!]+/, "");
+const isCaseLabel = (t) => t.endsWith(")") && !t.includes("(");
+
+/** The single argv peel walk. Consumes leading VAR=val assignments, shell keywords/grouping markers,
+ *  and every WRAPPER_SPECS wrapper -- each wrapper's own flags, value-taking options, operands and
+ *  script-splicing -- until an ordinary command word surfaces. Options:
+ *    stopAt: a Set of program names the walk does NOT peel but returns AS the command (programOf uses
+ *      ELEVATED_PROGS so the R5-sudo rule still sees `sudo`/`doas` as the program it must policy-check;
+ *      the canonicalization consumers pass nothing and peel them too).
+ *    splice: collected script strings pulled out of spliceOpts values along the way (env -S 'cmd').
+ *  Returns the remaining argv ([] when nothing concrete is left). Never throws; worst case stops early. */
+export function peelCommand(toksIn, opts = {}) {
+  const stopAt = opts.stopAt || null;
+  let toks = toksIn;
+  for (;;) {
+    if (!toks.length) return [];
+    const head = stripHeadMarks(toks[0]);
+    if (head !== toks[0]) {
+      // `!( cmd` / `{ cmd` / `( cmd`: the grouping marker rides the first token. If stripping it empties
+      // the token (a bare `(`/`{`/`!` word) or leaves a keyword, fall through to the keyword branch.
+      toks = [head, ...toks.slice(1)];
+    }
+    const t0 = toks[0];
+    if (!t0) { toks = toks.slice(1); continue; }
+    if (t0 === ")") { toks = toks.slice(1); continue; }
+    if (isCaseLabel(t0)) { toks = toks.slice(1); continue; }
+    if (t0 === "for" || t0 === "select") {
+      // `for v in a b; do ...`: the words between `in` and `do` are the list, not commands.
+      let i = 1;
+      while (i < toks.length && toks[i] !== "in" && toks[i] !== "do") i++;
+      while (i < toks.length && toks[i] !== "do") i++;
+      toks = i < toks.length ? toks.slice(i + 1) : [];
       continue;
     }
-    if (SKIP_PREFIX.has(toks[0])) {
-      toks = toks.slice(1);
-      while (toks.length && toks[0].startsWith("-")) {
-        const flag = toks[0];
-        toks = toks.slice(1);
-        if (["-n", "-p", "-o", "-e", "-i"].includes(flag) && toks.length && !toks[0].startsWith("-")) {
-          if (/^[+-]*\d+$/.test(toks[0])) toks = toks.slice(1);
+    if (t0 === "case") {
+      const k = toks.indexOf("in");
+      toks = k >= 0 ? toks.slice(k + 1) : [];
+      continue;
+    }
+    if (KEYWORD_SKIP.has(t0)) { toks = toks.slice(1); continue; }
+    if (ASSIGN_RE.test(t0)) { toks = toks.slice(1); continue; }
+    const prog = base(t0);
+    if (stopAt && stopAt.has(prog)) return toks;
+    const spec = WRAPPER_SPECS[prog];
+    if (!spec) return toks;
+    if (spec.runuserStyle) {
+      // runuser [opts] [-] [user] cmd...: the first bare positional is the user ONLY when a command
+      // still follows it, never when it IS the command (`runuser -u root bash -c ...` already named
+      // the user via -u).
+      let i = 1;
+      let namedUser = false;
+      while (i < toks.length) {
+        const t = toks[i];
+        if (t === "--") { i++; break; }
+        if (!t.startsWith("-") || t === "-") break;
+        if (["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group", "-c", "--command"].includes(t)) {
+          if (t === "-u" || t === "--user") namedUser = true;
+          i += 2;
+          continue;
+        }
+        i++;
+      }
+      if (i < toks.length && toks[i] === "-") i++;
+      // The first bare positional is the USER only when -u/--user didn't already name one and a
+      // command still follows it (`runuser bob ls` vs `runuser -u bob ls`).
+      if (!namedUser && i < toks.length && i + 1 < toks.length && !toks[i].startsWith("-")) i++;
+      if (i < toks.length && toks[i] === "--") i++;
+      toks = toks.slice(i);
+      continue;
+    }
+    let i = 1;
+    let sawValueOpt = false;
+    while (i < toks.length) {
+      const t = toks[i];
+      if (t === "--") {
+        i++;
+        if (spec.joinAfterDashDash) return toks.slice(i).length ? ["bash", ...toks.slice(i)] : [];
+        break;
+      }
+      if (!t.startsWith("-") || t === "-") break;
+      if (spec.envAssignments && ASSIGN_RE.test(t)) { i++; continue; }
+      if (spec.spliceOpts) {
+        // --split-string=x / -S=x: the attached value is still a command line to splice.
+        const eq = spec.spliceOpts && [...spec.spliceOpts].find((o) => t.startsWith(o + "="));
+        if (eq) {
+          const val = t.slice(eq.length + 1);
+          if (opts.splice) opts.splice.push(val);
+          toks = [...toks.slice(0, i), ...words(val), ...toks.slice(i + 1)];
+          i = 1;
+          continue;
         }
       }
-      continue;
+      if (t.includes("=")) { i++; continue; } // --opt=val: value attached, nothing more to consume
+      if (spec.spliceOpts && spec.spliceOpts.has(t) && i + 1 < toks.length) {
+        // env -S/--split-string: the value IS a command line. Splice its words back into the argv walk
+        // (env -S 'rm -rf /' resolves to rm) AND record the raw text for script-level consumers.
+        if (opts.splice) opts.splice.push(toks[i + 1]);
+        toks = [...toks.slice(0, i), ...words(toks[i + 1]), ...toks.slice(i + 2)];
+        i = 1;
+        continue;
+      }
+      if (spec.valueOpts && spec.valueOpts.has(t)) { i += 2; sawValueOpt = true; continue; }
+      // Attached short-form value for a spliceOpt (env -S'cmd args').
+      if (spec.spliceOpts && !t.startsWith("--") && t.length > 2 && [...spec.spliceOpts].some((o) => o.length === 2 && t.startsWith(o))) {
+        const val = t.slice(2);
+        if (opts.splice) opts.splice.push(val);
+        toks = [...toks.slice(0, i), ...words(val), ...toks.slice(i + 1)];
+        i = 1;
+        continue;
+      }
+      if (!t.startsWith("--") && spec.shortValue) {
+        let consumed = false;
+        for (let j = 1; j < t.length; j++) {
+          if (spec.shortValue.has(t[j])) { if (j === t.length - 1) { i += 2; consumed = true; } break; }
+        }
+        if (consumed) continue;
+        i++;
+        continue;
+      }
+      i++; // unknown option: conservatively a flag
     }
-    break;
+    const operands = spec.operandsIfNoOpts && sawValueOpt ? 0 : (spec.operands || 0);
+    i += operands;
+    if (i >= toks.length) {
+      // The wrapper IS the command (bare `env` dumps the environment, bare `xargs` echoes stdin):
+      // surface it as the program with its own args, not as a resolved-nothing.
+      return toks;
+    }
+    toks = toks.slice(i);
   }
+}
+
+/** First real command word of a segment, past VAR=val, keywords and wrapper prefixes -- deliberately
+ *  NOT past sudo/doas (ELEVATED_PROGS), which surface AS the program so the R5-sudo/doas policy rule
+ *  still applies to them; every other consumer resolves elevation via resolveCommand/peelCommand.
+ *  Returns [program, args]. */
+export function programOf(segment) {
+  const toks = peelCommand(words(segment), { stopAt: ELEVATED_PROGS });
   if (!toks.length) return [null, []];
   return [base(toks[0]), toks.slice(1)];
 }
 
-// ── wrapper unwrap: bash -c/sh -c/eval/xargs, one shared implementation every rule routes through ───────
-export const SHELL_WRAPPER_PROGS = new Set(["sh", "bash", "dash", "zsh", "ksh"]);
+// ── wrapper unwrap: bash -c/sh -c/eval/xargs/find -exec/su/ssh/..., shared by every rule ──────────────
+export const SHELL_WRAPPER_PROGS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh"]);
 const SHELL_WRAPPER_VALUE_OPTS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
-const XARGS_VALUE_OPTS = new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s",
+const XARGS_VALUE_OPTS = new Set(["-a", "-d", "-E", "-I", "-J", "-L", "-n", "-P", "-s",
   "--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars", "--process-slot-var"]);
+const PARALLEL_VALUE_OPTS = new Set(["-a", "--arg-file", "-A", "-j", "--jobs", "-N", "-n", "--max-lines",
+  "-L", "-l", "-s", "--colsep", "--delay", "--retries", "-S", "--trc", "-W", "--workdir", "-P",
+  "--max-procs", "-I", "--replace", "-B", "--slot-replace", "--timeout"]);
+const SSH_VALUE_OPTS = new Set(["-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
+  "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]);
 /** For a shell invoked with -c ('bash -c', 'sh -c', 'zsh -c', ...), the wrapped script text as a single
  *  trimmed, outer-quote-stripped string; null if `args` isn't a -c invocation. Handles a combined short
  *  flag group (`-xc`) and -o/-O's own value. The one shared -c detector: both expandWrappedSegments below
@@ -168,93 +377,21 @@ export function shellDashCScript(args) {
     break;
   }
   if (!hasC) return null;
-  return args.slice(i).join(" ").trim().replace(/^['"]+|['"]+$/g, "");
+  const script = args.slice(i).join(" ").trim().replace(/^['"]+|['"]+$/g, "");
+  return substLiteral(script) || script;
 }
-// ── peeling env/timeout/nice/sudo/... off an argv (programOf's loop, as a reusable primitive) ──────────
-// sudo/doas only appear in xargs' invoked argv (programOf itself deliberately leaves them to callers'
-// unsudo, so the R5-sudo rule still sees `sudo` as the program). Value-taking short options inside a
-// bundled short-option run take the NEXT argv element only when they're the last char (sudo -u root);
-// an attached value (sudo -uroot) stays inside the same token.
-const SUDO_VALUE_SHORT = new Set("ugpCUrtDRTh".split(""));
-const SUDO_VALUE_LONG = new Set(["--user", "--group", "--prompt", "--close-from", "--other-user", "--role",
-  "--type", "--chdir", "--chroot", "--command-timeout", "--host"]);
-const DOAS_VALUE_OPTS = new Set(["-u", "-C"]);
-/** The same assignment/env/timeout/skip-prefix peeling programOf() applies to a segment's tokens, plus
- *  sudo/doas, run on an already-tokenized argv — for resolving what an xargs/reader indirection actually
- *  invokes (`xargs -I{} timeout {} bash -c 'rm -rf {}'` -> bash's -c script) where the caller holds argv,
- *  not text. Iterates until no more prefixes peel. Returns the remaining argv (possibly empty). */
-export function peelArgv(toksIn) {
-  let toks = toksIn;
-  for (;;) {
-    if (!toks.length) return [];
-    if (ASSIGN_RE.test(toks[0])) { toks = toks.slice(1); continue; }
-    const head = base(toks[0]);
-    if (VALUE_WRAPPERS.has(head)) {
-      const rest = wrappedCommand(toks);
-      if (rest === null) return toks;
-      toks = rest;
-      continue;
-    }
-    if (head === "runuser") {
-      // runuser [opts] [-] [user] cmd...: -u/-s/-g/-G take values; a lone `-` means "login shell, user
-      // follows"; the first positional is the user only when a command still follows it (-- ends opts).
-      let i = 1;
-      while (i < toks.length) {
-        const t = toks[i];
-        if (t === "--") { i++; break; }
-        if (!t.startsWith("-") || t === "-") break;
-        i += ["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"].includes(t) ? 2 : 1;
-      }
-      if (i < toks.length && toks[i] === "-") i++;
-      if (i < toks.length && i + 1 < toks.length && !toks[i].startsWith("-")) i++; // user operand
-      if (i < toks.length && toks[i] === "--") i++;
-      toks = toks.slice(i);
-      continue;
-    }
-    if (head === "sudo" || head === "doas") {
-      let i = 1;
-      while (i < toks.length) {
-        const t = toks[i];
-        if (t === "--") { i++; break; }
-        if (!t.startsWith("-") || t.length < 2) break;
-        if (t.startsWith("--")) { i += SUDO_VALUE_LONG.has(t) ? 2 : 1; continue; }
-        i++;
-        for (let j = 1; j < t.length; j++) {
-          const valOpt = head === "sudo" ? SUDO_VALUE_SHORT.has(t[j]) : DOAS_VALUE_OPTS.has("-" + t[j]);
-          if (valOpt) { if (j === t.length - 1) i++; break; }
-        }
-      }
-      toks = toks.slice(i);
-      continue;
-    }
-    if (SKIP_PREFIX.has(toks[0])) {
-      toks = toks.slice(1);
-      while (toks.length && toks[0].startsWith("-")) {
-        const flag = toks[0];
-        toks = toks.slice(1);
-        if (["-n", "-p", "-o", "-e", "-i"].includes(flag) && toks.length && !toks[0].startsWith("-")) {
-          if (/^[+-]*\d+$/.test(toks[0])) toks = toks.slice(1);
-        }
-      }
-      continue;
-    }
-    return toks;
-  }
-}
-const PARALLEL_VALUE_OPTS = new Set(["-a", "--arg-file", "-A", "-j", "--jobs", "-N", "-n", "--max-lines",
-  "-L", "-l", "-s", "--colsep", "--delay", "--retries", "-S", "--trc", "-W", "--workdir", "-P",
-  "--max-procs", "-I", "--replace", "-B", "--slot-replace", "--timeout"]);
+
 /** The real [program, args] an item-feeding or shell-indirection command runs: `xargs`'/`parallel`'s
- *  invoked argv, `find ... -exec cmd \;`'s argv, or — for su/ssh — the inline script itself.
- *  The invoked argv gets the SAME prefix peeling a bare command line would (env/nice/timeout/sudo/...):
- *  without it `xargs -I{} timeout {} bash -c 'rm -rf /'` resolved to `timeout` — not a shell wrapper —
- *  and the -c script was never unwrapped. Returns [program, args], or null when prog isn't one of the
- *  known indirections / has no invoked command. */
+ *  invoked argv, `find ... -exec cmd \;`'s argv, or -- for su/ssh -- the inline script itself.
+ *  The invoked argv gets the SAME full prefix peeling a bare command line would (env/timeout/nice/
+ *  sudo/setsid/systemd-run/...): without it `xargs -I{} timeout {} bash -c 'rm -rf /'` resolved to
+ *  `timeout` -- not a shell wrapper -- and the -c script was never unwrapped. Returns [program, args],
+ *  or null when prog isn't one of the known indirections / has no invoked command. */
 export function indirectInvokes(prog, args) {
   if (prog === "xargs" || prog === "parallel") {
     const i = firstPositional(args, prog === "xargs" ? XARGS_VALUE_OPTS : PARALLEL_VALUE_OPTS);
     if (i === null) return null;
-    const rest = peelArgv(args.slice(i));
+    const rest = peelCommand(args.slice(i));
     return rest.length ? [base(rest[0]), rest.slice(1)] : null;
   }
   if (prog === "find") {
@@ -262,54 +399,298 @@ export function indirectInvokes(prog, args) {
       if (!["-exec", "-execdir", "-ok", "-okdir"].includes(args[i])) continue;
       const rest = [];
       for (let j = i + 1; j < args.length && args[j] !== ";" && args[j] !== "+"; j++) rest.push(args[j]);
-      const peeled = peelArgv(rest);
+      const peeled = peelCommand(rest);
       if (peeled.length) return [base(peeled[0]), peeled.slice(1)];
     }
   }
   return null;
 }
-const SSH_VALUE_OPTS = new Set(["-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
-  "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]);
-/** `su [-] [user] -c 'script'` / `runuser ... -c 'script'`: the -c operand is a full shell script, same
- *  indirection class as `bash -c`. */
+
+/** Full command resolution: programOf's keyword/wrapper peel, then the item-feeding/shell indirection
+ *  resolution (xargs/parallel/find -exec), then a final peel of whatever that produced -- iterated until
+ *  stable (an -exec'd command can itself be an indirection). This is THE entry point every per-segment
+ *  rule uses when it asks "what program does this segment actually run, and with what args": the invoked
+ *  argv is rescanned through every rule exactly like a bare command (xargs curl -d @.env, find -exec dd,
+ *  xargs aws s3 cp secrets all reach their rules). `stopAt` forwards to programOf. */
+export function resolveCommand(segment, opts = {}) {
+  const [prog0, args0] = programOf(segment);
+  if (prog0 === null) return [null, []];
+  // programOf deliberately stops AT sudo/doas (R5 sees the elevation wrapper); everything else needs
+  // the command behind it, so the head goes through one more peel with no stopAt.
+  let toks = peelCommand([prog0, ...args0]);
+  if (!toks.length) return [null, []];
+  let [prog, args] = [base(toks[0]), toks.slice(1)];
+  for (let k = 0; k < 4; k++) {
+    const invoked = indirectInvokes(prog, args);
+    if (!invoked) return [prog, args];
+    const peeled = peelCommand([invoked[0], ...invoked[1]]);
+    if (!peeled.length) return [null, []];
+    [prog, args] = [base(peeled[0]), peeled.slice(1)];
+  }
+  return [prog, args];
+}
+
+/** `su [-] [user] -c 'script'` / `su -c'script'` / `su --command='script'`: the -c operand is a full
+ *  shell script, same indirection class as `bash -c` (GNU su accepts the -c<value> attached form too). */
 function suScript(args) {
   for (let i = 0; i < args.length; i++) {
     if ((args[i] === "-c" || args[i] === "--command") && i + 1 < args.length) return args[i + 1];
     if (args[i].startsWith("--command=")) return args[i].slice("--command=".length);
+    if (args[i].length > 2 && args[i].startsWith("-c") && !args[i].startsWith("--")) return args[i].slice(2);
   }
   return null;
 }
 /** `ssh [opts] dest 'remote script'`: first non-option operand is the destination, everything after it is
- *  one remote command line — re-tokenizable script text for our purposes. */
+ *  one remote command line -- re-tokenizable script text for our purposes. */
 function sshScript(args) {
   const i = firstPositional(args, SSH_VALUE_OPTS);
   return i !== null && i + 1 < args.length ? args.slice(i + 1).join(" ") : null;
 }
-/** Every shell-script body reachable by peeling off a `bash -c`/`sh -c`/`eval`/`xargs ... <real command>`
- *  wrapper around any of `segments`, recursively, up to `maxDepth` levels -- raw, unsplit text, so a caller
- *  needing pipeline structure (splitPipelines) or per-segment matching (splitSegments) parses it whichever
- *  way it needs. `programOf` already strips env/timeout/nice/nohup/command/builtin/stdbuf/sudo-less prefix
- *  wrappers on its own, so only an actual -c body or an `eval`/`xargs` layer needs handling here. Returns
- *  only the NEWLY found script bodies, not the original segments (callers already have those). */
+const TMUX_SCRIPT_SUBS = new Set(["new-session", "neww", "new-window", "split-window", "splitw", "respawn-pane", "respawnw"]);
+/** Interpreters whose -c/-e/--eval/-r operand is an inline script (versioned binary names like
+ *  python3.11 match via the same trailing-version rule the pipe detector uses). */
+export const INTERP_SCRIPT_PROGS = new Set(["python", "python3", "node", "nodejs", "ruby", "perl", "php",
+  "deno", "bun", "pwsh", "powershell", "lua"]);
+const INTERP_SCRIPT_OPTS = new Set(["-c", "-e", "--eval", "-r"]);
+const INTERP_PROG_BASES = new Set(["python", "node", "nodejs", "ruby", "perl", "php", "deno", "bun", "lua", "pwsh", "powershell"]);
+const INTERP_VERSION_RE2 = /^([a-z]+?)(\d+(?:\.\d+)*)$/i;
+function interpBase(prog) {
+  if (INTERP_PROG_BASES.has(prog)) return prog;
+  const m = INTERP_VERSION_RE2.exec(prog || "");
+  return m && INTERP_PROG_BASES.has(m[1].toLowerCase()) ? m[1].toLowerCase() : null;
+}
+/** The inline-script text of an interpreter invocation (`python -c X`, `node --eval X`, `php -r X`,
+ *  `deno eval X`, `bun -e X`), or null. deno's `eval` is a SUBCOMMAND (first positional), not a flag. */
+export function interpScriptText(prog, args) {
+  const b = interpBase(prog);
+  if (!b) return null;
+  if (b === "deno") {
+    const i = firstPositional(args, new Set());
+    return i !== null && args[i] === "eval" && args[i + 1] !== undefined ? args[i + 1] : null;
+  }
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") break;
+    if (INTERP_SCRIPT_OPTS.has(a) && args[i + 1] !== undefined) return args[i + 1];
+    if (a.startsWith("--eval=")) return a.slice("--eval=".length);
+  }
+  return null;
+}
+/** A script string carried by a segment's resolved invocation: bash/sh/fish -c, eval's whole args, an
+ *  interpreter's -c/-e/-r/--eval payload, su -c, ssh's remote command line, tmux's shell-command
+ *  operand, capsh's post-`--` join, or an env -S/--split-string value. Returns script text or null. */
+export function scriptOf(prog, args, opts = {}) {
+  if (prog === "eval") return args.length ? args.join(" ") : null;
+  if (SHELL_WRAPPER_PROGS.has(prog)) return shellDashCScript(args);
+  if (prog === "su" || prog === "runuser") return suScript(args);
+  if (prog === "ssh") return sshScript(args);
+  if (prog === "tmux") {
+    const i = firstPositional(args, new Set(["-L", "-S", "-f", "-T", "-t", "-s"]));
+    if (i !== null && TMUX_SCRIPT_SUBS.has(args[i]) && args.slice(i + 1).length) return args.slice(i + 1).join(" ");
+    return null;
+  }
+  if (prog === "env") {
+    for (let i = 0; i < args.length; i++) {
+      if ((args[i] === "-S" || args[i] === "--split-string") && args[i + 1]) return args[i + 1];
+      if (args[i].startsWith("--split-string=")) return args[i].slice("--split-string=".length);
+      if (args[i].length > 2 && args[i].startsWith("-S")) return args[i].slice(2);
+    }
+    return null;
+  }
+  if (opts.interp !== false) {
+    const t = interpScriptText(prog, args);
+    if (t !== null) return t;
+  }
+  return null;
+}
+
+/** Every script body reachable by peeling wrapper layers around any of `segments` -- bash -c/sh -c/
+ *  eval/xargs/find -exec/parallel/su/runuser/ssh/tmux/capsh/env -S/interp -c -- recursively, up to
+ *  maxDepth levels. Raw, unsplit text, so a caller needing pipeline structure (splitPipelines) or
+ *  per-segment matching (splitSegments) parses it whichever way it needs. Returns only the NEWLY found
+ *  script bodies, not the original segments (callers already have those). */
 export function unwrapScripts(segments, maxDepth = 3) {
   const out = [];
   const walk = (segs, depth) => {
     if (depth >= maxDepth) return;
     for (const seg of segs) {
+      // env -S/--split-string's value is a script line peelCommand splices into argv (resolveCommand
+      // sees `env -S 'rm -rf /'` as rm); collect the same text as a SCRIPT so pipeline-shape rules
+      // (env --split-string='curl x | sh') see the | as a real pipeline, not argv noise.
+      const splices = [];
+      peelCommand(words(seg), { splice: splices });
+      for (const sp of splices) {
+        out.push(sp);
+        walk(splitSegments(stripHeredocs(sp)), depth + 1);
+      }
       let [prog, args] = programOf(seg);
       if (prog === null) continue;
       const invoked = indirectInvokes(prog, args);
       if (invoked) [prog, args] = invoked;
-      const script = prog === "eval" ? (args.length ? args.join(" ") : null)
-        : SHELL_WRAPPER_PROGS.has(prog) ? shellDashCScript(args)
-        : (prog === "su" || prog === "runuser") ? suScript(args)
-        : prog === "ssh" ? sshScript(args) : null;
+      const script = scriptOf(prog, args);
       if (!script) continue;
       out.push(script);
       walk(splitSegments(stripHeredocs(script)), depth + 1);
+      // An interpreter's -c/-e/--eval payload is ITS language, not shell -- but string literals inside
+      // it passed to os.system()/execSync()/system()/qx are shell command lines with literal text
+      // right there to scan: python3 -c "import os;os.system('rm -rf /')" unwraps the os.system
+      // operand exactly like any other -c script.
+      if (interpBase(prog) !== null) {
+        for (const lit of interpShellLiterals(script)) {
+          out.push(lit);
+          walk(splitSegments(stripHeredocs(lit)), depth + 1);
+        }
+      }
     }
   };
   walk(segments, 0);
+  return out;
+}
+
+const SUBST_LIT_TOKEN_RE = /^(?:\$\((.*)\)|`(.*)`)$/s;
+/** If a token is exactly one `$(cmd ...)`/`` `cmd ...` `` substitution whose command is a literal-
+ *  printing builtin (`echo X`, `printf X`), resolve to the literal the substitution emits -- the
+ *  common way to smuggle a dangerous operand ("rm -rf $(echo /)") behind a substitution the path
+ *  checks would otherwise see as opaque. Any other inner command (mktemp, cat, ...) can't be proven
+ *  from the text and resolves to null (treated as an unprovable value, not a literal). */
+export function substLiteral(tok) {
+  if (typeof tok !== "string") return null;
+  const m = SUBST_LIT_TOKEN_RE.exec(tok.trim());
+  if (!m) return null;
+  const inner = (m[1] !== undefined ? m[1] : m[2]).trim();
+  const ws = words(inner);
+  if (!ws.length) return null;
+  let toks = ws;
+  if (toks[0] === "printf" && toks.length > 1) toks = toks.slice(1);
+  if (toks[0] !== "echo") return null;
+  const val = toks.slice(1).filter((t) => t !== "-n" && t !== "-e").join(" ");
+  return val || null;
+}
+
+/** Shell-command-looking string literals inside an interpreter -c/-e payload: the operands of
+ *  os.system/subprocess/exec/spawn/execSync/system/backtick/qx calls, plus perl's system qw(...)
+ *  list joined back into a command line. Heuristic: only literals that look like a command line
+ *  (a leading bare word followed by a space or a / path) qualify -- data strings never do. */
+const STRING_LIT_RE2 = /'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"|`([^`\\]*(?:\\.[^`\\]*)*)`/g;
+const SHELLISH_RE = /^[~.\/]|[A-Za-z0-9_][A-Za-z0-9_.\/-]*\s/;
+function interpShellLiterals(script) {
+  const out = [];
+  for (const m of script.matchAll(STRING_LIT_RE2)) {
+    const lit = (m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3] || "")
+      .replace(/\\(['"\\`])/g, "$1");
+    if (lit.length > 2 && lit.length < 4000 && SHELLISH_RE.test(lit)) out.push(lit);
+  }
+  for (const m of script.matchAll(/\bqw\s*[(\[{]\s*([^)\]}]+)\s*[)\]}]/g)) {
+    const joined = m[1].trim().replace(/\s+/g, " ");
+    if (SHELLISH_RE.test(joined)) out.push(joined);
+  }
+  return out;
+}
+
+// ── input-supplied scripts: heredocs and here-strings feeding an executor ────────────────────────────
+// stripHeredocs drops a heredoc body as inert data -- correct when it lands in a file or a non-
+// executor's stdin, but a `<<`-redirect onto a shell/interpreter/at/crontab makes the body a SCRIPT,
+// literal text every rule should see the same as `bash -c '...'`'s operand.
+/** Does a segment resolve to something that EXECUTES its stdin (or named operand) as a script?
+ *  Covers `sh`, `bash -s`, an interpreter with no script argument, `at`/`batch` (the body IS the
+ *  at-job's command list), `crontab` (body lines are cron entries: five fields then the command),
+ *  `xargs`/`parallel`/`find -exec` whose invoked program is itself an executor (itemFed bodies get
+ *  the same per-item ask the direct indirections get), and `ssh dest 'sh'` whose REMOTE command reads
+ *  stdin. Returns {prog, itemFed, crontab} or null. */
+function executorOf(prog, args) {
+  if (prog === null) return null;
+  const invoked = indirectInvokes(prog, args);
+  if (invoked) {
+    const [iprog, iargs] = invoked;
+    if (SHELL_WRAPPER_PROGS.has(iprog) && scriptOf(iprog, iargs, { interp: false }) === null) {
+      return { prog: iprog, itemFed: true, crontab: false };
+    }
+    if (interpBase(iprog) && !iargs.some((a) => !a.startsWith("-"))) {
+      return { prog: iprog, itemFed: true, crontab: false };
+    }
+    const inner = scriptOf(iprog, iargs, { interp: false });
+    if (inner) {
+      const [p2] = programOf(inner);
+      if (p2 && SHELL_WRAPPER_PROGS.has(p2)) return { prog: p2, itemFed: true, crontab: false };
+    }
+    return null;
+  }
+  if (SHELL_WRAPPER_PROGS.has(prog)) {
+    if (scriptOf(prog, args, { interp: false }) !== null) return null; // sh -c: stdin is data
+    const fileArg = args.some((a) => !a.startsWith("-"));
+    return fileArg ? null : { prog, itemFed: false, crontab: false };
+  }
+  if (interpBase(prog) && interpScriptText(prog, args) === null &&
+      !args.some((a) => !a.startsWith("-"))) {
+    return { prog, itemFed: false, crontab: false };
+  }
+  if (prog === "at" || prog === "batch" || prog === "eval") return { prog, itemFed: false, crontab: false };
+  if (prog === "crontab") return { prog, itemFed: false, crontab: true };
+  if (prog === "ssh") {
+    const remote = sshScript(args);
+    if (!remote) return null;
+    const [rp, ra] = programOf(remote);
+    return executorOf(rp, ra);
+  }
+  return null;
+}
+/** Scan a line for the executor a heredoc/here-string on it feeds: checks EVERY stage of the line's
+ *  pipelines, not just the first command (`cat <<EOF | sh` executes the body through the sh stage). */
+function lineExecutor(line) {
+  for (const pipeline of splitPipelines(stripRedirects(line))) {
+    for (const stage of pipeline) {
+      const [prog, args] = programOf(stage);
+      const ex = executorOf(prog, args);
+      if (ex) return ex;
+    }
+  }
+  return null;
+}
+const HERESTRING_RE = /(?<!<)<<<\s*(?:'([^']*)'|"([^"]*)"|(\S+))/g;
+const CRON_FIELD_RE = /^\s*\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+/;
+/** Script bodies a heredoc or here-string feeds to an executor: [{body, itemFed, crontab}].
+ *  `itemFed` marks xargs/parallel/find -exec-driven bodies (an rm -r inside one asks the way the
+ *  direct indirection asks); `crontab` marks bodies whose lines need the 5-field cron prefix
+ *  stripped to reach the command. */
+export function inputScripts(command) {
+  const out = [];
+  if (!command) return out;
+  const lines = String(command).split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const delims = heredocDelimiters(line);
+    const hs = [];
+    for (const m of line.matchAll(HERESTRING_RE)) {
+      const v = m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : m[3] || "";
+      if (v.trim()) hs.push(v.trim());
+    }
+    const executor = (delims.length || hs.length) ? lineExecutor(line) : null;
+    if (executor) for (const v of hs) out.push({ body: v, itemFed: executor.itemFed, crontab: executor.crontab });
+    if (!delims.length) { i++; continue; }
+    i++;
+    for (const [delim, dashed] of delims) {
+      const body = [];
+      while (i < lines.length) {
+        const l = lines[i]; i++;
+        const probe = dashed ? l.replace(/^\t+/, "") : l;
+        if (probe.replace(/\r+$/, "") === delim) break;
+        body.push(l);
+      }
+      if (executor) out.push({ body: body.join("\n"), itemFed: executor.itemFed, crontab: executor.crontab });
+    }
+  }
+  return out;
+}
+/** The command lines of a crontab body: each entry's five schedule fields stripped; comments, blank
+ *  lines and VAR=val environment lines dropped. */
+export function crontabCommands(body) {
+  const out = [];
+  for (const line of String(body || "").split("\n")) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    const m = CRON_FIELD_RE.exec(line);
+    if (m) out.push(line.slice(m[0].length));
+  }
   return out;
 }
 
@@ -409,7 +790,7 @@ export function shellCodeOnly(command) {
   return text.replace(ESCAPED_RE, "_").replace(QUOTED_RE, '""');
 }
 
-const SUBST_RE = /\$\(([^()]*)\)|`([^`]*)`/g;
+const SUBST_RE = /\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)/g;
 /** Segments of every `$(...)` / backtick substitution (an assignment's value is skipped). */
 export function substitutedSegments(command) {
   const out = [];
@@ -419,7 +800,10 @@ export function substitutedSegments(command) {
       const before = splitSegments(cmd.slice(0, m.index));
       const toks = before.length ? words(before[before.length - 1]) : [];
       if (toks.length && toks.every((t) => ASSIGN_RE.test(t) || ["export", "local", "readonly", "declare", "typeset"].includes(t))) continue;
-      let inner = m[1] !== undefined ? m[1] : m[2];
+      // <(cmd)/>(cmd) process substitution: the inner command line is literal text that runs
+      // (diff <(cat ~/.env) really executes cat on the secret) -- extracted like $(...) since it IS
+      // executed code, unlike the opaque data a substitution PRODUCES at runtime.
+      let inner = m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4]);
       if (inner.startsWith("<")) inner = "cat " + inner.slice(1);
       out.push(...splitSegments(inner));
     }
@@ -498,7 +882,7 @@ export function splitPipelines(command) {
   let segs = [];
   let buf = [];
   let quote = null;
-  const s = command || "";
+  const s = (command || "").replace(/\\\r?\n/g, "");
   const n = s.length;
   let i = 0;
   const flushSeg = () => { const t = buf.join("").trim(); if (t) segs.push(t); buf = []; };

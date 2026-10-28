@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-Guard corpus grown to 200 cases (`evals/guard.jsonl`) across four independent adversarial review rounds on
+Guard corpus grown to 220 cases (`evals/guard.jsonl`) across five independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
@@ -19,13 +19,20 @@ names, and a credential-placeholder-window fix in round 3; escaped-quote dequoti
 scripts and xargs indirection parity in round 4, extended in a round-4b self-verification pass to the same
 indirection class in `find -exec`, GNU `parallel`, `su -c`/`runuser`, and `ssh dest 'cmd'` — with strict
 parity (any recursive rm in an indirect script asks, not only placeholder-carrying ones) and a g135
-relabel; plus two pinned cases documenting the deliberate 3-layer unwrap cap, and g67's expectation
-relabeled: AWS's canonical doc-example key ends in "EXAMPLE" and is placeholder-suppressed by design, while
-a real AKIA-shaped literal still blocks per g128).
+relabel; then round 5 unified the whole family into ONE argv walk (shell.mjs's `peelCommand` +
+`WRAPPER_SPECS` + `resolveCommand`) covering doas/pkexec/setsid/busybox/chroot/unshare/systemd-run/watch/
+firejail/nsenter/flatpak-spawn/setpriv/capsh/chpst/taskset/proxychains and shell keywords, added
+heredoc/here-string script extraction, `\`-newline folding, `$'...'` ANSI-C decoding, invoked-argv rescan
+through every rule, device-write and cloud-destructive tables, and the P1 sweep (env -S, fish/csh/tcsh,
+node --eval/php -r/deno/bun, os.system literals, $(echo X) operands, stdin-redirect exfil, archiver pipes,
+~user, process substitution, git push --delete/-d/:ref/lease, at <<<, tmux new-session, xargs -J, pip
+file://) — plus g114's relabel: a normalized-to-root rm operand now hits R7-root-delete's block, matching
+rm -rf /'s tier; and g67's prior relabel stands (AWS doc-example "EXAMPLE" suppressed by design, real
+AKIA-shaped literal still blocks per g128).
 
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 200 | 96.5% | 95.9% | 100.0% | **0.0%** |
+| guard | 220 | 96.4% | 96.5% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's
@@ -34,7 +41,7 @@ Not a regression in the `verify_done` logic itself -- see `decide()`'s own unit 
 `server/test/kit.test.mjs` for credential-independent coverage of that logic.
 
 Guard's 4 remaining misses (down from 8 after g67's relabel and earlier recounts; all independent of the
-round-2/3/4/4b fixes): `kubectl delete` on a namespace (`ask` vs Jev-scored `allow` offline),
+round-2/3/4/4b/5 fixes): `kubectl delete` on a namespace (`ask` vs Jev-scored `allow` offline),
 `npm publish`/`docker push` (`ask` vs Jev-scored `allow` offline), and a `config/secrets.yml` read (`block`
 vs Jev-scored `allow` offline) -- all genuinely ambiguous judgment calls Jev would resolve with credentials,
 not false negatives in the deterministic rules.
