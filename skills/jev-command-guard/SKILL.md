@@ -1,11 +1,13 @@
 ---
 name: jev-command-guard
-description: Before running a risky or ambiguous shell command (deleting or overwriting files, sudo, scp/rsync/ssh to another host, reading .env or key files, printing environment variables, git commit/add that might stage secrets, curl | sh, anything touching prod), ask the jev-mcp kit_guard_command tool whether it is safe, then obey its allow / ask / block answer.
+description: Before running a risky or ambiguous shell command (deleting or overwriting files, sudo, scp/rsync/ssh to another host, reading .env or key files, printing environment variables, git commit/add that might stage secrets, curl | sh, anything touching prod), ask the jev-mcp kit_guard_command tool for a second opinion, then obey `ask` and `block`.
 ---
 
 # jev-command-guard
 
 Run the command through `kit_guard_command` first whenever it could be destructive, exfiltrate or print a secret, change something outside the working directory, or touch another machine. Skip it for plainly read-only commands (`ls`, `git status`, `rg`, `cat README.md`, test and build runs).
+
+If a `kit_guard_command` PreToolUse hook is already installed it calls the same tool on every Bash/Read, so you can skip manual calls on commands that pass through it — but it is not equivalent: it fails open on a 2 s Jev timeout, never blocks in `JEV_GUARD_MODE=shadow`, can let `ask` through when `JEV_GUARD_ASK_NO_UI=allow`, and covers Bash/Read only. Keep calling the tool for anything risky outside those shapes or when you can't see the hook's mode.
 
 ## Call
 
@@ -24,13 +26,13 @@ Arguments (only `command` is required):
 
 | decision | what you do |
 |---|---|
-| `allow` | Run the command. |
-| `ask` | Do not run it yet. Tell the user what the command does and the `reason`, and wait for an explicit yes. If they approve, run it (or re-call with their words in `user_request`). |
+| `allow` | Run it — but read this as "no rule matched, no opinion", not "proven safe". Prefilter misses obfuscated secrets and many dangerous shapes, so keep your own judgment for anything destructive. |
+| `ask` | Do not run it yet. Tell the user what the command does and the `reason`, and wait for an explicit yes. If they approve, run it (or re-call with their words in `user_request`). In a host with no UI to ask through (e.g. an omp hook), `ask` resolves to `block`. |
 | `block` | Do not run it. Read `rule`, `reason` and `suggestion`, then take the suggested safer route (for example load `.env` into the environment instead of printing it). Never retry the same command reworded, quoted, split up or base64-encoded to get past the guard. |
 
 ## Notes
 - `decided_by: "prefilter"` means a deterministic rule fired and no model was called (secret reads, `rm -rf ~`, `sudo`, staging secrets). `decided_by: "jev"` means the Jev model scored it; `score` is the risk 0-1.
 - If `jev.status` shows Jev is unavailable, the server fails open (`allow` with a note). Treat that as "no opinion", and use normal caution for anything destructive.
 - `disable_rules` exists but only the user may decide to use it.
-- Never paste secrets into `command`; the server redacts but you should not send them.
+- Never put a secret value in `command` (or `file_path`): the full text goes to the MCP server, and when Jev is consulted a **redacted, truncated** copy goes upstream to the model API (`redactCap` in the server). Even redacted, don't paste secrets — refer to files.
 - Rules adapted from jonathanavis96/jev-kit (MIT).

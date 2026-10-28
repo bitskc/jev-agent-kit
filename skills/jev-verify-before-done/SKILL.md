@@ -19,18 +19,17 @@ Tool: `kit_verify_done` on the `jev` MCP server (Claude Code: `mcp__jev__kit_ver
   "final_message": "your draft final message",
   "file_changes": 3,
   "checks": [
-    {"command": "npm test", "output": "<last ~50 lines of output>", "passed": true}
+    {"command": "npm test", "output": "<last ~50 lines of real output>"}
   ]
 }
 ```
-- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` (command and output tail; `passed` is auto-detected from runner summaries if omitted).
-- Claude Code users can alternatively pass `transcript_tail` (tail of the session JSONL) and let the server derive the evidence.
+- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command` + the output tail. **Paste real output — a bare command name is not evidence.** The tool auto-detects pass/fail from recognised runner summaries (Jest/pytest/cargo/go/vitest/bun/eslint/tsc/build banners); **a check command it can't parse counts as passed** — `npm test` failing with `2 failing` and no recognised summary still verifies. The only hard evidence is a recognised pass banner or an explicit `passed:true`, so paste output the tool can read and never set `passed:true` to assert a run the output doesn't show.
 - Optional `threshold` (0.5-1, default 0.75): how sure the server must be that you claim done before it blocks.
 
 ## Act on the result
 
 - `verified: true` (or `action: allow`): send your message.
-- `verified: false` with `verdict: "unverified"`: do **not** send it. Run the project's own checks (tests, build, type-check, lint; whichever exist) on what you changed, fix failures, then call again with the new `checks`. If the nudge says the last check failed, fix that first.
+- `verified: false` with `verdict: "unverified"`: do **not** send it. A block means go run the project's own checks (tests, build, type-check, lint; whichever exist) on what you changed, fix failures, then call again with the new `checks` — not reword `final_message` until it passes. If the nudge says the last check failed, fix that first.
 - If no check exists or none can run here, say so plainly in the final message instead of presenting the work as done, and state exactly what you did verify.
 - `false_claim: true` means the message claimed verification that the evidence does not show. Correct the message.
 - A check that ran before your last edit does not count. Re-run it.

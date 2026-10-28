@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Honest Jev: Abe Lincoln mark — stovepipe hat, beard, suit collar -->
+  <rect width="64" height="64" rx="14" fill="#2b2118"/>
+  <!-- hat -->
+  <rect x="18" y="4" width="28" height="26" rx="3" fill="#171310"/>
+  <rect x="12" y="28" width="40" height="5" rx="2.5" fill="#171310"/>
+  <!-- face -->
+  <path d="M32 33 c-8 0 -13 6 -13 13 v2 c0 2 1 3 3 3 h20 c2 0 3 -1 3 -3 v-2 c0 -7 -5 -13 -13 -13 z" fill="#e8c9a8"/>
+  <!-- ears -->
+  <circle cx="19.5" cy="43" r="2.4" fill="#e8c9a8"/>
+  <circle cx="44.5" cy="43" r="2.4" fill="#e8c9a8"/>
+  <!-- beard -->
+  <path d="M20 42 c0 10 5 17 12 17 c7 0 12 -7 12 -17 c-2 3 -4 4 -5 3 c-1.5 4 -4 6 -7 6 c-3 0 -5.5 -2 -7 -6 c-1 1 -3 0 -5 -3 z" fill="#3a2c1f"/>
+  <!-- eyes -->
+  <circle cx="27" cy="41" r="1.6" fill="#1a140f"/>
+  <circle cx="37" cy="41" r="1.6" fill="#1a140f"/>
+  <!-- brows -->
+  <rect x="24.4" y="38" width="5.4" height="1.4" rx="0.7" fill="#3a2c1f"/>
+  <rect x="34.2" y="38" width="5.4" height="1.4" rx="0.7" fill="#3a2c1f"/>
+  <!-- nose -->
+  <path d="M32 41.5 v4 c0 1.5 -1.5 2 -2.4 2.3" stroke="#c9a37e" stroke-width="1.4" fill="none" stroke-linecap="round"/>
+  <!-- suit collar + cravat -->
+  <path d="M22 62 l4 -6 6 4 6 -4 4 6 z" fill="#171310"/>
+  <path d="M29 60 l3 -3 3 3 -3 3 z" fill="#f2ede4"/>
+</svg>

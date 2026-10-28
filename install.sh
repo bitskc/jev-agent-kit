@@ -21,6 +21,7 @@ share="$HOME/.local/share/jev-agent-skills"; bin="$HOME/.local/bin"
 mkdir -p "$share" "$bin"
 rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py
 install -m 755 "$here/scripts/jev-call.sh" "$bin/jev-call"
+install -m 755 "$here/update.sh" "$bin/jev-update"
 copy_skills() { mkdir -p "$1"; for d in "$here"/skills/*/; do n=$(basename "$d"); rm -rf "$1/$n"; cp -r "$d" "$1/$n"; done; echo "skills -> $1"; }
 if [ "$target" = omp ] || [ "$target" = both ]; then
   copy_skills "${project:-$HOME}$([ -n "$project" ] && echo /.omp/skills || echo /.omp/agent/skills)"
@@ -30,6 +31,7 @@ if [ "$target" = claude ] || [ "$target" = both ]; then
 fi
 echo "hooks  -> $share/hooks   (omp TS hook: $share/hooks/omp/jev-guard.ts)"
 echo "helper -> $bin/jev-call  (make sure $bin is on PATH)"
+echo "update -> $bin/jev-update  (re-pull skills; --timer for weekly auto-sync)"
 cat <<MSG
 
 Next (nothing below was done for you):
