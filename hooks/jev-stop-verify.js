@@ -74,7 +74,7 @@ const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 // command (npm test, git status, ls > /tmp/x) is not an edit. Targets under /tmp, /var/tmp, /dev or $TMPDIR are scratch.
 const SCRATCH_TARGET_RE = /^(?:\/tmp\/|\/var\/tmp\/|\/dev\/|\$TMPDIR|&)/;
 // /tmp/wt-<name>/ is a git worktree checkout (this repo's convention): project files, never scratch.
-const WORKTREE_PATH_RE = /(?:^|\/)wt-[^/\s]*(?:\/|$)/;
+const WORKTREE_PATH_RE = /(?:^|\/)wt-[^/\s]+\//;
 const isScratchTarget = (t) => SCRATCH_TARGET_RE.test(t) && !WORKTREE_PATH_RE.test(t);
 // Returns one label per project-file write found; empty means the command wrote nothing project-side.
 function bashWriteTargets(command) {
@@ -102,18 +102,37 @@ function bashWriteTargets(command) {
 // that call's own edit unless a LATER chain element writes after it (`npm test && cp broken.js src/a.js` is not).
 const CHECK_VERB_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bbun\s+test\b|\bnode\s+--test\b|\bdeno\s+test\b|\b(?:npx\s+)?(?:jest|vitest|mocha|pytest|tsc|eslint|ruff|mypy)\b|\bpython3?\s+-m\s+(?:pytest|unittest)\b|\bcargo\s+(?:test|build|check|clippy)\b|\bgo\s+(?:test|build|vet)\b|\bmake\s+(?:test|check|lint|build)\b/;
 const CHAIN_SPLIT_RE = /&&|\|\||[;\n]|(?<![&>\d])&(?![&>])/;
+// Heredoc bodies are data, never commands: the lines between `<<WORD` and the closing WORD line are dropped first.
+function stripHeredocBodies(command) {
+  const out = [];
+  let end = null;
+  for (const line of String(command || '').split('\n')) {
+    if (end !== null) { if (line.trim() === end) end = null; continue; }
+    out.push(line);
+    const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
+    if (m) end = m[2];
+  }
+  return out.join('\n');
+}
+// A check counts only in program position: the first word of a pipeline element, after VAR=value / sudo / env / time / nohup.
+// `echo npm test > f`, quoted text, and heredoc text are not checks.
+const ANCHORED_CHECK_RE = new RegExp('^(?:' + CHECK_VERB_RE.source + ')');
+const EXEC_PREFIX_RE = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env|time|nohup)\s+)*/;
+function executesCheck(unit) {
+  return unit.split(/\|(?!\|)/).some((seg) => ANCHORED_CHECK_RE.test(seg.trim().replace(EXEC_PREFIX_RE, '')));
+}
 function sameCallCheckIsEvidence(command) {
-  const bare = String(command || '').replace(/'[^']*'|"[^"]*"/g, '""');
+  const bare = stripHeredocBodies(command).replace(/'[^']*'|"[^"]*"/g, '""');
   const units = bare.split(CHAIN_SPLIT_RE).map((u) => u.trim()).filter(Boolean);
   const writes = units.map((u) => bashWriteTargets(u).length > 0);
-  return units.some((u, i) => CHECK_VERB_RE.test(u) && !writes.slice(i + 1).some(Boolean));
+  return units.some((u, i) => executesCheck(u) && !writes.slice(i + 1).some(Boolean));
 }
 // Evidence after the last edit call: any later Bash call, or the last edit call itself when it runs a check after its writes.
 function bashIsEvidenceAfterEdit(b, lastEditCall) {
   return b.seq > lastEditCall || (b.seq === lastEditCall && sameCallCheckIsEvidence(b.command));
 }
-// jev_classify takes at most 64 items per call (skills/jev-classify). A long message keeps its LAST CLAIM_CAP claims: the
-// closing conclusion is what the gate checks, and a long preamble must not push it out of the window.
+// jev_classify takes at most 64 items per call (skills/jev-classify), so decide() sends every claim in CLAIM_CAP-sized
+// chunks. The cap is the chunk size, never a drop: no claim is left unjudged.
 const CLAIM_CAP = 64;
 
 // Hard cap: 3s per MCP call, regardless of JEV_GUARD_TIMEOUT (which may still set something *lower*, e.g.
@@ -385,10 +404,7 @@ function splitClaims(message) {
   // joined, but only when no longer claim qualified. Questions never enter shortCandidates, so a message that is
   // only a question ("Want me to run the tests?") still produces no claims.
   if (!claims.length && shortCandidates.length) claims.push(shortCandidates.join(' ').slice(0, 500));
-  if (claims.length > CLAIM_CAP) {
-    process.stderr.write(`jev-stop-verify: ${claims.length - CLAIM_CAP} of ${claims.length} claims were not judged (jev_classify takes ${CLAIM_CAP} per call; the last ${CLAIM_CAP} are judged)\n`);
-  }
-  return claims.slice(-CLAIM_CAP);
+  return claims;
 }
 
 // jev_classify needs its `classes` on every call (unlike the Honest Jev level table, which the hooks
@@ -568,19 +584,27 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
     ? mcpCall('kit_verify_done', { task: vp.task, final_message: finalMessage, file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl)
     : Promise.resolve(null);
 
-  let classifyPromise = Promise.resolve(null);
+  let classifyPromise = Promise.resolve([]);
   if (wantsHonest && claims.length) {
     evidence = evidenceText(ev);
     const { classes } = classifyClasses();
     const nonce = crypto.randomBytes(8).toString('hex');
-    const items = claims.map((c, i) => ({ id: 'c' + i, text: `CLAIM: ${JSON.stringify(redact(c))}\n[tool-log:${nonce}]\n${evidence}\n[/tool-log:${nonce}]` }));
-    classifyPromise = mcpCall('jev_classify', { purpose: honestGatePurpose(nonce), items, classes }, fetchImpl);
+    // jev_classify takes at most CLAIM_CAP items per call, so every claim is judged in CLAIM_CAP-sized chunks.
+    // Chunks run in parallel (the same ~3s worst case as one call); ids are global, so results merge by claim.
+    const chunks = [];
+    for (let i = 0; i < claims.length; i += CLAIM_CAP) chunks.push(claims.slice(i, i + CLAIM_CAP));
+    if (chunks.length > 1) process.stderr.write(`jev-stop-verify: ${claims.length} claims judged in ${chunks.length} parallel jev_classify calls (chunks of ${CLAIM_CAP})\n`);
+    classifyPromise = Promise.all(chunks.map((chunk, k) => {
+      const items = chunk.map((c, j) => ({ id: 'c' + (k * CLAIM_CAP + j), text: `CLAIM: ${JSON.stringify(redact(c))}\n[tool-log:${nonce}]\n${evidence}\n[/tool-log:${nonce}]` }));
+      return mcpCall('jev_classify', { purpose: honestGatePurpose(nonce), items, classes }, fetchImpl);
+    }));
   }
 
   // Run both MCP calls concurrently — verify-gate evidence and honest-gate evidence are independent reads
   // of the same transcript, so there is no reason to pay their 3s-per-call caps sequentially (~6s
   // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
-  const [verdict, classifyResult] = await Promise.all([verifyPromise, classifyPromise]);
+  const [verdict, classifyChunks] = await Promise.all([verifyPromise, classifyPromise]);
+  const classifyResult = { results: classifyChunks.flatMap((r) => (r && Array.isArray(r.results) ? r.results : [])) };
   note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
   // A server that has shipped jev-agent-kit PR #30 puts `discloses_unverified` inside `answers` whenever it
   // actually ran the Jev judgement (absent only on an early-return fail-open path, same as an older server).

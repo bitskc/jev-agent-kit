@@ -823,18 +823,18 @@ test("splitClaims: a terse message where every fragment is under the 10-char flo
   assert.deepEqual(stopGate.splitClaims("```js\nfoo()\n```"), []); // pure code fence: still correctly empty
 });
 
-// ── PR #31 verdict 6478968656 regression P2-3: the 64-item window keeps the LAST claims and says when it drops any ──
-test("splitClaims: a message over 64 claims keeps the LAST 64 (the closing conclusion is always judged) and discloses the drop on stderr", () => {
+// ── PR #31 verdict 6479164688 regression P2-B: splitClaims drops nothing; decide() judges every claim in chunks ──
+test("splitClaims: a message over 64 claims returns ALL of them; chunking happens in decide(), nothing is dropped", () => {
   const msg = Array.from({ length: 69 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
   const writes = [];
   const realWrite = process.stderr.write;
   process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
   let claims;
   try { claims = stopGate.splitClaims(msg); } finally { process.stderr.write = realWrite; }
-  assert.equal(claims.length, 64);
-  assert.ok(claims[0].includes("claim number 5"), "the window starts after the 5 dropped preamble claims");
-  assert.ok(claims[63].includes("claim number 68"), "the final claim is judged");
-  assert.ok(writes.join("").includes("5 of 69 claims were not judged"), "the drop is disclosed on stderr, never silent");
+  assert.equal(claims.length, 69);
+  assert.ok(claims[0].includes("claim number 0"), "the head claim is kept");
+  assert.ok(claims[68].includes("claim number 68"), "the tail claim is kept");
+  assert.deepEqual(writes, [], "splitClaims itself drops nothing and writes nothing");
 });
 test("splitClaims: a message within the window drops nothing and writes nothing to stderr", () => {
   const msg = Array.from({ length: 10 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
@@ -882,6 +882,39 @@ test("P2-1 control: a check BEFORE a later write in the same call, or a write-on
     assert.equal(verify.arguments.checks.length, 0, `not evidence: ${JSON.stringify(command)}`);
   }
 });
+// ── PR #31 verdict 6479164688 regression P2-A: a check verb counts only when it is EXECUTED, never when it is text ──
+test("P2-A: a check verb in a heredoc body, an echo payload, or quoted text is not a check run", async () => {
+  for (const command of ["cat > x <<EOF\nRun npm test\nEOF", "echo npm test > f", "cat > tests/x.py <<EOF\nimport pytest\nEOF", 'echo "npm test" > f']) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const { fetchImpl, calls } = stubFetch((name) => (name === "kit_verify_done" ? ALLOW : { results: [] }));
+    const transcript = writeTranscript([
+      userPrompt("Fix the parser."),
+      assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+      assistantToolUse("t2", "Bash", { command }), toolResult("t2", ""),
+    ]);
+    await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass; ready to merge." }, { fetchImpl });
+    const verify = calls.find((c) => c.name === "kit_verify_done");
+    assert.ok(verify, `verify must be called for ${JSON.stringify(command)}`);
+    assert.equal(verify.arguments.checks.length, 0, `text is not a check run: ${JSON.stringify(command)}`);
+  }
+});
+test("P2-A positive: a heredoc write followed by a real `npm test` line IS a check run; the heredoc body is not the check", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch((name, args) => (name === "kit_verify_done" ? (args.checks.length ? ALLOW : { verified: false, verdict: "unverified", action: "block", reason: "no check", false_claim: true }) : { results: [] }));
+  const command = "cat > tests/x.py <<EOF\nimport pytest\nEOF\nnpm test";
+  const transcript = writeTranscript([
+    userPrompt("Fix the parser."),
+    assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+    assistantToolUse("t2", "Bash", { command }), toolResult("t2", "ok"),
+  ]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass; ready to merge." }, { fetchImpl });
+  const verify = calls.find((c) => c.name === "kit_verify_done");
+  assert.equal(verify.arguments.checks.length, 1, "the executed `npm test` line is evidence");
+});
+test("P3-h: /tmp/wt-notes.txt (no path separator after wt-<name>) is scratch; /tmp/wt-notes/a.md is a worktree write", () => {
+  assert.deepEqual(stopGate.bashWriteTargets("echo ok > /tmp/wt-notes.txt"), []);
+  assert.ok(stopGate.bashWriteTargets("echo ok > /tmp/wt-notes/a.md").length > 0);
+});
 test("P2-2: a Bash write into a /tmp/wt-<name>/ worktree is a project edit; true scratch targets stay exempt", () => {
   for (const c of ["cat > /tmp/wt-x/src/a.js <<'EOF'\nx\nEOF", "cp a.js /tmp/wt-x/src/b.js", "echo hi > /tmp/wt-x/src/c.js"]) {
     assert.ok(stopGate.bashWriteTargets(c).length > 0, `expected a write: ${JSON.stringify(c)}`);
@@ -917,6 +950,25 @@ test("P2-3: a long message's FINAL false claim reaches jev_classify behind 69 be
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: msg }, { fetchImpl });
   const judged = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items.map((i) => i.text));
   assert.ok(judged.some((t) => t.includes("ready to ship")), "the final claim must reach jev_classify");
+  assert.equal(out && out.decision, "block");
+});
+test("P2-B: a FALSE claim at index 0 of a 70-claim message is judged: claims go out in parallel chunks of 64, none dropped", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return ALLOW;
+    return { results: args.items.map((item) => ({ id: item.id, classification: /ready to ship/.test(item.text) ? "misrepresented" : "verified", top_probability: 0.9, decision: "auto" })) };
+  });
+  const msg = ["- The build is green and the release is ready to ship.", ...Array.from({ length: 69 }, (_, i) => `- Step ${i} of the plan is documented in detail.`)].join("\n");
+  const transcript = writeTranscript([
+    userPrompt("Fix the parser."),
+    assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+    assistantToolUse("t2", "Bash", { command: "npm test" }), toolResult("t2", "All tests pass."),
+  ]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: msg }, { fetchImpl });
+  const classify = calls.filter((c) => c.name === "jev_classify");
+  assert.equal(classify.length, 2, "70 claims go out as 2 chunks");
+  assert.deepEqual(classify.map((c) => c.arguments.items.length), [64, 6]);
+  assert.ok(classify[0].arguments.items.some((i) => i.id === "c0" && i.text.includes("ready to ship")), "the head claim is judged");
   assert.equal(out && out.decision, "block");
 });
 
