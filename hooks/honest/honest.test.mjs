@@ -22,6 +22,24 @@ const inRepo = (repo, fn) => {
   try { return fn(); } finally { process.chdir(prev); }
 };
 
+// Every test that touches CLAUDE_CONFIG_DIR, XDG_CONFIG_HOME, JEV_HONEST_DEFAULT_LEVEL or cwd (via fresh(),
+// freshXdg(), or a direct process.env/process.chdir write) is auto-isolated here: a leaked env var or a
+// cwd left pointing at a scratch dir can never bleed into the next test, regardless of whether that test
+// remembers to clean up after itself.
+const ISOLATED_ENV_KEYS = ["CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "JEV_HONEST_DEFAULT_LEVEL"];
+let savedEnv, savedCwd;
+test.beforeEach(() => {
+  savedEnv = Object.fromEntries(ISOLATED_ENV_KEYS.map((k) => [k, process.env[k]]));
+  savedCwd = process.cwd();
+});
+test.afterEach(() => {
+  for (const k of ISOLATED_ENV_KEYS) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
+  }
+  process.chdir(savedCwd);
+});
+
 test("rules: the default PR rule is present with no user or repo files", () => {
   freshXdg();
   inRepo(freshRepo(), () => {
@@ -29,7 +47,6 @@ test("rules: the default PR rule is present with no user or repo files", () => {
     assert.equal(list.length, 1);
     assert.equal(list[0].id, "pr-gstack-reviewed");
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("rules: layer merge order — user global beats built-in, repo beats user global, on the same id", () => {
@@ -42,7 +59,6 @@ test("rules: layer merge order — user global beats built-in, repo beats user g
     fs.writeFileSync(path.join(repo, ".jev", "rules.json"), JSON.stringify([{ id: "pr-gstack-reviewed", when: "repo override", ask: "repo ask", evidence: "repo" }]));
     assert.equal(rt.rules().find((r) => r.id === "pr-gstack-reviewed").when, "repo override");
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("rules: a disabled entry at a later layer removes an earlier layer's same-id rule", () => {
@@ -52,7 +68,6 @@ test("rules: a disabled entry at a later layer removes an earlier layer's same-i
     fs.writeFileSync(path.join(repo, ".jev", "rules.json"), JSON.stringify([{ id: "pr-gstack-reviewed", disabled: true }]));
     assert.equal(rt.rules().find((r) => r.id === "pr-gstack-reviewed"), undefined);
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("rules: malformed entries and an unparsable file are skipped, never crash", () => {
@@ -72,7 +87,6 @@ test("rules: malformed entries and an unparsable file are skipped, never crash",
     assert.doesNotThrow(() => rt.rules());
     assert.equal(rt.rules().length, 1); // falls back to just the built-in default
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("parseRuleCommand: quoted, natural-language, list, remove, disable, and explicit repo-scope forms", () => {
@@ -113,7 +127,6 @@ test("hooks end to end: rule add via mode-tracker writes the file and emits the 
     assert.equal(removed, "HONEST JEV RULE REMOVED: shipping-a-release");
     assert.ok(!rt.rules().some((r) => r.id === "shipping-a-release"));
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("instructions: no Rules section (or anything else) at level off", () => {
@@ -147,7 +160,6 @@ test("instructions: real SKILL.md is injected with exactly one level row", () =>
       assert.equal((text.match(/^\| \*\*/gm) || []).length, 1, level);
     }
   });
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("defaultLevel: env beats config file beats off", () => {
@@ -159,7 +171,6 @@ test("defaultLevel: env beats config file beats off", () => {
   assert.equal(rt.defaultLevel(), "soft");
   process.env.JEV_HONEST_DEFAULT_LEVEL = "strict";
   assert.equal(rt.defaultLevel(), "strict");
-  delete process.env.JEV_HONEST_DEFAULT_LEVEL; delete process.env.XDG_CONFIG_HOME;
   assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false);
 });
 
@@ -194,7 +205,6 @@ test("off persists across resume even with a configured default: activate never 
   // second activate (e.g. a later compact/resume): still silent, still off, despite the configured default
   assert.equal(run("jev-honest-activate.js"), "");
   assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "off\n");
-  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("activate: statusline nudge composes with an existing command and is skipped once wired", () => {
