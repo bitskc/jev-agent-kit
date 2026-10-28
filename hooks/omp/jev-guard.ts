@@ -17,12 +17,20 @@ const TIMEOUT_MS = Number(process.env.JEV_GUARD_TIMEOUT ?? "2") * 1000;
 const SHADOW = process.env.JEV_GUARD_MODE === "shadow";
 const ASK_NO_UI = process.env.JEV_GUARD_ASK_NO_UI ?? "block"; // "block" | "allow" when "ask" but nobody can answer
 
-async function guard(args: Record<string, unknown>): Promise<any | null> {
+// Server-side input caps (server/src/kit/tools.mjs): over these the schema rejects the call, and a rejection must
+// become "ask", never a silent allow.
+const CAPS: Record<string, number> = { command: 20000, file_path: 2000, cwd: 1000, home: 500 };
+
+type GuardReply = { decision?: string; rule?: string; reason?: string; suggestion?: string };
+type GuardResult = { kind: "reply"; reply: GuardReply } | { kind: "rejected"; detail: string } | { kind: "unavailable" };
+
+async function guard(args: Record<string, unknown>): Promise<GuardResult> {
   const token = (process.env.JEV_MCP_TOKEN ?? "").trim();
-  if (!token || !URL_) return null;
+  if (!token || !URL_.startsWith("https://")) return { kind: "unavailable" };
   try {
     const res = await fetch(URL_, {
       method: "POST",
+      redirect: "error", // a 3xx would re-send the bearer wherever it points
       signal: AbortSignal.timeout(TIMEOUT_MS),
       headers: {
         "content-type": "application/json",
@@ -35,43 +43,66 @@ async function guard(args: Record<string, unknown>): Promise<any | null> {
         params: { name: "kit_guard_command", arguments: args },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { kind: "unavailable" };
     const raw = await res.text();
     for (let line of raw.split("\n")) {
       line = line.trim();
       if (line.startsWith("data:")) line = line.slice(5).trim();
       if (!line.startsWith("{")) continue;
-      const msg = JSON.parse(line);
-      if (msg.result?.isError) return null;
-      return JSON.parse(msg.result.content[0].text);
+      const msg = JSON.parse(line) as { error?: { message?: string }; result?: { isError?: boolean; content?: { text?: string }[] } };
+      if (msg.error) return { kind: "rejected", detail: String(msg.error.message ?? "error").slice(0, 200) };
+      if (msg.result?.isError) return { kind: "rejected", detail: String(msg.result.content?.[0]?.text ?? "tool error").slice(0, 200) };
+      const text = msg.result?.content?.[0]?.text;
+      if (typeof text !== "string") return { kind: "unavailable" };
+      return { kind: "reply", reply: JSON.parse(text) as GuardReply };
     }
   } catch {
     /* timeout, network, parse: fail open */
   }
-  return null;
+  return { kind: "unavailable" };
 }
 
+type ToolCallEvent = { toolName?: string; input?: Record<string, unknown> };
+type ToolCallCtx = { cwd?: string; hasUI?: boolean; ui?: { confirm?: (title: string, message: string) => Promise<boolean> } };
+type Verdict = { block: true; reason: string } | undefined;
+
 export default function jevGuard(pi: ExtensionAPI) {
-  pi.on("tool_call", async (event: any, ctx: any) => {
+  const ask = async (ctx: ToolCallCtx, why: string): Promise<Verdict> => {
+    if (SHADOW) { pi.logger?.warn?.(`(shadow) would ask: ${why}`); return; }
+    if (ctx.hasUI && typeof ctx.ui?.confirm === "function") {
+      const ok = await ctx.ui.confirm("Jev guard: run this command?", why);
+      return ok ? undefined : { block: true, reason: `${why} (declined by user)` };
+    }
+    return ASK_NO_UI === "allow" ? undefined : { block: true, reason: `${why} Needs human approval; ask the user and retry.` };
+  };
+
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: ToolCallCtx): Promise<Verdict> => {
     try {
       let args: Record<string, unknown> | null = null;
       if (isToolCallEventType("bash", event)) {
-        args = { tool: "Bash", command: event.input.command, cwd: ctx.cwd, home: process.env.HOME };
+        args = { tool: "Bash", command: String(event.input.command ?? ""), cwd: ctx.cwd, home: process.env.HOME };
       } else if (event.toolName === "read" && (event.input?.path || event.input?.file_path)) {
-        args = { tool: "Read", file_path: event.input.path ?? event.input.file_path, cwd: ctx.cwd, home: process.env.HOME };
+        args = { tool: "Read", file_path: String(event.input.path ?? event.input.file_path), cwd: ctx.cwd, home: process.env.HOME };
+      } else if (event.toolName === "grep" && event.input?.pattern) {
+        // grep in content mode prints matching lines verbatim: judge it as the grep command it is (R1 secret reader)
+        args = { tool: "Bash", command: `grep -r ${JSON.stringify(String(event.input.pattern))} ${JSON.stringify(String(event.input.path ?? "."))}`, cwd: ctx.cwd, home: process.env.HOME };
       }
       if (!args) return;
-      const r = await guard(args);
-      if (!r || (r.decision !== "ask" && r.decision !== "block")) return;
+      for (const [key, cap] of Object.entries(CAPS)) {
+        const v = args[key];
+        if (typeof v !== "string" || v.length <= cap) continue;
+        if (key === "command" || key === "file_path") return ask(ctx, `Jev guard: ${key} is ${v.length} chars, over the ${cap}-char limit the guard can judge; confirm it by hand.`);
+        args[key] = v.slice(0, cap);
+      }
+      const g = await guard(args);
+      if (g.kind === "unavailable") return; // fail open
+      if (g.kind === "rejected") return ask(ctx, `Jev guard could not judge this call (server rejected it: ${g.detail}); confirm it by hand.`);
+      const r = g.reply;
+      if (r.decision !== "ask" && r.decision !== "block") return;
       const why = `Jev guard${r.rule ? ` [${r.rule}]` : ""}: ${r.reason}${r.suggestion ? ` ${r.suggestion}` : ""}`;
       if (SHADOW) { pi.logger?.warn?.(`(shadow) would ${r.decision}: ${why}`); return; }
       if (r.decision === "block") return { block: true, reason: why };
-      // ask
-      if (ctx.hasUI && typeof ctx.ui?.confirm === "function") {
-        const ok = await ctx.ui.confirm("Jev guard: run this command?", why);
-        return ok ? undefined : { block: true, reason: `${why} (declined by user)` };
-      }
-      return ASK_NO_UI === "allow" ? undefined : { block: true, reason: `${why} Needs human approval; ask the user and retry.` };
+      return ask(ctx, why);
     } catch {
       return; // never let the guard itself break the session
     }

@@ -230,7 +230,12 @@ const SECRET_RULES = [
   [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, REDACTED],
   [/(authorization\s*[:=]\s*)(?:basic|bearer|token)?\s*\S+/gi, `$1${REDACTED}`],
   [/\b(bearer\s+)[\w.-]{16,}/gi, `$1${REDACTED}`],
-  [/((?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key|passw(?:or)?d|passphrase|token|secret|credentials?)[a-z0-9_-]*["']?\s*[=:]\s*["']?)([^\s"'&;]+)/gi, `$1${REDACTED}`],
+  // name-based: anything ending in key/pass/pwd/auth/cookie/session/signature/token/secret, plus the classic words;
+  // a quoted value runs to the closing quote (multi-word passphrases), an unquoted one to the next delimiter.
+  [/((?:\b[a-z0-9_-]*(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|private[_-]?key|passw(?:or)?d|passphrase|credentials?|_key|_pass|_pwd|_auth|_cookie|_session|_signature|token|secret)[a-z0-9_-]*)["']?\s*[=:]\s*)("([^"]*)"|'([^']*)'|[^\s"'&;]+)/gi, `$1${REDACTED}`],
+  // CLI option values: -u user:pass, --password x, -p x, --token x, aws ... secret_access_key x
+  [/((?:^|\s)(?:-u|--user|--username|-p|--password|--passwd|--token|--api-key|--secret|--auth)\s+)(\S+)/gi, `$1${REDACTED}`],
+  [/((?:aws_)?secret_access_key\s+)(\S+)/gi, `$1${REDACTED}`],
   [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]*:[^\s/@]+@/gi, `$1${REDACTED}@`],
   [/\bsk-[A-Za-z0-9_-]{8,}/g, REDACTED],
   [/\bapikey_[A-Za-z0-9_]+/g, REDACTED],
