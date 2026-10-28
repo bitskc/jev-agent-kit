@@ -131,14 +131,14 @@ function parseForVerify(lines) {
   const resultsById = new Map();
   for (const d of lines) {
     const content = d.message && d.message.content;
-    if (d.type === 'user' && task === null && typeof content !== 'undefined') {
+    if (task === null && isRealUserPrompt(d) && typeof content !== 'undefined') {
       const t = textOf(content);
       if (t) task = t.slice(0, 2000);
     }
     if (d.type === 'assistant' && Array.isArray(content)) {
       for (const c of content) {
         if (!c) continue;
-        if (c.type === 'text' && c.text) finalMessage = c.text;
+        if (c.type === 'text' && c.text && !d.isSidechain) finalMessage = c.text;
         if (c.type === 'tool_use') {
           callSeq += 1;
           if (EDIT_TOOLS.has(c.name)) { fileChanges += 1; lastEditCall = callSeq; }

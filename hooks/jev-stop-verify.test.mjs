@@ -874,3 +874,21 @@ test("NEW-7 regression: a classify result whose id matches no claim renders '(cl
   assert.match(out.reason, /\(claim text unavailable\)/);
   assert.ok(!out.reason.includes("undefined"), `reason leaked 'undefined': ${out.reason}`);
 });
+
+test("NEW-7 regression: task capture skips a slash-command line and takes the first real prompt", () => {
+  const lines = [
+    userPrompt("<command-name>/jev-agent-kit:honest-jev</command-name>"),
+    userPrompt("Fix the parser bug."),
+    assistantToolUse("t1", "Edit", { file_path: "x.js" }), toolResult("t1", "ok"),
+  ];
+  assert.equal(stopGate.parseForVerify(lines).task, "Fix the parser bug.");
+});
+
+test("NEW-7 regression: a sidechain assistant text block does not overwrite the main agent's final message", () => {
+  const lines = [
+    userPrompt("Fix it."),
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "All tests pass." }] } },
+    { type: "assistant", isSidechain: true, message: { role: "assistant", content: [{ type: "text", text: "Subagent note: scratch output." }] } },
+  ];
+  assert.equal(stopGate.parseForVerify(lines).finalMessage, "All tests pass.");
+});
