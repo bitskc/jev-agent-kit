@@ -23,7 +23,7 @@ Tool: `kit_verify_done` on the `jev` MCP server (Claude Code: `mcp__jev__kit_ver
   ]
 }
 ```
-- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command` + the output tail. **Paste real output — a bare command name is not evidence.** The tool auto-detects pass/fail from runner summaries; a self-asserted `passed: true` makes any check count, and one passing check means it can never block, so set `passed` only when the tool can't recognise your runner's output format, and only to what actually happened. If your runner supports it, pass `exit_code` per check — currently a check with no recognised output counts as passed (server-side `exit_code` fix pending).
+- `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command` + the output tail. **Paste real output — a bare command name is not evidence.** The tool auto-detects pass/fail from recognised runner summaries; a self-asserted `passed: true` makes any check count, and one passing check means it can never block, so set `passed` only when the tool can't recognise your runner's output format, and only to what actually happened.
 - Optional `threshold` (0.5-1, default 0.75): how sure the server must be that you claim done before it blocks.
 
 ## Act on the result

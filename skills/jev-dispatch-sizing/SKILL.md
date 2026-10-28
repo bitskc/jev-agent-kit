@@ -19,7 +19,7 @@ Tool: `kit_size_dispatch` on the `jev` MCP server (Claude Code: `mcp__jev__kit_s
 }
 ```
 - `description` and `model` are required. Passing the full `prompt` makes the judgement more accurate.
-- **Omit `ladder`** unless the tool's built-in ladder genuinely doesn't fit your fleet. The tool only recognises its own tier names (`scout-find, scout, workerS, workerO, director, fable`) plus bare model names like `haiku`/`sonnet`/`opus`; a *custom* ladder can't be ranked and the check returns `verdict:"unknown"` — it stops protecting you. Full model IDs like `claude-fable-5-1` resolve as unrecognised (`chosen.recognised: false`) and are treated as the director tier, so pass the tier name itself when checking. Translate tier → your model: scout-find/scout → cheapest (haiku-class), workerS/workerO → mid (sonnet-class), director → large (opus-class), fable → top tier.
+- **Omit `ladder`** unless the tool's built-in ladder genuinely doesn't fit your fleet. The tool only recognises its own tier names (`scout-find, scout, workerS, workerO, director, fable`) plus bare model names like `haiku`/`sonnet`/`opus`; a *custom* ladder can't be ranked and the check returns `verdict:"unknown"` — it stops protecting you. **`claude-fable-*` IDs match the `claude` alias and resolve to `director` with `recognised:true`, silently skipping the fable-tier block** — pass `fable` itself when checking the top tier. Translate tier → your model: scout-find/scout → cheapest (haiku-class), workerS/workerO → mid (sonnet-class), director → large (opus-class), fable → top tier.
 
 ## Act on the result
 

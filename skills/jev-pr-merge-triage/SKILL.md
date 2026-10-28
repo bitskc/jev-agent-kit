@@ -17,16 +17,13 @@ Use this as a first pass when the PR has open review comments and you want to kn
 ```bash
 gh pr view <N> -R <owner>/<repo> --json mergeable,mergeStateStatus,isDraft,reviewDecision,reviews,comments
 gh pr checks <N> -R <owner>/<repo>
+
+# Unresolved review threads (keep id and isOutdated — both are free):
+gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:100){nodes{id isResolved isOutdated comments(first:30){nodes{author{login} body path line}}}}}}}' -F o=<owner> -F r=<repo> -F n=<N> \
+  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false) | {id, outdated:.isOutdated, path:(.comments.nodes[0].path // "?"), line:(.comments.nodes[0].line // 0), comments:[.comments.nodes[]|{author:.author.login,body}]}'
 ```
 
 **Merge-state facts are the hard gate** — red required checks, `isDraft`, `reviewDecision: CHANGES_REQUESTED`, or conflicts are the blocker; skip classification until they're handled. Read the top-level `reviews[].body` and `comments[]` too — many bots post findings as issue comments, not review threads.
-
-Then unresolved review threads via GraphQL (keep `id` and `isOutdated` — both are free):
-
-```bash
-gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){reviewThreads(first:50){nodes{id isResolved isOutdated comments(first:10){nodes{author{login} body path line}}}}}}}' -F o=<owner> -F r=<repo> -F n=<N> \
-  --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false) | {id, outdated:.isOutdated, path:(.comments.nodes[0].path // "?"), comments:[.comments.nodes[]|{author:.author.login,body}]}'
-```
 
 - `isOutdated: true` is GitHub's own signal that the code under the comment changed — pre-tag those threads yourself; don't ask jev to guess staleness it can't see.
 - Read **every comment in the thread**, not just the first: a reply like "fixed in abc123" is itself a classification input (`claimed_addressed`).
@@ -34,6 +31,8 @@ gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$
 ## Step 2: classify the open threads
 
 One `jev_classify` call, one item per unresolved thread (or per top-level review/comment). Put `author`, `path:line`, `isOutdated`, and the comment bodies (truncate at ~500 chars) in `text`; keep the GraphQL `id` in `id` so results map back to threads for replying/resolving.
+
+If threads + top-level comments exceed ~60 items, split into multiple `jev_classify` calls — the tool caps at 64 items per call.
 
 ```json
 {
