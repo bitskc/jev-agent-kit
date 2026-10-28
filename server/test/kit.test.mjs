@@ -292,3 +292,13 @@ test("askUpstream hits {base}/v1/systemone with bearer and TypeSafe shapes", asy
   const bad = async () => ({ ok: false, status: 402, text: async () => "no credits secret-body" });
   await assert.rejects(askUpstream(up, {}, { q: {} }, { fetchImpl: bad }), (e) => /HTTP 402/.test(e.message) && !/secret-body|gk/.test(e.message));
 });
+test("guard.mjs firstBlockingHit: url_credentials scheme must not go quadratic, and still matches a real credential", async () => {
+  const { firstBlockingHit } = await import("../src/kit/guard.mjs");
+  const payload = "a-".repeat(9975); // ~20000 chars, the server's own command input cap
+  const t0 = Date.now();
+  firstBlockingHit(payload);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 50, `firstBlockingHit took ${ms}ms on a 20000-char input, expected well under 50ms`);
+  const hit = firstBlockingHit("creds: postgres://admin:s3cr3tPassw0rd@db.internal:5432/app");
+  assert.equal(hit && hit.kind, "url_credentials");
+});

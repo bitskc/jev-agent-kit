@@ -482,7 +482,7 @@ const HIGH_PRECISION = [
   ["npm_token", new RegExp(LEFT + "npm_[A-Za-z0-9]{36}")],
   ["private_key", /-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/],
   ["jwt", new RegExp(LEFT + "eyJ[\\w-]{10,}\\.eyJ")],
-  ["url_credentials", new RegExp(LEFT + "\\w[\\w+.-]*://[^/\\s:@]+:[^/\\s:@]+@")],
+  ["url_credentials", new RegExp(LEFT + "\\w[\\w+.-]{0,255}://[^/\\s:@]+:[^/\\s:@]+@")],
   ["typesafe_key", new RegExp(LEFT + "apikey_[A-Za-z0-9_]{16,}")],
 ];
 const PLACEHOLDER_WORDS = ["example", "placeholder", "dummy", "changeme", "redacted", "sample", "fake", "your_", "xxxx",
