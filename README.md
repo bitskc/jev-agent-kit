@@ -1,5 +1,15 @@
 # jev-agent-kit
 
+## Give this to your agent
+
+Paste this into omp, Claude Code, Codex, Cursor or any coding agent:
+
+```text
+Install https://github.com/bitskc/jev-agent-kit by following its AGENTS.md
+```
+
+The agent reads [`AGENTS.md`](AGENTS.md), asks you for the server URL and token (or deploys its own server to your Cloudflare account), installs the skills and guard hook for its host, and verifies 15 tools. Nothing secret is committed or echoed.
+
 Give your coding agents (omp / oh-my-pi, Claude Code and compatible agents) a hosted **Jev** toolbox over MCP, plus the skills and hook that make them use it:
 
 - **`server/`**: a Cloudflare Worker serving MCP over streamable HTTP, bearer-protected. 15 tools: the 12 upstream `jev_*` tools from [jkudish/jev-mcp](https://github.com/jkudish/jev-mcp) plus three ported from [jev-kit](https://github.com/jonathanavis96/jev-kit): `kit_guard_command` (is this shell command safe?), `kit_size_dispatch` (is this sub-agent model the right size for the task?), `kit_verify_done` (did the agent verify before saying "done"?).
@@ -9,14 +19,14 @@ Give your coding agents (omp / oh-my-pi, Claude Code and compatible agents) a ho
 
 Jev is a probabilistic decision model (TypeSafe "System One"). Calls are billed to the API key **you** configure on **your** Worker.
 
-## Quick start (agent install)
+## Quick start (manual install)
 
 ```sh
 git clone https://github.com/bitskc/jev-agent-kit && ./jev-agent-kit/install.sh --omp      # or --claude | --both
 ```
 or, without git: `curl -fsSL https://github.com/bitskc/jev-agent-kit/archive/refs/heads/main.tar.gz | tar xz && ./jev-agent-kit-main/install.sh --omp`
 
-`install.sh` copies the skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/` (`--project DIR` for project scope), the hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` to `~/.local/bin/`. It never edits your config files and never touches a token. It then prints the remaining steps (below).
+`install.sh` copies the skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/` (`--project DIR` for project scope), the hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` to `~/.local/bin/`. By default it never edits your config files and never touches a token; `--wire` merges token-free MCP/hook config (with backups), `--save-env` writes a 0600 env file and `--doctor` verifies the setup. See [`AGENTS.md`](AGENTS.md).
 
 You need a deployed server first: see [Deploy your own server](#deploy-your-own-server).
 
