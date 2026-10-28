@@ -98,7 +98,7 @@ git clone https://github.com/bitskc/jev-agent-kit && ./jev-agent-kit/install.sh 
 `install.sh` copies skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/`, hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` + `jev-update` to `~/.local/bin/`. It never edits config and never touches a token; it prints what to wire next:
 
 - **omp**: `cp ~/.local/share/jev-agent-skills/hooks/omp/jev-honest.ts ~/.omp/agent/hooks/pre/` (and `jev-guard.ts`). The honest hook registers `/honest-jev`, injects the level before each turn and sets the badge through omp's own status line.
-- **Claude Code, manual**: merge `config/claude-settings-hook.json` into `~/.claude/settings.json`.
+- **Claude Code, manual**: merge `config/claude-settings-hook.json` into `~/.claude/settings.json`. The file has no `statusLine` key on purpose, so a shallow merge can't clobber one you already have (ponytail's included); to add the Honest Jev badge, compose it by hand: `{"type": "command", "command": "<your existing command, if any>; bash \"$HOME/.local/share/jev-agent-skills/hooks/jev-honest-statusline.sh\""}`.
 
 Either way you need a deployed worker first: [Deploy your own server](#deploy-your-own-server).
 
