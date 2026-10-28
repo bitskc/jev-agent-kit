@@ -169,6 +169,17 @@ test("rungFor: claude-* ids resolve to their own family, not the generic directo
   const unknown = await sizeDispatch({ description: "x", model: "llama-9" }, noJev);
   assert.equal(unknown.chosen.tier, "director"); assert.equal(unknown.chosen.recognised, false);
 });
+test("rungFor: a family name embedded in a longer word is not a false-positive match", async () => {
+  // "fable" inside "fableforge" and "claude" inside "notclaude" must not match: these are not
+  // the jev-family models, and a substring match here would misattribute a tier by accident.
+  const fableforge = await sizeDispatch({ description: "x", model: "my-fableforge-9b" }, noJev);
+  assert.equal(fableforge.chosen.tier, "director"); assert.equal(fableforge.chosen.recognised, false);
+  const notclaude = await sizeDispatch({ description: "x", model: "notclaude-cheap-7b" }, noJev);
+  assert.equal(notclaude.chosen.tier, "director"); assert.equal(notclaude.chosen.recognised, false);
+  // a real model whose name is itself hyphen-bounded "Scout" (Meta's Llama-4-Scout) still resolves
+  // via the family heuristic; this is the unavoidable floor of a substring match and is documented.
+  assert.equal((await sizeDispatch({ description: "x", model: "Llama-4-Scout-17B-16E" }, noJev)).chosen.tier, "scout");
+});
 test("redact: name-based keys, quoted passphrases, CLI option values and aws secrets never reach upstream", async () => {
   const { redact } = await import("../src/kit/shell.mjs");
   const leaks = [
