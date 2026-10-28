@@ -203,10 +203,26 @@ test("redact: name-based keys, quoted passphrases, CLI option values and aws sec
     ["aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUt"],
     ["mysql -u root --password hunter2hunter2", "hunter2"],
     ["MY_DEPLOY_KEY=abc123 ./deploy.sh", "abc123"],
+    ["mysql -h db -p sup3rsecret", "sup3rsecret"],
   ];
   for (const [input, secret] of leaks) assert.ok(!redact(input).includes(secret), `leaked: ${redact(input)}`);
-  for (const benign of ["ls -la src/key_store.rs", 'git commit -m "release: bump version"', "echo $HOME/.ssh"]) assert.equal(redact(benign), benign);
+  const benignCommands = [
+    "ls -la src/key_store.rs", 'git commit -m "release: bump version"', "echo $HOME/.ssh",
+    "mkdir -p DIR", "cp -p src dst", "scp -p file.txt host:/tmp", "ssh -p 22 user@host",
+    "docker run -p 8080:80 image", "sort -u file.txt", "git push -u origin main", "psql -p 5432 -U app",
+  ];
+  for (const benign of benignCommands) assert.equal(redact(benign), benign);
   assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).rule, "R9-commit-secret");
+});
+test("redact: a cap-sized (20000 char) hyphenated command never goes quadratic", async () => {
+  // the name-based and URL-credential rules had unbounded [a-z0-9_-]*/[a-z0-9+.-]* quantifiers that could
+  // catastrophically backtrack on a long run of name-like characters with no real match (549ms observed pre-fix).
+  const { redact } = await import("../src/kit/shell.mjs");
+  const payload = "a-b-c-d-e-f-g-h-".repeat(1250); // 20000 chars: the server's own command input cap
+  const t0 = Date.now();
+  redact(payload);
+  const ms = Date.now() - t0;
+  assert.ok(ms < 100, `redact took ${ms}ms on a 20000-char input, expected well under 100ms`);
 });
 const jl = (...l) => l.map((x) => JSON.stringify(x)).join("\n");
 const turn = (extra) => jl(
