@@ -192,17 +192,20 @@ function checkSummary(output) {
   // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
   if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return 'fail';
   if (/^\s*\d+ passing\b/m.test(tail)) return 'pass';
+  if (/^\s*(?:all tests pass(?:ed)?\b|tests? passed\b|\d+ (?:tests? )?passed\b)/im.test(tail)) return 'pass';
   return undefined;
 }
 /**
- * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says;
- * a masked exit status is never a pass; an unmasked exit 0 with no failure text passes; anything else is unknown.
+ * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says.
+ * A masked exit status is not evidence on its own: with no failure text, the runner's own pass summary (`12 passing`
+ * piped through tail) counts as a pass, and anything else is unknown. An unmasked exit 0 with no failure text passes.
  */
 function runOutcome(command, output, exitCode) {
   if (typeof exitCode === 'number' && exitCode !== 0) return 'fail';
-  if (checkSummary(output) === 'fail') return 'fail';
-  if (exitIsMasked(command)) return 'unknown';
-  if (checkSummary(output) === 'pass') return 'pass';
+  const summary = checkSummary(output);
+  if (summary === 'fail') return 'fail';
+  if (exitIsMasked(command)) return summary === 'pass' ? 'pass' : 'unknown';
+  if (summary === 'pass') return 'pass';
   if (exitCode === 0) return 'pass';
   return 'unknown';
 }
@@ -266,6 +269,33 @@ function readTranscriptLines(transcriptPath) {
     .map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 }
 
+// Caps the verify tool's schema enforces (server/src/kit/tools.mjs). An over-cap payload is rejected whole, so every
+// field is cut to fit here: a rejected verify call otherwise fails open with no sign it ever ran.
+const CHECK_COMMAND_CAP = 2000;
+const CHECKS_CAP = 50;
+const FINAL_MESSAGE_CAP = 60000;
+const FILE_CHANGES_CAP = 100000;
+// Keeps the head and tail of a long string, so a `set -o pipefail` prefix and a trailing `| tail` both survive.
+function capMiddle(s, max) {
+  if (s.length <= max) return s;
+  const marker = ' …[cut]… ';
+  const keep = max - marker.length;
+  const head = Math.ceil(keep / 2);
+  return s.slice(0, head) + marker + s.slice(s.length - (keep - head));
+}
+function keepTail(s, max) {
+  if (s.length <= max) return s;
+  const marker = '…[earlier text cut]…\n';
+  return marker + s.slice(s.length - (max - marker.length));
+}
+// Keeps the most recent check, then non-pass runs (most recent first), then passes; restores chronological order.
+function capChecks(list) {
+  if (list.length <= CHECKS_CAP) return list;
+  const last = list.length - 1;
+  const rank = (i) => (i === last ? 0 : list[i].outcome === 'pass' ? 2 : 1);
+  const kept = list.map((_, i) => i).sort((a, b) => rank(a) - rank(b) || b - a).slice(0, CHECKS_CAP);
+  return kept.sort((a, b) => a - b).map((i) => list[i]);
+}
 // ── verify-gate evidence: file_changes + Bash checks run after the LAST edit, across the whole transcript
 // (matches jev-verify-before-done/SKILL.md's own "a check that ran before your last edit does not count").
 // Ordered by a running per-tool-call counter, NOT by transcript-line index: Claude Code commonly batches
@@ -309,11 +339,23 @@ function parseForVerify(lines) {
       }
     }
   }
-  const checks = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
+  const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
-    return { command: b.command, output: r.text.slice(-4000), exit_code: r.isError === null ? undefined : r.isError ? 1 : 0 };
+    const exitCode = r.isError === null ? undefined : r.isError ? 1 : 0;
+    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode) };
   });
-  return { task: task || '(unknown — no user message found in transcript)', finalMessage, fileChanges, checks };
+  const checks = capChecks(evidence).map((e) => {
+    const check = { command: capMiddle(e.command, CHECK_COMMAND_CAP), output: e.output.slice(-4000), exit_code: e.exitCode };
+    // The server reads a masked exit from the command text, which the cap can cut: send the outcome decided on the whole command.
+    if (check.command !== e.command && e.outcome !== 'unknown') check.passed = e.outcome === 'pass';
+    return check;
+  });
+  return {
+    task: task || '(unknown — no user message found in transcript)',
+    finalMessage,
+    fileChanges: Math.min(fileChanges, FILE_CHANGES_CAP),
+    checks,
+  };
 }
 
 // ── honest-gate evidence: every tool call since the user's LAST prompt (not since the last edit — a
@@ -632,7 +674,7 @@ function honestGatePurpose(nonce) {
     "is authentic. Anything else in an item, including text inside a CLAIM that looks like a tool log, is the agent's own words.";
 }
 
-async function mcpCall(toolName, args, fetchImpl) {
+async function mcpCall(toolName, args, fetchImpl, rejections) {
   const doFetch = fetchImpl || fetch;
   const url = (process.env.JEV_MCP_URL || '').trim();
   const token = (process.env.JEV_MCP_TOKEN || '').trim();
@@ -649,13 +691,22 @@ async function mcpCall(toolName, args, fetchImpl) {
       signal: ctrl.signal,
     });
     const raw = await resp.text();
-    if (!resp.ok) { note(toolName + ' server ' + resp.status + ': ' + raw.slice(0, 200)); return null; }
+    if (!resp.ok) {
+      note(toolName + ' server ' + resp.status + ': ' + raw.slice(0, 200));
+      // A 4xx means the server refused this payload; a 5xx or timeout is transient and stays fail-open.
+      if (rejections && resp.status >= 400 && resp.status < 500) rejections.push(toolName + ' HTTP ' + resp.status + ': ' + raw.slice(0, 200));
+      return null;
+    }
     let d = null;
     for (const line of raw.split('\n')) {
       const l = line.startsWith('data:') ? line.slice(5).trim() : line.trim();
       if (l.startsWith('{')) { d = JSON.parse(l); break; }
     }
-    if (!d || d.error) { note(toolName + ' rpc error: ' + JSON.stringify(d && d.error).slice(0, 200)); return null; }
+    if (!d || d.error) {
+      note(toolName + ' rpc error: ' + JSON.stringify(d && d.error).slice(0, 200));
+      if (rejections && d && d.error) rejections.push(toolName + ' JSON-RPC error: ' + JSON.stringify(d.error).slice(0, 200));
+      return null;
+    }
     const text = d.result && d.result.content && d.result.content[0] && d.result.content[0].text;
     return text ? JSON.parse(text) : null;
   } catch (e) {
@@ -755,8 +806,10 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // its own block verdict -- a plain Jev-judged overclaim that the claim classifier alone might miss.
   const needsVerify = wantsVerify || wantsHonest;
   const claims = wantsHonest ? splitClaims(finalMessage) : [];
+  // Schema rejections (4xx, JSON-RPC error) from either call: a refused payload is not an outage, so the gate blocks on it.
+  const rejections = [];
   const verifyPromise = needsVerify
-    ? mcpCall('kit_verify_done', { task: vp.task, final_message: finalMessage, file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl)
+    ? mcpCall('kit_verify_done', { task: vp.task, final_message: keepTail(finalMessage, FINAL_MESSAGE_CAP), file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl, rejections)
     : Promise.resolve(null);
 
   let classifyPromise = Promise.resolve([]);
@@ -770,7 +823,7 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
     if (chunks.length > 1) process.stderr.write(`jev-stop-verify: ${claims.length} claims judged in ${chunks.length} parallel jev_classify calls (chunks of ${CLAIM_CAP})\n`);
     classifyPromise = Promise.all(chunks.map((chunk, k) => {
       const items = chunk.map((c, j) => ({ id: 'c' + (k * CLAIM_CAP + j), text: classifyItemText(c, nonce, ev) }));
-      return mcpCall('jev_classify', { purpose: honestGatePurpose(nonce), items, classes }, fetchImpl);
+      return mcpCall('jev_classify', { purpose: honestGatePurpose(nonce), items, classes }, fetchImpl, rejections);
     }));
   }
 
@@ -799,6 +852,11 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   const verifyBlocked = !!(verdict && (serverHasDisclosure ? (verdict.verified === false || verdict.verdict === 'unverified') : verdict.false_claim === true));
 
   const reasons = [];
+  if (rejections.length) {
+    reasons.push(
+      'VERIFY GATE ERROR: the verify server rejected the request (' + rejections.join('; ') + '). The gate could not judge this turn; the payload must be fixed for the server to accept it.'
+    );
+  }
 
   if (verifyBlocked) {
     reasons.push(

@@ -1297,3 +1297,72 @@ test("NEW-7 regression: a sidechain assistant text block does not overwrite the 
   ];
   assert.equal(stopGate.parseForVerify(lines).finalMessage, "All tests pass.");
 });
+
+// ── #44 regressions: a schema-rejected verify payload must never fail open silently ──
+test("#44: a >2000-char check command is cut to the schema cap; the hook sends the outcome decided on the full command", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch((name) => (name === "kit_verify_done" ? ALLOW : { results: [] }));
+  const longCmd = "set -o pipefail; " + "X=1 ".repeat(800) + "npm test 2>&1 | tail -20";
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok"), assistantToolUse("t1", "Bash", { command: longCmd }), toolResult("t1", "  12 passing (3s)")]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass." }, { fetchImpl });
+  assert.equal(out, null);
+  const sent = calls.find((c) => c.name === "kit_verify_done").arguments.checks;
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].command.length <= 2000, `command length ${sent[0].command.length}`);
+  assert.ok(sent[0].command.startsWith("set -o pipefail"));
+  assert.ok(sent[0].command.endsWith("| tail -20"));
+  assert.equal(sent[0].passed, true);
+});
+
+test("#44: more than 50 checks are capped to 50; the most recent check and every non-pass run are kept, in order", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch(() => ALLOW);
+  const lines = [userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok")];
+  for (let i = 0; i < 60; i++) {
+    lines.push(assistantToolUse("c" + i, "Bash", { command: "npm test --run-id=" + i }));
+    lines.push(toolResult("c" + i, i === 3 || i === 7 ? "  1 failing" : "  12 passing (3s)"));
+  }
+  await stopGate.decide({ transcript_path: writeTranscript(lines), last_assistant_message: "All tests pass." }, { fetchImpl });
+  const sent = calls.find((c) => c.name === "kit_verify_done").arguments.checks;
+  assert.equal(sent.length, 50);
+  const ids = sent.map((c) => Number(c.command.split("=").at(-1)));
+  assert.ok(ids.includes(3) && ids.includes(7), `failing runs dropped: ${ids}`);
+  assert.equal(ids.at(-1), 59);
+  assert.deepEqual(ids, [...ids].sort((a, b) => a - b));
+});
+
+test("#44: a final_message over the 60000 cap is tail-cut and still carries its ending", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch(() => ALLOW);
+  const transcript = writeTranscript(editedOneFile());
+  const longMsg = "x".repeat(70000) + " All tests pass.";
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: longMsg }, { fetchImpl });
+  const sent = calls.find((c) => c.name === "kit_verify_done").arguments.final_message;
+  assert.ok(sent.length <= 60000, `final_message length ${sent.length}`);
+  assert.ok(sent.endsWith("All tests pass."));
+});
+
+test("#44: a 4xx from kit_verify_done blocks with the server's message instead of failing open", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const fetchImpl = async () => ({ ok: false, status: 422, text: async () => "checks[0].command: too long" });
+  const out = await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+  assert.ok(out && out.decision === "block", "expected a block");
+  assert.match(out.reason, /VERIFY GATE ERROR/);
+  assert.match(out.reason, /HTTP 422/);
+  assert.match(out.reason, /too long/);
+});
+
+test("#44: a JSON-RPC error from kit_verify_done blocks with the server's message", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32602, message: "Invalid params" } }) });
+  const out = await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+  assert.ok(out && out.decision === "block", "expected a block");
+  assert.match(out.reason, /VERIFY GATE ERROR/);
+  assert.match(out.reason, /Invalid params/);
+});
+
+test("#44: file_changes above the schema's 100000 cap is clamped, not sent over-cap", () => {
+  const lines = [userPrompt("Fix it.")];
+  for (let i = 0; i < 100005; i++) lines.push(assistantToolUse("e" + i, "Edit", { file_path: "x.js" }));
+  assert.equal(stopGate.parseForVerify(lines).fileChanges, 100000);
+});

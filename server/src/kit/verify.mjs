@@ -54,14 +54,16 @@ export function exitIsMasked(command) {
   return first < segments.length - 1;
 }
 /**
- * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says;
- * a masked exit status is never a pass; an unmasked exit 0 with no failure text passes; anything else is unknown.
+ * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says.
+ * A masked exit status is not evidence on its own: with no failure text, the runner's own pass summary (`12 passing`
+ * piped through tail) counts as a pass, and anything else is unknown. An unmasked exit 0 with no failure text passes.
  */
 export function runOutcome(command, output, exitCode) {
   if (typeof exitCode === "number" && exitCode !== 0) return "fail";
-  if (checkSummary(output) === "fail") return "fail";
-  if (exitIsMasked(command)) return "unknown";
-  if (checkSummary(output) === "pass") return "pass";
+  const summary = checkSummary(output);
+  if (summary === "fail") return "fail";
+  if (exitIsMasked(command)) return summary === "pass" ? "pass" : "unknown";
+  if (summary === "pass") return "pass";
   if (exitCode === 0) return "pass";
   return "unknown";
 }
@@ -97,6 +99,7 @@ export function checkSummary(output) {
   // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
   if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return "fail";
   if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
+  if (/^\s*(?:all tests pass(?:ed)?\b|tests? passed\b|\d+ (?:tests? )?passed\b)/im.test(tail)) return "pass";
   return undefined;
 }
 
