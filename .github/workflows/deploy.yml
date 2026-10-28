@@ -1,0 +1,42 @@
+# Deploys server/ to the live Cloudflare Worker "jev-mcp" when server code lands on main.
+# Worker secrets (MCP_BEARER_TOKEN, MCP_BEARER_TOKENS, AI_GATEWAY_API_KEY) live on Cloudflare and are not touched.
+# Repo secrets needed: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit), CLOUDFLARE_ACCOUNT_ID.
+name: deploy-server
+on:
+  push:
+    branches: [main]
+    paths: ["server/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+concurrency:
+  group: deploy-jev-mcp
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - run: npm run vendor
+      - run: npm test
+      - id: wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: server
+          command: deploy --keep-vars
+      - name: Health check
+        env:
+          URL: ${{ steps.wrangler.outputs.deployment-url }}
+        run: test -n "$URL" && curl -fsS --retry 3 --retry-delay 3 "$URL/health"

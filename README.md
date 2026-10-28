@@ -63,6 +63,10 @@ Knobs: `JEV_GUARD_TIMEOUT` (seconds, 2), `JEV_GUARD_MODE=shadow` (log only), `JE
 **omp**: hooks are TypeScript modules, so use the port: `cp hooks/omp/jev-guard.ts ~/.omp/agent/hooks/pre/` (project: `.omp/hooks/pre/`) and start a new session, or try it once with `omp --hook /abs/path/jev-guard.ts`. omp *fails closed* on a throwing or timing-out `tool_call` handler, so the port swallows all errors. With no UI, `ask` becomes a block unless `JEV_GUARD_ASK_NO_UI=allow`.
 Confirmed against the omp docs (2026-10-27): MCP file locations and schema, `${VAR}` expansion, skill locations, hook module contract. **Not verified**: that `jev-guard.ts` runs inside omp, `ctx.ui.confirm`'s signature, and the built-in read tool's name (`read`, `input.path`).
 
+## Auto-deploy from GitHub
+
+`.github/workflows/deploy.yml` deploys `server/` to the Worker named in `server/wrangler.jsonc` on every push to `main` that touches `server/**` (or by hand: Actions > deploy-server > Run workflow). It builds the vendored upstream, runs the tests, then `wrangler deploy --keep-vars`. Worker secrets are never read or changed. Repo secrets required: `CLOUDFLARE_API_TOKEN` (Workers Scripts: Edit) and `CLOUDFLARE_ACCOUNT_ID`. Forks must set their own, and change `name` in `server/wrangler.jsonc` unless they want to deploy over the same name in their own account.
+
 ## Deploy your own server
 
 Needs Node >= 22, a Cloudflare account (free plan is fine), and an API key for Jev.
@@ -84,6 +88,7 @@ printf %s "$TYPESAFE_API_KEY"   | npx wrangler secret put TYPESAFE_API_KEY      
 | Secret | Purpose |
 |---|---|
 | `MCP_BEARER_TOKEN` | **Required.** Callers send `Authorization: Bearer <it>`. Without it every `/mcp` call is a 401. |
+| `MCP_BEARER_TOKENS` | Optional. Comma-separated extra tokens, so each person gets their own revocable one (`printf %s "tokA,tokB" \| npx wrangler secret put MCP_BEARER_TOKENS`). Accepted alongside `MCP_BEARER_TOKEN`; remove a token from the list to revoke it. |
 | `AI_GATEWAY_API_KEY` | Jev via Vercel AI Gateway (`https://ai-gateway.vercel.sh/typesafe`, model `typesafe-ai/jev`). Preferred if set. |
 | `TYPESAFE_API_KEY` | Jev directly via TypeSafe. Used when no gateway key is set. |
 | `JEV_UPSTREAM_API_KEY` (+ optional base URL/model, see `server/src/kit/jev.mjs`) | Override for a custom OpenAI-compatible upstream. |
