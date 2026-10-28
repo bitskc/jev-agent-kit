@@ -28,7 +28,7 @@ Fields: `task_kind` (lookup, mechanical_edit, scoped_implementation, judgement, 
 - `mismatch: false`: dispatch as planned. `verdict:"unknown"` means Jev was unavailable, gave an unusable answer, or you passed a custom ladder — it does NOT mean the tier is fine, and it is different from an unrecognised model (which is silently treated as director-tier).
 - `over_tiered`: re-dispatch with `recommended_model` (cheaper). Only keep the bigger model if you can state a concrete reason the classifier could not see.
 - `under_tiered`: use the larger `recommended_model`, or do the thinking yourself and delegate only the mechanical part.
-- It only judges when Jev is confident (>= 0.8 with a clear margin). If the answer is unclear, or Jev is unavailable, it returns no mismatch (fails open): proceed with your own judgement.
+- The ≥0.8-confidence/clear-margin bar gates **over_tiered flagging only**. `under_tiered` is flagged regardless of confidence, and the fable-without-prior-failure block fires whenever it's true (a missing answer counts as `prior=0` → block).
 - Do not call it again with a reworded description to get a different answer.
 
 Logic adapted from jonathanavis96/jev-kit (MIT).

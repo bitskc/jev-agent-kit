@@ -1,11 +1,13 @@
 ---
 name: jev-command-guard
-description: Before running a risky or ambiguous shell command (deleting or overwriting files, sudo, scp/rsync/ssh to another host, reading .env or key files, printing environment variables, git commit/add that might stage secrets, curl | sh, anything touching prod), ask the jev-mcp kit_guard_command tool for a second opinion, then obey `ask` and `block`. Skip it when a PreToolUse guard hook is already installed (the hook runs this same check on every call).
+description: Before running a risky or ambiguous shell command (deleting or overwriting files, sudo, scp/rsync/ssh to another host, reading .env or key files, printing environment variables, git commit/add that might stage secrets, curl | sh, anything touching prod), ask the jev-mcp kit_guard_command tool for a second opinion, then obey `ask` and `block`.
 ---
 
 # jev-command-guard
 
 Run the command through `kit_guard_command` first whenever it could be destructive, exfiltrate or print a secret, change something outside the working directory, or touch another machine. Skip it for plainly read-only commands (`ls`, `git status`, `rg`, `cat README.md`, test and build runs).
+
+If a `kit_guard_command` PreToolUse hook is already installed it calls the same tool on every Bash/Read, so you can skip manual calls on commands that pass through it — but it is not equivalent: it fails open on a 2 s Jev timeout, never blocks in `JEV_GUARD_MODE=shadow`, can let `ask` through when `JEV_GUARD_ASK_NO_UI=allow`, and covers Bash/Read only. Keep calling the tool for anything risky outside those shapes or when you can't see the hook's mode.
 
 ## Call
 

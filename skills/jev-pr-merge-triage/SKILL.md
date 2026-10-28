@@ -1,6 +1,6 @@
 ---
 name: jev-pr-merge-triage
-description: Before merging a PR (or spending an agent pass on "are the review comments handled"), batch-classify the unresolved review comments with jev-mcp jev_classify into must_fix / question / cosmetic / claimed_addressed / bot_noise — a cheap triage that tells you whether anything actually blocks the merge before you pay for a real review pass.
+description: Before merging a PR (or spending an agent pass on "are the review comments handled"), batch-classify the unresolved review comments with jev-mcp jev_classify into must_fix / question / cosmetic / claimed_addressed / bot_noise / manual_review — a cheap triage that tells you whether anything actually blocks the merge before you pay for a real review pass.
 ---
 
 # jev-pr-merge-triage
@@ -23,9 +23,11 @@ gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$
   --jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved==false) | {id, outdated:.isOutdated, path:(.comments.nodes[0].path // "?"), line:(.comments.nodes[0].line // 0), comments:[.comments.nodes[]|{author:.author.login,body}]}'
 ```
 
-**Merge-state facts are the hard gate** — red required checks, `isDraft`, `reviewDecision: CHANGES_REQUESTED`, or conflicts are the blocker; skip classification until they're handled. Read the top-level `reviews[].body` and `comments[]` too — many bots post findings as issue comments, not review threads.
+**Merge-state facts are the hard gate** — red required checks, `isDraft`, or conflicts are the blocker; skip classification until they're handled. `reviewDecision: CHANGES_REQUESTED` blocks *merging* but not triage — the requested changes usually are the open threads, so classify them anyway and report them as the blockers. Read the top-level `reviews[].body` and `comments[]` too — many bots post findings as issue comments, not review threads.
 
 - `isOutdated: true` is GitHub's own signal that the code under the comment changed — pre-tag those threads yourself; don't ask jev to guess staleness it can't see.
+
+- The query caps at `reviewThreads(first:100)` / `comments(first:30)` — >100 threads or >30 comments/thread are dropped silently. On a heavy PR, page the connection (`pageInfo { hasNextPage endCursor }` + `after:`) or accept the cap and call it out in the report.
 - Read **every comment in the thread**, not just the first: a reply like "fixed in abc123" is itself a classification input (`claimed_addressed`).
 
 ## Step 2: classify the open threads
@@ -39,7 +41,7 @@ If threads + top-level comments exceed ~60 items, split into multiple `jev_class
   "purpose": "Triage unresolved PR review comments: which actually block merging vs. are questions, cosmetic, already-claimed-fixed, or bot noise.",
   "items": [{"id": "PRRT_xxx", "text": "[bitskc bot, outdated=false] src/auth.ts:47 — P1: token compared with ==, timing attack. Reply by andy: fixed in 1ea192b"}],
   "classes": [
-    {"id": "must_fix", "description": "A concrete bug, security hole, regression, or missing behavior the commenter expects addressed. Includes P1/P2 severity labels, 'this will break', and specific suggested changes not yet applied and not claimed applied in a reply."},
+    {"id": "must_fix", "description": "A concrete bug, security hole, regression, or missing behavior the commenter expects addressed. Includes P0/P1/P2 severity labels, 'this will break', and specific suggested changes not yet applied and not claimed applied in a reply."},
     {"id": "question", "description": "Asks why, requests clarification, or raises a design tradeoff for the owner to accept — needs a human/author answer, not necessarily a code change."},
     {"id": "cosmetic", "description": "Style, naming, docs wording, P3-or-lower nits, non-blocking suggestions ('could also', 'nit', 'cosmetic')."},
     {"id": "claimed_addressed", "description": "A reply in the thread asserts it's fixed (e.g. 'fixed in <sha>', 'done', 'addressed'), or the thread is GitHub-flagged outdated. Verify the claim in the current diff before trusting it."},
