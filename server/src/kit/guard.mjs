@@ -865,6 +865,18 @@ function launderTargets(seg, home) {
   }
   return out;
 }
+// Rewrites the alias-matching suffix of one token, so every operand position inherits the source's classification:
+// `x`, `--post-file=x`, `-d @x`, `--data=@x`, `if=x`, `FILE:x`, `-F f=@x`. The whole token is tried first, then each
+// suffix that follows `=`, `@`, or `:`.
+function aliasedToken(t, alias) {
+  const cuts = [0];
+  for (let i = 0; i < t.length; i++) if ("=@:".includes(t[i])) cuts.push(i + 1);
+  for (const s of cuts) {
+    const key = t.slice(s) && normalizePath(rdUnquote(t.slice(s)));
+    if (key && alias.has(key)) return t.slice(0, s) + alias.get(key);
+  }
+  return t;
+}
 // Rewrites each segment through the aliases built so far and returns the rewritten copies as extra segments.
 function launderedSegments(segments, home) {
   const alias = new Map();
@@ -875,8 +887,7 @@ function launderedSegments(segments, home) {
       rewritten = rewritten
         .split(/(\s+)/)
         .map((t) => {
-          const key = t.trim() && normalizePath(rdUnquote(t));
-          return key && alias.has(key) ? alias.get(key) : t;
+          return t.trim() ? aliasedToken(t, alias) : t;
         })
         .join("");
     }
