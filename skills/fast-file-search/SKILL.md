@@ -20,12 +20,12 @@ plocate -i -l 50 'nginx.conf'          # case-insensitive, 50 results
 plocate -b '\.pem$' -r                 # regex on the base name (-r = regex)
 ```
 
-**Missing? Install** (a named package install is the one sudo use the jev guard accepts; if a guard asks, confirm with the user):
+**Missing? Install** (the jev guard's R5 rule counts only `apt`/`apt-get`/`dpkg`/`snap`/`aptitude` installs as a named package install; `dnf`, `pacman` and `sudo updatedb` come back `block`, so have the user run those):
 ```sh
 sudo apt-get install -y plocate        # Debian/Ubuntu
-sudo dnf install -y plocate            # Fedora/RHEL
-sudo pacman -S --noconfirm plocate     # Arch
-sudo updatedb                          # build the system index (needs root, takes a minute)
+sudo dnf install -y plocate            # Fedora/RHEL (guard: block)
+sudo pacman -S --noconfirm plocate     # Arch (guard: block)
+sudo updatedb                          # build the system index (needs root, takes a minute; guard: block)
 ```
 If `plocate` is unavailable but `mlocate`/`locate` exists, use `locate -i pattern` and `sudo updatedb`.
 
