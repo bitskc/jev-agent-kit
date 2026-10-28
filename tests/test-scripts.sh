@@ -26,6 +26,8 @@ ok "$(ls "$H/.claude/skills" | tr '\n' ' ')" "$(ls "$H/.omp/agent/skills" | tr '
 ok "$([ -d "$H/.claude/skills/jev-honest" ] && echo yes)" yes "install: jev-honest skill present"
 ok "$([ -x "$H/.local/bin/jev-call" ] && [ -x "$H/.local/bin/jev-update" ] && echo yes)" yes "install: jev-call + jev-update executable"
 ok "$([ -x "$H/.local/share/jev-agent-skills/hooks/honest/jev-honest-activate.js" ] && [ -f "$H/.local/share/jev-agent-skills/hooks/omp/jev-honest.ts" ] && echo yes)" yes "install: honest hooks shipped"
+ok "$([ -f "$H/.local/share/jev-agent-skills/hooks/honest/rules.default.json" ] && echo yes)" yes "install: rules.default.json shipped alongside the honest hooks"
+ok "$(node -e "const rt=require('$H/.local/share/jev-agent-skills/hooks/honest/jev-honest-runtime.js'); console.log(rt.rules()[0] && rt.rules()[0].id)")" "pr-gstack-reviewed" "install: default rule resolves from the installed location"
 P="$tmp/My Project"; mkdir -p "$P"
 HOME=$H bash "$root/install.sh" --project "$P" >/dev/null
 ok "$([ -f "$P/.claude/skills/jev-honest/SKILL.md" ] && [ -f "$P/.omp/skills/jev-honest/SKILL.md" ] && echo yes)" yes "install: --project path with spaces"

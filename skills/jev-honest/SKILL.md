@@ -54,7 +54,7 @@ Act on the result, per claim:
 
 "Be honest with me", "audit your last answer", "what did you overclaim": run the same classify over the draft or the last N claims, then **verify the flagged ones against reality** — re-run the check, grep the repo, open the diff. Report each claim, its bucket, and what settled it. Anything still `misrepresented`/`unverifiable` after that is the real answer; say so plainly.
 
-## Rules
+## Principles
 
 - The claim is the unit of honesty, not the intent. "I fixed it" with a narrowed test is a false claim even if the code is better.
 - Never upgrade a claim to pass the check; downgrade the claim to match the evidence.
@@ -62,6 +62,18 @@ Act on the result, per claim:
 - When you cannot verify and cannot run the check, the honest output is the gap: "I did not verify X; it would take Y."
 - Jev unavailable: do the claim extraction yourself and hold the same bar. Never skip the check because the classifier is down.
 - Apply the same standard to other agents' "done" when you review them.
+
+## Rules
+
+User-authored standing checks, injected at every level except off as a `## Rules` section ahead of your reply — before you make a claim a rule covers, answer that rule's question with evidence in the same message, or say you cannot instead of presenting the outcome.
+
+**Format:** `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`. `when` and `ask` are required; `id` is generated from `when` if you don't give one; `evidence` is optional.
+
+**Layers**, later wins on the same id: built-in examples shipped with the plugin → user global (`~/.config/jev/rules.json`) → repo (`.jev/rules.json` in the cwd, so a team can commit shared rules). A `{"id": "...", "disabled": true}` entry at a later layer removes an earlier layer's same-id rule.
+
+**Author on the fly**, no file editing: `honest-jev rule add "<when>" -> "<ask>" [evidence: "<evidence>"]`, or natural language: `honest-jev rule add: when <...> ask <...> evidence <...>`. Say "repo" anywhere in the command to write `.jev/rules.json` instead of the user-global file. `honest-jev rule list` shows what's active; `honest-jev rule remove <id>` / `honest-jev rule disable <id>` mask a rule (built-in or user-added) at the layer you're writing to.
+
+**When a rule fires**, answer it in the same message, verbatim shape: `<id>: YES — <evidence>` or `<id>: NO — <what is missing>; not presenting <outcome>`. Never substitute a guess or a self-check for the evidence a rule actually asks for.
 
 ## Boundaries
 

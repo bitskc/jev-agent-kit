@@ -20,6 +20,123 @@ function normalize(v: unknown): Level | null {
   if (n === "lite") return "soft";
   return (LEVELS as readonly string[]).includes(n) ? (n as Level) : null;
 }
+
+// ── rules (user-authored standing checks) ──────────────────────────────────
+// Three layers merge in id order, later wins: built-in examples (embedded below, since this file is installed
+// standalone with no sibling rules.default.json) -> user global (~/.config/jev/rules.json) -> repo
+// (.jev/rules.json in the cwd). A {"id":...,"disabled":true} entry at a later layer removes an earlier layer's
+// same-id rule. Malformed entries are skipped individually; never crashes the hook.
+type Rule = { id: string; when: string; ask: string; evidence: string };
+const DEFAULT_RULES: Rule[] = [
+  {
+    id: "pr-gstack-reviewed",
+    when: "presenting a pull request as ready to merge or calling it reviewed/clean/mergeable",
+    ask: "Has a real gstack /review run on THIS PR and is it clean?",
+    evidence: "review record or Automated Code Review comment on this PR number with a CLEAN verdict and 0 unresolved threads; Auto-review bot comments, Devin checks, reviews on other PRs, or a self-review do not count",
+  },
+];
+const ID_RE = /^[a-z0-9-]{2,48}$/;
+function userRulesPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(base, "jev", "rules.json");
+}
+function repoRulesPath(): string {
+  return path.join(process.cwd(), ".jev", "rules.json");
+}
+function validRule(r: unknown): r is Rule {
+  if (!r || typeof r !== "object") return false;
+  const o = r as Record<string, unknown>;
+  return typeof o.id === "string" && ID_RE.test(o.id) &&
+    typeof o.when === "string" && o.when.trim() !== "" &&
+    typeof o.ask === "string" && o.ask.trim() !== "" &&
+    (o.evidence === undefined || typeof o.evidence === "string");
+}
+function validDisable(r: unknown): r is { id: string; disabled: true } {
+  if (!r || typeof r !== "object") return false;
+  const o = r as Record<string, unknown>;
+  return o.disabled === true && typeof o.id === "string" && ID_RE.test(o.id);
+}
+function readRulesFile(p: string): unknown[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, "utf8").replace(/^\uFEFF/, ""));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+function rules(): Rule[] {
+  const merged = new Map<string, Rule>();
+  for (const r of DEFAULT_RULES) merged.set(r.id, r);
+  for (const file of [userRulesPath(), repoRulesPath()]) {
+    for (const entry of readRulesFile(file)) {
+      if (validDisable(entry)) { merged.delete(entry.id); continue; }
+      if (validRule(entry)) merged.set(entry.id, { id: entry.id, when: entry.when, ask: entry.ask, evidence: entry.evidence ?? "" });
+    }
+  }
+  return [...merged.values()];
+}
+function slugify(text: string): string {
+  const s = String(text ?? "").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  return ID_RE.test(s) ? s : "rule";
+}
+type RuleCmd =
+  | { action: "list" }
+  | { action: "remove" | "disable"; id: string; repo: boolean }
+  | { action: "add"; when: string; ask: string; evidence: string; repo: boolean };
+// Parses the args already stripped of the leading "/honest-jev " — expects to start with "rule ".
+function parseRuleArgs(a: string): RuleCmd | null {
+  const m = a.match(/^rule\s+(.+)$/is);
+  if (!m) return null;
+  const rest = m[1].trim();
+  if (/^list\b/i.test(rest)) return { action: "list" };
+  let mm: RegExpMatchArray | null;
+  if ((mm = rest.match(/^remove\s+([a-z0-9-]{2,48})\b/i))) return { action: "remove", id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
+  if ((mm = rest.match(/^disable\s+([a-z0-9-]{2,48})\b/i))) return { action: "disable", id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
+  if (/^add\b/i.test(rest)) {
+    const body = rest.replace(/^add:?\s*/i, "");
+    const repo = /\brepo\b/i.test(body);
+    let m2 = body.match(/^"([^"]+)"\s*->\s*"([^"]+)"(?:\s*evidence:\s*"([^"]+)")?/i);
+    if (m2) return { action: "add", when: m2[1].trim(), ask: m2[2].trim(), evidence: (m2[3] ?? "").trim(), repo };
+    m2 = body.match(/^when\s+(.+?)\s+ask\s+(.+?)(?:\s+evidence\s+(.+))?$/i);
+    if (m2) return { action: "add", when: m2[1].trim(), ask: m2[2].trim(), evidence: (m2[3] ?? "").trim(), repo };
+    return null;
+  }
+  return null;
+}
+function writeRulesFile(file: string, list: unknown[]): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(list, null, 2) + "\n");
+}
+function maskRuleEntry(file: string, id: string): void {
+  const list = readRulesFile(file).filter((e) => !(e && typeof e === "object" && (e as Record<string, unknown>).id === id));
+  list.push({ id, disabled: true });
+  writeRulesFile(file, list);
+}
+function ruleLine(r: Rule): string {
+  return `- [${r.id}] When ${r.when}: ${r.ask}${r.evidence ? ` — Evidence: ${r.evidence}` : ""}`;
+}
+function applyRuleCommand(cmd: RuleCmd): string {
+  if (cmd.action === "list") {
+    const all = rules();
+    return all.length ? `HONEST JEV RULES:\n${all.map(ruleLine).join("\n")}` : "HONEST JEV RULES: none configured.";
+  }
+  const file = cmd.repo ? repoRulesPath() : userRulesPath();
+  if (cmd.action === "remove" || cmd.action === "disable") {
+    maskRuleEntry(file, cmd.id);
+    return `HONEST JEV RULE ${cmd.action === "remove" ? "REMOVED" : "DISABLED"}: ${cmd.id}`;
+  }
+  const id = slugify(cmd.when);
+  const list = readRulesFile(file).filter((e) => !(e && typeof e === "object" && (e as Record<string, unknown>).id === id));
+  const entry: Rule = { id, when: cmd.when, ask: cmd.ask, evidence: cmd.evidence };
+  list.push(entry);
+  writeRulesFile(file, list);
+  return `HONEST JEV RULE ADDED: ${ruleLine(entry)}\n\nApply this rule from this reply on.`;
+}
+function rulesSection(): string {
+  const list = rules();
+  if (!list.length) return "";
+  return `\n\n## Rules\n\nBefore you say any of the following, answer the question with evidence in the same message; if you cannot, say so instead of presenting the outcome:\n\n${list.map(ruleLine).join("\n")}`;
+}
 // Default level: JEV_HONEST_DEFAULT_LEVEL env > ~/.config/jev/config.json {"honestLevel": ...} > off (same 3-step
 // resolution as the Claude Code hooks, so the README's "same levels/semantics" promise actually holds for omp).
 function configPath(): string {
@@ -51,17 +168,19 @@ function writeLevel(level: Level): void {
 }
 function instructions(level: Level): string {
   const head = `HONEST JEV ACTIVE — level: ${level}\n\n`;
+  if (level === "off") return head; // defensive: no caller passes "off", but never inject rules if one does
+  let body: string;
   try {
-    const body = fs.readFileSync(SKILL, "utf8").replace(/^---[\s\S]*?---\s*/, "");
-    return head + body.split(/\r?\n/).filter((line) => {
+    body = fs.readFileSync(SKILL, "utf8").replace(/^---[\s\S]*?---\s*/, "").split(/\r?\n/).filter((line) => {
       const row = line.match(/^\|\s*\*\*(.+?)\*\*\s*\|/);
       const rowLevel = row ? normalize(row[1]) : null;
       return rowLevel ? rowLevel === level : true;
     }).join("\n");
   } catch {
-    return head + 'Before claiming done, fixed, works, verified or safe: for every claim ask "what would I show to prove this line?" ' +
+    body = 'Before claiming done, fixed, works, verified or safe: for every claim ask "what would I show to prove this line?" ' +
       "Send only claims backed by output you produced this turn; keep hedges visible; rewrite overclaims to what the evidence shows.";
   }
+  return head + body + rulesSection();
 }
 function badge(level: Level): string {
   return level === "off" ? "" : level === "standard" ? "[HONEST]" : `[HONEST:${level.toUpperCase()}]`;
@@ -75,7 +194,17 @@ export default function jevHonest(pi: ExtensionAPI) {
   pi.registerCommand("honest-jev", {
     description: "Honest Jev level: soft | standard | strict | off",
     handler: async (args: string, ctx: HookCtx) => {
-      const level = normalize(String(args ?? "").trim() || "standard");
+      const a = String(args ?? "").trim();
+      if (/^rule\b/i.test(a)) {
+        const cmd = parseRuleArgs(a);
+        if (!cmd) {
+          try { ctx?.ui?.notify?.('usage: /honest-jev rule add "<when>" -> "<ask>" [evidence: "<evidence>"] | rule list | rule remove <id> | rule disable <id>', "warning"); } catch { /* */ }
+          return;
+        }
+        pi.sendMessage?.({ customType: "jev-honest", content: applyRuleCommand(cmd), display: true });
+        return;
+      }
+      const level = normalize(a || "standard");
       if (!level) { try { ctx?.ui?.notify?.("usage: /honest-jev soft|standard|strict|off", "warning"); } catch { /* */ } return; }
       writeLevel(level);
       setStatus(ctx);

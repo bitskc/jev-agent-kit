@@ -78,6 +78,8 @@ Honest Jev is the honesty layer: it does not judge the code, it judges the sente
 
 Switch with **`/honest-jev soft|standard|strict|off`** (Claude Code and omp), or just type `honest-jev strict`. The level is injected into every session and sub-agent by the hooks, and a **`[HONEST]` / `[HONEST:STRICT]` badge** shows under the input box while it's armed. Default level: `JEV_HONEST_DEFAULT_LEVEL` env or `~/.config/jev/config.json` `{"honestLevel":"standard"}`.
 
+**Rules** are user-authored standing checks — reusable, not a dedicated merge gate. A rule is `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`; when its situation applies, Honest Jev injects it so the model must answer the question with evidence before making the claim. Three layers merge, later wins on the same id: built-in examples (one ships by default: "presenting a PR as ready to merge" asks whether it's really gstack-reviewed) → user global `~/.config/jev/rules.json` → repo `.jev/rules.json` (committable, so a team shares rules). Author one on the fly, no file editing: `honest-jev rule add: when presenting a PR as ready to merge ask "Is it gstack-reviewed?" evidence "a CLEAN review record for this PR number"` (say "repo" anywhere in the command to write the repo layer instead); `honest-jev rule list` / `rule remove <id>` / `rule disable <id>` manage what's active.
+
 ## Install
 
 ### Claude Code (plugin, recommended)

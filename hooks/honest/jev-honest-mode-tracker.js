@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Honest Jev — Claude Code UserPromptSubmit hook. Watches for "/honest-jev <level>" (also "honest-jev strict",
-// "stop honest-jev", "normal mode"), writes the flag, and tells the model the level changed. Any other prompt: no-op.
+// "stop honest-jev", "normal mode"), "honest-jev rule add|list|remove|disable ...", writes the flag or rules
+// file, and tells the model what changed. Any other prompt: no-op.
 const rt = require('./jev-honest-runtime');
 
 let input = '';
@@ -8,6 +9,8 @@ process.stdin.on('data', (c) => { input += c; });
 process.stdin.on('end', () => {
   try {
     const data = JSON.parse(input.replace(/^\uFEFF/, ''));
+    const ruleCmd = rt.parseRuleCommand(data.prompt);
+    if (ruleCmd) { rt.emit('UserPromptSubmit', rt.applyRuleCommand(ruleCmd)); return; }
     const level = rt.parseCommand(data.prompt);
     if (level === null) return;
     if (level === 'off') {
