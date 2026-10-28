@@ -1,6 +1,10 @@
 # jev-agent-kit
 
-**The decision layer your coding agent is missing.**
+<p align="center">
+  <img src="docs/honest-jev.svg" width="72" alt="Honest Jev — Abe Lincoln mark"/>
+  <br>
+  <b>The decision layer your coding agent is missing.</b>
+</p>
 
 A hosted Jev toolbox over MCP + the skills that make agents actually use it — for **omp** (oh-my-pi), **Claude Code**, and any MCP-capable agent.
 
@@ -32,8 +36,6 @@ Every kit tool **fails open**: Jev unavailable → deterministic rules still dec
 
 ## The skills (what makes agents *use* it)
 
-Skills are markdown agents load automatically — no wiring beyond installing them.
-
 | Skill | When it fires |
 |---|---|
 | `jev-command-guard` | Before any risky command — `rm`, `sudo`, `scp prod`, `.env` reads, `curl \| sh` |
@@ -41,6 +43,7 @@ Skills are markdown agents load automatically — no wiring beyond installing th
 | `jev-verify-before-done` | Before claiming "done/fixed/works" — checks evidence, not words |
 | `jev-pr-merge-triage` | Before merging — are unresolved review threads actually handled? |
 | `jev-issue-triage` | Backlog sweep — classify 1-2K issues (~40k tokens vs ~1M+ agent pass), then verify close-candidates |
+| `jev-honest` 🧔 | Honest Jev — claims-vs-evidence check before "done/works/fixed"; catches hedging and misrepresentation |
 | `jev-classify` | Any "sort these items into buckets" task |
 | `fast-file-search` | Repo-wide file discovery without `fd`/`rg` guesswork |
 
