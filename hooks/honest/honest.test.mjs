@@ -120,16 +120,32 @@ test("parseRuleCommand: quoted, natural-language, list, remove, disable, and exp
 });
 
 test("hooks end to end: rule add via mode-tracker writes the file and emits the rule; rule remove masks it", () => {
-  fresh(); const xdg = freshXdg();
+  const d = fresh(); freshXdg(); // CLAUDE_CONFIG_DIR set AND XDG_CONFIG_HOME set: the former must win
   inRepo(freshRepo(), () => {
     const added = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: 'honest-jev rule add "shipping a release" -> "did CI run?" evidence: "CI link"' }));
     assert.match(added, /^HONEST JEV RULE ADDED: \[shipping-a-release\]/);
-    const file = JSON.parse(fs.readFileSync(path.join(xdg, "jev", "rules.json"), "utf8"));
+    const file = JSON.parse(fs.readFileSync(path.join(d, "jev", "rules.json"), "utf8"));
     assert.equal(file.length, 1);
     assert.equal(file[0].id, "shipping-a-release");
     const removed = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "honest-jev rule remove shipping-a-release" }));
     assert.equal(removed, "HONEST JEV RULE REMOVED: shipping-a-release");
     assert.ok(!rt.rules().some((r) => r.id === "shipping-a-release"));
+  });
+});
+
+test("userConfigDir/userRulesPath: CLAUDE_CONFIG_DIR wins over a populated XDG_CONFIG_HOME", () => {
+  const d = fresh();
+  const xdg = freshXdg();
+  assert.equal(rt.userConfigDir(), path.join(d, "jev"));
+  fs.mkdirSync(path.join(xdg, "jev"), { recursive: true });
+  fs.writeFileSync(path.join(xdg, "jev", "rules.json"), JSON.stringify([{ id: "xdg-only", when: "x", ask: "y" }]));
+  inRepo(freshRepo(), () => {
+    assert.ok(!rt.rules().some((r) => r.id === "xdg-only")); // the XDG file is never read while CLAUDE_CONFIG_DIR is set
+  });
+  delete process.env.CLAUDE_CONFIG_DIR;
+  assert.equal(rt.userConfigDir(), path.join(xdg, "jev")); // unset CLAUDE_CONFIG_DIR: falls back to XDG_CONFIG_HOME
+  inRepo(freshRepo(), () => {
+    assert.ok(rt.rules().some((r) => r.id === "xdg-only"));
   });
 });
 
@@ -168,10 +184,10 @@ test("instructions: real SKILL.md is injected with exactly one level row", () =>
 
 test("defaultLevel: env beats config file beats off", () => {
   const d = fresh();
-  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-"));
-  process.env.XDG_CONFIG_HOME = xdg; delete process.env.JEV_HONEST_DEFAULT_LEVEL;
+  freshXdg(); // populated but ignored: CLAUDE_CONFIG_DIR wins over XDG_CONFIG_HOME
+  delete process.env.JEV_HONEST_DEFAULT_LEVEL;
   assert.equal(rt.defaultLevel(), "off");
-  fs.mkdirSync(path.join(xdg, "jev")); fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"soft"}');
+  fs.mkdirSync(path.join(d, "jev")); fs.writeFileSync(path.join(d, "jev", "config.json"), '{"honestLevel":"soft"}');
   assert.equal(rt.defaultLevel(), "soft");
   process.env.JEV_HONEST_DEFAULT_LEVEL = "strict";
   assert.equal(rt.defaultLevel(), "strict");
@@ -179,18 +195,18 @@ test("defaultLevel: env beats config file beats off", () => {
 });
 test("activate/subagent: a config-default level is never persisted, so editing the config takes effect next session", () => {
   const d = fresh();
-  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-")); process.env.XDG_CONFIG_HOME = xdg; delete process.env.JEV_HONEST_DEFAULT_LEVEL;
-  fs.mkdirSync(path.join(xdg, "jev")); fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"soft"}');
+  freshXdg(); delete process.env.JEV_HONEST_DEFAULT_LEVEL;
+  fs.mkdirSync(path.join(d, "jev")); fs.writeFileSync(path.join(d, "jev", "config.json"), '{"honestLevel":"soft"}');
   assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: soft/);
   assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false); // never persisted: a default resolution is not an explicit choice
-  fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"strict"}');
+  fs.writeFileSync(path.join(d, "jev", "config.json"), '{"honestLevel":"strict"}');
   assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: strict/); // picks up the edited config, not frozen at "soft"
   const sub = JSON.parse(run("jev-honest-subagent.js"));
   assert.match(sub.hookSpecificOutput.additionalContext, /level: strict/); // subagent independently resolves the same live default
   // an explicit switch still persists and still wins over the config default
   assert.match(run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "/honest-jev soft" })), /^HONEST JEV LEVEL CHANGED/);
   assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "soft\n");
-  fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"strict"}');
+  fs.writeFileSync(path.join(d, "jev", "config.json"), '{"honestLevel":"strict"}');
   assert.match(run("jev-honest-activate.js"), /^HONEST JEV ACTIVE — level: soft/); // explicit choice still beats the (now different) default
 });
 

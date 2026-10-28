@@ -19,7 +19,7 @@ if [ "$target" = auto ]; then
 fi
 share="$HOME/.local/share/jev-agent-skills"; bin="$HOME/.local/bin"
 mkdir -p "$share" "$bin"
-rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py "$share"/hooks/honest/*.js
+rm -rf "$share/hooks" && cp -r "$here/hooks" "$share/hooks" && chmod +x "$share"/hooks/*.sh "$share"/hooks/*.py "$share"/hooks/*.js "$share"/hooks/honest/*.js
 # jev-honest-runtime.js resolves SKILL.md relative to its own install location ($share/hooks/honest/.. -> $share/skills)
 # first, falling back to ~/.claude/skills only if that's absent. Without this, --omp-only and --project installs
 # never populate $share/skills, so the honest hook silently falls back to a ~700-char hardcoded summary instead

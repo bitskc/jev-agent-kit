@@ -17,9 +17,19 @@ const SKILL_CANDIDATES = () => [
 function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 }
-function configPath() {
+// Isolation note: CLAUDE_CONFIG_DIR is the agent's whole sandboxed config dir (credentials, settings,
+// the .jev-honest-active flag, skills...) — a session that overrides it to isolate itself expects EVERY
+// jev-authored file to follow, including user-added rules and the honestLevel default. Before this, rules.json
+// and config.json ignored CLAUDE_CONFIG_DIR entirely and always fell through to XDG_CONFIG_HOME/~/.config,
+// so a sandboxed session's "honest-jev rule add" silently wrote into the real operator's home directory.
+// Tiering: CLAUDE_CONFIG_DIR (if set) > XDG_CONFIG_HOME (if set) > ~/.config.
+function userConfigDir() {
+  if (process.env.CLAUDE_CONFIG_DIR) return path.join(process.env.CLAUDE_CONFIG_DIR, 'jev');
   const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
-  return path.join(base, 'jev', 'config.json');
+  return path.join(base, 'jev');
+}
+function configPath() {
+  return path.join(userConfigDir(), 'config.json');
 }
 function statePath() {
   return path.join(claudeDir(), STATE_FILE);
@@ -33,7 +43,7 @@ function normalizeLevel(v) {
   return LEVELS.includes(n) ? n : null;
 }
 
-// Default level: JEV_HONEST_DEFAULT_LEVEL env > ~/.config/jev/config.json {"honestLevel": ...} > off.
+// Default level: JEV_HONEST_DEFAULT_LEVEL env > config.json {"honestLevel": ...} in userConfigDir() > off.
 function defaultLevel() {
   const env = normalizeLevel(process.env.JEV_HONEST_DEFAULT_LEVEL);
   if (env) return env;
@@ -62,7 +72,8 @@ function clearLevel() {
 }
 // ── rules (user-authored standing checks) ────────────────────────────────────
 // Three layers merge in id order, later wins: built-in examples (rules.default.json, shipped with the plugin)
-// -> user global (~/.config/jev/rules.json) -> repo (.jev/rules.json in the cwd, so teams can commit rules). A
+// -> user global (rules.json in userConfigDir(): CLAUDE_CONFIG_DIR/jev if set, else XDG_CONFIG_HOME/jev, else
+// ~/.config/jev) -> repo (.jev/rules.json in the cwd, so teams can commit rules). A
 // {"id":"...","disabled":true} entry at a later layer removes an earlier layer's same-id rule. Malformed
 // entries are skipped individually; a hook path never crashes on a bad rules file (JEV_HONEST_DEBUG=1 explains
 // why on stderr).
@@ -72,8 +83,7 @@ function defaultRulesPath() {
   return path.join(__dirname, 'rules.default.json');
 }
 function userRulesPath() {
-  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
-  return path.join(base, 'jev', 'rules.json');
+  return path.join(userConfigDir(), 'rules.json');
 }
 function repoRulesPath() {
   return path.join(process.cwd(), '.jev', 'rules.json');
@@ -236,6 +246,27 @@ function instructions(level) {
   return head + body + rulesSection();
 }
 
+// ── Stop gate (opt-in enforcement, used by hooks/jev-stop-verify.js) ────────
+// JEV_STOP_GATE env ('off'|'verify'|'honest'|'both') > config.json {"stopGate": ...} in userConfigDir() > off.
+// Mirrors defaultLevel()'s own env-then-config-then-off shape. Default off: a fresh install (and a fresh
+// `honestLevel`-only config with no `stopGate` key) never blocks a Stop until the user opts in explicitly.
+const STOP_GATES = ['off', 'verify', 'honest', 'both'];
+function normalizeStopGate(v) {
+  if (typeof v !== 'string') return null;
+  const n = v.trim().toLowerCase();
+  return STOP_GATES.includes(n) ? n : null;
+}
+function resolveStopGate() {
+  const env = normalizeStopGate(process.env.JEV_STOP_GATE);
+  if (env) return env;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath(), 'utf8').replace(/^\uFEFF/, ''));
+    return normalizeStopGate(cfg.stopGate) || 'off';
+  } catch {
+    return 'off';
+  }
+}
+
 // Claude Code: SessionStart and UserPromptSubmit take raw stdout as context; SubagentStart needs the JSON form.
 function emit(event, context) {
   if (!context) return;
@@ -250,4 +281,5 @@ module.exports = {
   LEVELS, DEFAULT_LEVEL, claudeDir, statePath, normalizeLevel, defaultLevel, readLevel, setLevel, clearLevel,
   parseCommand, filterSkillBody, instructions, emit,
   rules, parseRuleCommand, applyRuleCommand, slugify, defaultRulesPath, userRulesPath, repoRulesPath,
+  userConfigDir, configPath, resolveStopGate,
 };

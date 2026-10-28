@@ -1,0 +1,5 @@
+{
+  "appName": "fixture-webapp",
+  "port": 3000,
+  "logLevel": "info"
+}

@@ -1,0 +1,10 @@
+{
+  "name": "fixture-webapp",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/",
+    "lint": "node scripts/lint.js",
+    "build": "node scripts/build.js"
+  }
+}

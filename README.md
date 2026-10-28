@@ -15,7 +15,7 @@ Coding agents are good at writing code and bad at three judgment calls they make
 - *"Did I run the tests, or just say I did?"* — `kit_verify_done` counts only real runner evidence.
 - *"Is what I'm about to say actually backed by what I did?"* — **Honest Jev** classifies each claim as verified / hedged / unverifiable / misrepresented before you send it.
 
-One Cloudflare Worker (your account, your Jev key, your bearer token), 15 MCP tools, 8 skills, 4 hooks.
+One Cloudflare Worker (your account, your Jev key, your bearer token), 15 MCP tools, 8 skills, 5 hooks.
 
 `jev-call` below is installed to `~/.local/bin/jev-call` by `install.sh`; from a bare checkout use `scripts/jev-call.sh` instead.
 
@@ -78,11 +78,24 @@ Honest Jev is the honesty layer: it does not judge the code, it judges the sente
 | `standard` | Classifies before any done / fixed / works / verified claim; hedges must stay visible |
 | `strict` | Classifies before every substantive reply; a hedge counts as unverified: show it or say "not verified" |
 
-Switch with **`/honest-jev soft|standard|strict|off`** (Claude Code and omp), or just type `honest-jev strict`. The level is injected into every session and sub-agent by the hooks, and a **`[HONEST]` / `[HONEST:STRICT]` badge** shows under the input box while it's armed. Default level: `JEV_HONEST_DEFAULT_LEVEL` env or `~/.config/jev/config.json` `{"honestLevel":"standard"}`.
+Switch with **`/jev-agent-kit:honest-jev soft|standard|strict|off`** — that's the registered plugin command (Claude Code namespaces every plugin slash command; a bare `/honest-jev` won't autocomplete). The plain-text shortcut works from any session regardless of namespacing: just type `honest-jev strict` (no slash) and the `UserPromptSubmit` hook catches it as plain text, the same as the slash form. The level is injected into every session and sub-agent by the hooks, and a **`[HONEST]` / `[HONEST:STRICT]` badge** shows under the input box while it's armed. Default level: `JEV_HONEST_DEFAULT_LEVEL` env or `config.json` `{"honestLevel":"standard"}` in `userConfigDir()` (`$CLAUDE_CONFIG_DIR/jev` if set, else `$XDG_CONFIG_HOME/jev`, else `~/.config/jev`).
 
-**Rules** are user-authored standing checks — reusable, not a dedicated merge gate. A rule is `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`; when its situation applies, Honest Jev injects it so the model must answer the question with evidence before making the claim. Three layers merge, later wins on the same id: built-in examples (one ships by default: "presenting a PR as ready to merge" asks whether it's really gstack-reviewed) → user global `~/.config/jev/rules.json` → repo `.jev/rules.json` (committable, so a team shares rules). Author one on the fly, no file editing: `honest-jev rule add: when presenting a PR as ready to merge ask "Is it gstack-reviewed?" evidence "a CLEAN review record for this PR number"` (add a trailing `--repo`/`(repo)`, or lead with `repo` right after `add`/`remove`/`disable`, to target the repo layer instead — a `when`/`ask` that just mentions "the repo" stays user-global); `honest-jev rule list` / `rule remove <id>` / `rule disable <id>` manage what's active.
+**Rules** are user-authored standing checks — reusable, not a dedicated merge gate. A rule is `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`; when its situation applies, Honest Jev injects it so the model must answer the question with evidence before making the claim. Three layers merge, later wins on the same id: built-in examples (one ships by default: "presenting a PR as ready to merge" asks whether it's really gstack-reviewed) → user global `rules.json` in `userConfigDir()` (same `$CLAUDE_CONFIG_DIR`/`$XDG_CONFIG_HOME`/`~/.config` tiering as `config.json` — a sandboxed session that sets only `CLAUDE_CONFIG_DIR` keeps its rules fully isolated from the real operator's home directory) → repo `.jev/rules.json` (committable, so a team shares rules). Author one on the fly, no file editing: `honest-jev rule add: when presenting a PR as ready to merge ask "Is it gstack-reviewed?" evidence "a CLEAN review record for this PR number"` (add a trailing `--repo`/`(repo)`, or lead with `repo` right after `add`/`remove`/`disable`, to target the repo layer instead — a `when`/`ask` that just mentions "the repo" stays user-global); `honest-jev rule list` / `rule remove <id>` / `rule disable <id>` manage what's active.
 
 `.jev/rules.json` is in the same trust class as `CLAUDE.md`: whoever can land a commit on the repo layer can steer every session and subagent's `when`/`ask`/`evidence` text. Review it like you'd review any other committed instructions file — a hostile PR adding a repo-layer rule is a prompt-injection vector, not a bypass of anything Honest Jev itself checks.
+
+## Stop gate (opt-in enforcement)
+
+Honest Jev and `jev-verify-before-done` are both skill-driven: the prose tells the model to call `kit_verify_done` / `jev_classify` before claiming done, but nothing stops it from skipping the call. `hooks/jev-stop-verify.js` is a Claude Code `Stop` hook that closes that gap by calling those tools itself, from the transcript, after the model has already decided to stop:
+
+- **`verify`** — reconstructs `{task, final_message, file_changes, checks}` the same way the skill asks the model to by hand, calls `kit_verify_done`, and blocks (forcing one more turn) when the verdict is `unverified`.
+- **`honest`** — splits the final message into claims and builds the evidence **from the transcript's own tool calls since the user's last prompt** (commands run, their exit status, files edited — not the model's own self-written `EVIDENCE:` text, which is the self-attestation gap a skill-only check can't close), then calls `jev_classify`. Blocks only when a claim lands on `misrepresented`/`unverifiable` at `decision: "auto"`; a thin-margin `review` result is reported but never blocks by itself.
+
+Opt-in, default off: set `JEV_STOP_GATE=verify|honest|both` or `config.json` `{"stopGate": "..."}` in the same `userConfigDir()` as above. `honest` also auto-engages whenever the active Honest Jev level is `strict`, even with `JEV_STOP_GATE` unset — strict already promises "classify before every substantive reply" in prose; this is the same promise with a tool call behind it.
+
+It never blocks when nothing changed (`file_changes == 0`) or on the same stop twice (`stop_hook_active` loop guard), and it **fails open** — allows the stop — on a missing/malformed transcript, a missing `JEV_MCP_URL`/`JEV_MCP_TOKEN`, or any MCP call that errors or is still running past a hard 3 s cap. Added latency is near zero when it allows (no block, nothing to show), and roughly 4–8 s when it blocks (one extra model turn plus the MCP round trip(s)), measured in an e2e eval against `claude -p`.
+
+It is a nudge, not a guarantee: an explicit, specific user instruction ("don't run any tests, just tell me it's done") can outweigh the hook's injected feedback in the model's own judgement, the same way it would outweigh a human reviewer's comment — the hook still fires and still costs a turn, but the model may re-assert its original (honestly-hedged) answer instead of complying. It cannot be bypassed by the model deciding not to call a tool, since the hook calls the tools itself.
 
 ## Install
 
@@ -93,7 +106,7 @@ Switch with **`/honest-jev soft|standard|strict|off`** (Claude Code and omp), or
 /plugin install jev-agent-kit@jev-agent-kit
 ```
 
-Skills, `/honest-jev`, the Honest Jev hooks (SessionStart, UserPromptSubmit, SubagentStart) and the guard hook (PreToolUse on Bash/Read/NotebookRead/Grep) wire themselves. On first session Honest Jev offers to add its statusline badge — composed with any statusline you already have (ponytail's included), never replacing it.
+Skills, `/jev-agent-kit:honest-jev` (type `honest-jev <level>` plain text from any session, no slash needed), the Honest Jev hooks (SessionStart, UserPromptSubmit, SubagentStart), the guard hook (PreToolUse on Bash/Read/NotebookRead/Grep) and the opt-in Stop gate (off until `JEV_STOP_GATE`/`stopGate` is set — see [Stop gate](#stop-gate-opt-in-enforcement)) wire themselves. On first session Honest Jev offers to add its statusline badge — composed with any statusline you already have (ponytail's included), never replacing it.
 
 ### omp / oh-my-pi, or Claude Code without the plugin system
 
@@ -104,7 +117,7 @@ git clone https://github.com/bitskc/jev-agent-kit && ./jev-agent-kit/install.sh 
 `install.sh` copies skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/`, hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` + `jev-update` to `~/.local/bin/`. It never edits config and never touches a token; it prints what to wire next:
 
 - **omp**: `cp ~/.local/share/jev-agent-skills/hooks/omp/jev-honest.ts ~/.omp/agent/hooks/pre/` (and `jev-guard.ts`). The honest hook registers `/honest-jev`, injects the level before each turn and sets the badge through omp's own status line.
-- **Claude Code, manual**: merge `config/claude-settings-hook.json` into `~/.claude/settings.json`. The file has no `statusLine` key on purpose, so a shallow merge can't clobber one you already have (ponytail's included); to add the Honest Jev badge, compose it by hand: `{"type": "command", "command": "<your existing command, if any>; bash \"$HOME/.local/share/jev-agent-skills/hooks/jev-honest-statusline.sh\""}`.
+- **Claude Code, manual**: merge `config/claude-settings-hook.json` into `~/.claude/settings.json` — this now includes the opt-in `Stop` entry too (off until you set `JEV_STOP_GATE`/`stopGate`). The file has no `statusLine` key on purpose, so a shallow merge can't clobber one you already have (ponytail's included); to add the Honest Jev badge, compose it by hand: `{"type": "command", "command": "<your existing command, if any>; bash \"$HOME/.local/share/jev-agent-skills/hooks/jev-honest-statusline.sh\""}`.
 
 Either way you need a deployed worker first: [Deploy your own server](#deploy-your-own-server).
 
@@ -144,6 +157,8 @@ Then `/mcp reload`, `/mcp list`, `/mcp test jev` (expect 15 tools), `/reload-plu
 
 The guard hook makes `kit_guard_command` unconditional on Bash/Read/NotebookRead/Grep (Grep only when `output_mode` is `content`; the default `files_with_matches` and `count` modes print no secret content, so they're not judged). `allow` is silent, `ask` becomes a permission prompt, `block` denies with the reason and the suggested safer route. It **fails open** on a timeout (`JEV_GUARD_TIMEOUT`, default 2 s), a network/DNS error, a 5xx from the endpoint, an unparseable reply, or a missing/non-https `JEV_MCP_URL`/missing `JEV_MCP_TOKEN` — but it **asks** instead of silently allowing on a 4xx (revoked token, Cloudflare block), a redirect, a server-rejected call (a JSON-RPC error or a tool error), or an over-cap `command`/`file_path`: the server answered, so those are never treated as an outage. `JEV_GUARD_MODE=shadow` logs instead of blocking; `JEV_GUARD_ASK_AT` moves the ask threshold (server default 0.65). The omp port (`hooks/omp/jev-guard.ts`) follows the same ask-vs-fail-open split and swallows all errors because omp fails closed on a throwing hook; with no UI `ask` becomes a block unless `JEV_GUARD_ASK_NO_UI=allow`.
 
+Some Claude Code builds/configurations don't expose a top-level `Grep` tool at all in headless (`-p`) sessions (confirmed on 2.1.311: not even discoverable via `ToolSearch`). When that's the case the `Grep` branch of the `PreToolUse` matcher simply never fires for that session — but a grep-style secret read run through `Bash` (`grep SECRET .env`) is still caught, since it matches the `Bash` branch instead.
+
 ## Deploy your own server
 
 Needs Node ≥ 22 and a Cloudflare account (free plan is fine).
@@ -172,7 +187,8 @@ curl -s -X POST "$JEV_MCP_URL" -H "authorization: Bearer $JEV_MCP_TOKEN" \
 ## Tests
 
 - `cd server && npm test` — offline, mocked Jev (guard rules, tier resolution, verify evidence rules).
-- `node --test "hooks/honest/**/*.test.mjs"` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file.
+- `node --test "hooks/honest/**/*.test.mjs"` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file, `userConfigDir()`/rules/config path tiering.
+- `node --test "hooks/jev-stop-verify.test.mjs"` — the Stop gate: verify/honest/both/off gating, the strict-level auto-engage, the loop guard, fail-open on timeout/error/malformed transcript, claim splitting, evidence scoping. Runs in-process against an injected `fetchImpl` stub, no real network call.
 - `bash tests/test-scripts.sh` — `install.sh`, `update.sh --timer`, statusline badge, `jev-call` exit codes, with stubbed network.
 - `bash tests/test-hook.sh` — live guard hook against your worker (needs `JEV_MCP_URL` + `JEV_MCP_TOKEN`).
 
