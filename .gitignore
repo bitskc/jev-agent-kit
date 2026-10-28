@@ -17,3 +17,8 @@ dist/
 __pycache__/
 *.pyc
 *.tar.gz
+# local eval run output: evals/run.mjs writes a fresh evals/results/<date>.json on every run; these are
+# scratch, not curated evidence. The corpora (evals/*.jsonl) ARE tracked. A PR wanting a before/after
+# snapshot as evidence should summarize pass/fail counts in evals/RESULTS.md and the commit message, not
+# commit the full run output.
+evals/results/

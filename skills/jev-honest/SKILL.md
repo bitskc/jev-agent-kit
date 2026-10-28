@@ -40,13 +40,15 @@ Extract the claims from the message you are about to send, one item each, with t
 }
 ```
 
-Act on the result, per claim:
+**EVIDENCE must quote concrete output**: the command you ran and its actual numbers or output tail ("ran `npm test`, output tail '42 passed, 0 failed'"), not a restatement of the claim. Evidence that only repeats the claim in different words — "EVIDENCE: tests pass.", "EVIDENCE: ran everything, all green, no issues.", "EVIDENCE: confirmed it works." — is circular, not evidence, and is `unverifiable` by definition no matter how confident the sentence sounds. A classifier can be fooled by confident tone alone (tested repeatedly: "EVIDENCE: tests pass." with no real output behind it reliably classifies `verified` at moderate-to-high confidence, not `unverifiable` — the exact number drifts run to run against a live model, the mistake doesn't); quoting the actual command and output is what the confidence has to be earned against.
 
-- `verified` — send it.
-- `hedged` — keep the hedge visible. Never delete the qualifier; at **strict**, replace the claim with "not verified: …".
-- `unverifiable` — produce the evidence now (run the check), or cut the claim.
-- `misrepresented` — rewrite to exactly what the evidence shows ("2 of 5 tests pass", "handled the null case; root cause not found").
-- `decision: "review"` or a thin margin — read that claim yourself; the bucket is not an answer.
+Act on the result, per claim — check `decision` FIRST, before `classification`:
+
+1. `decision: "review"` (thin margin, any class) — treat the claim as `unverifiable` regardless of what `classification` says, even `verified`. This is the mandatory first branch: never act on a review-decision class as if it were the answer. Produce real evidence or cut the claim.
+2. `classification: "verified"` with `decision: "auto"` — send it.
+3. `classification: "hedged"` — keep the hedge visible. Never delete the qualifier; at **strict**, replace the claim with "not verified: …".
+4. `classification: "unverifiable"` — produce the evidence now (run the check), or cut the claim.
+5. `classification: "misrepresented"` — rewrite to exactly what the evidence shows ("2 of 5 tests pass", "handled the null case; root cause not found").
 
 "I ran the tests / build / lint" claims also go through `kit_verify_done`: it decides *whether a check happened*; Honest Jev decides *whether the sentence matches the check*. Self-asserted evidence text is not evidence — the EVIDENCE field must be what you actually observed.
 
