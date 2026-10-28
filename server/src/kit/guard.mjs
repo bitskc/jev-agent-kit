@@ -282,7 +282,8 @@ function outputOperands(prog, args) {
 // path: `grep -rn "e.key" src` searches for text. A fused -e (`-rnePRIVATE ~/.ssh/id_rsa`) keeps every operand.
 const GREP_PATTERN_PROGS = new Set(["grep", "egrep", "rg", "ag"]);
 function grepPatternExempt(prog, args, operands) {
-  if (!GREP_PATTERN_PROGS.has(prog)) return operands;
+  const gitGrep = prog === "git" && args[gitSubIndex(args)] === "grep";
+  if (!gitGrep && !GREP_PATTERN_PROGS.has(prog)) return operands;
   const explicit = args.some((a) => a === "--regexp" || a === "--file" || a.startsWith("--regexp=") || a.startsWith("--file=") || /^-[^-]*[ef]/.test(a));
   if (explicit) return operands;
   const rest = dropOptionValues(operands, GREP_VALUE_OPTS);
@@ -386,20 +387,26 @@ function envPrintsEnvironment(args) {
   return true;
 }
 
-// True when a find/ls result reaches a consumer that reads content: a pipe into any program other than a
-// listing one (xargs, parallel, a shell loop), or a $(...)/backtick substitution. Listing-only uses stay allow.
-function feedsConsumer(ctx) {
-  if (substitutedSegments(ctx.command).some((s) => ["find", "ls"].includes(programOf(s)[0]))) return true;
+// The find/ls segments whose output reaches a consumer that reads content: a pipe into any program other than a
+// listing one (xargs, parallel, a shell loop), or a $(...)/backtick substitution. Keyed per segment, so an unrelated
+// `$(ls /tmp)` does not make a standalone `find` feed a reader. Listing-only uses stay allow.
+function listingKey(seg) {
+  const [prog, args] = programOf(stripRedirects(seg));
+  return JSON.stringify([prog, args]);
+}
+function consumerFedListings(ctx) {
+  const fed = new Set();
+  for (const s of substitutedSegments(ctx.command)) if (["find", "ls"].includes(programOf(s)[0])) fed.add(listingKey(s));
   for (const text of [ctx.command, ...ctx.unwrappedScripts]) {
     for (const pipeline of splitPipelines(stripRedirects(stripHeredocs(text)))) {
       for (let i = 0; i + 1 < pipeline.length; i++) {
         if (!["find", "ls"].includes(programOf(pipeline[i])[0])) continue;
         const [next] = resolveCommand(pipeline[i + 1]);
-        if (next === null || !NON_CONTENT_PROGS.has(next)) return true;
+        if (next === null || !NON_CONTENT_PROGS.has(next)) fed.add(listingKey(pipeline[i]));
       }
     }
   }
-  return false;
+  return fed;
 }
 
 function ruleSecret(ctx) {
@@ -420,7 +427,7 @@ function ruleSecret(ctx) {
   if (!SHELL_TOOLS.has(tool) || !ctx.command) return null;
   let ambiguous = null;
   let soft = null;
-  let consumerFed = null;
+  let fed = null;
   for (const seg of [...ctx.expandedSegments, ...substitutedSegments(ctx.command)]) {
     // resolveCommand swaps a `find` segment for its -exec argv (`cat {}`), dropping the -name/path operands.
     // find prints names only, but `-exec cat {}` and `find ... | xargs cat` hand the matched files to a content
@@ -433,14 +440,14 @@ function ruleSecret(ctx) {
         const hit = secretShapeIn(pathArgs("find", bareArgs), home);
         if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`find\` on a secret store (${hit}) would list it or hand it to a reader`, suggestion: R1_SUGGESTION };
       }
-      consumerFed ??= feedsConsumer(ctx);
-      const glob = consumerFed && secretShapeIn(bareArgs, home);
+      fed ??= consumerFedListings(ctx);
+      const glob = fed.has(listingKey(seg)) && secretShapeIn(bareArgs, home);
       if (glob) soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${bareProg}\` matches a secret-looking file (${glob}) and feeds a reader`, suggestion: R1_SUGGESTION };
     }
     const [prog, args] = resolveCommand(seg);
     if (prog === null) continue;
     if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
-    if (grepNamesSecret(prog, args) && (grepRecursive(prog, args) || ["xargs", "find", "parallel"].includes(bareProg) || (consumerFed ??= feedsConsumer(ctx)))) {
+    if (grepNamesSecret(prog, args) && (grepRecursive(prog, args) || ["xargs", "find", "parallel"].includes(bareProg) || (fed ??= consumerFedListings(ctx)).size > 0)) {
       soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${prog}\` searches for a secret name across many files (recursive, or fed by find): matching lines carry their values`, suggestion: R1_SUGGESTION };
     }
     // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)

@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-420 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
+424 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
@@ -153,11 +153,13 @@ Pre-existing verdict items, not fixed here, filed as issues: subshell `(cat .env
 
 Round 14b closes the same-command laundering gap (in-PR fix). A secret copied, moved, linked, or decrypted in the same command and then read through the new name now blocks: `cp .env x && cat x`, `cp .env /tmp/x.txt && cat /tmp/x.txt`, `ln -s .env x && cat x`, `mv .env x && cat x`, `openssl enc -d -in .env.enc -out x && cat x`, `cat $(realpath .env)`, `cat $(readlink -f .env)`, and the backtick form. The pass is lexical: `launderedSegments` in `server/src/kit/guard.mjs` records each cp/mv/ln/openssl-enc copy whose source is a secret store, rewrites later segments to the secret path, and appends the rewritten segment so every rule sees it. A copy into a directory (`cp .ssh/id_rsa d1/`) tracks the new name too. A copy of a bare credential word store asks, matching its source tier. Cross-command laundering (copy or decrypt in an earlier tool call, read in a later one) stays a disclosed limit, filed as #82. `install` is not in the alias pass and still allows. `env | grep` over-blocks (filed as #83, not fixed). The `round 14b P2` test in `server/test/secret-tiers.test.mjs` has 11 block or ask cases and 6 allow controls; it fails at base `0466075` (`cp .env x1 && cat x1` allows) and passes with the fix. Mutation-verified: six reverts in a scratch copy (cp/mv/ln branch, openssl branch, realpath/readlink rewrite, token rewrite, directory-key push, not wired into `expandedSegments`) each make the test fail. Corpus rows g361–g370 (block, ask, allow controls). Suites with the fix: server 124/124, hooks 15/15, `tests/test-scripts.sh` 41/0. Offline guard eval: 420 rows, 99.0% accuracy, 98.4% catch-recall, 100% precision, 0.0% false-alarm; misses are the same four (g55, g68, g69, r08), and no new row misses. The `verify_done` 54.8% is the offline fail-open verdict corpus and is unaffected by this change.
 
+Round 14c (PR #30 automated review comment 6481092153, on `1a4e992`; both are round-13 regressions, fixed in this PR). #70: `git grep <pattern>` false-asked on a credential-word pattern, because only grep/egrep/rg/ag exempted the pattern. `git grep` now gets the same pattern-as-text exemption, and a secret-store operand still blocks. #71: the find/ls consumer check was command-wide and memoized, so an unrelated `$(ls /tmp)` made a standalone `find . -name '*.env' -print` ask. It is now a per-segment set of fed listings. Tests: `round 14 #70` and `round 14 #71` in `server/test/secret-tiers.test.mjs` each fail at `abc6ae2` and pass at HEAD. Mutations: removing the git-grep exemption, using the command-wide flag, and dropping the substitution feed each fail a test. Corpus rows g371 to g374. Suites: server 126/126, `tests/test-scripts.sh` 41/0; `tests/test-hook.sh` needs a live `JEV_MCP_URL`/`JEV_MCP_TOKEN` and was not run here. Offline guard eval: 424 rows, 99.1% accuracy, 98.4% catch-recall, 100% precision, 0.0% false-alarm; misses are the same four (g55, g68, g69, r08). The grep clause still uses the command-wide fed flag, which is its prior meaning and is unchanged this round.
+
 
 
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 420 | 99.0% | 98.4% | 100.0% | **0.0%** |
+| guard | 424 | 99.1% | 98.4% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's

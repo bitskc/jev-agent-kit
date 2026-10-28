@@ -418,3 +418,7 @@
 {"id":"g368","expected":"ask","why":"round 14b: a same-command copy of a bare credential word store asks (soft tier), then a read of the copy asks.","input":{"command":"cp credentials cz && cat cz"}}
 {"id":"g369","expected":"allow","why":"round 14b control: a same-command copy of a non-secret file then a read of the copy is allowed.","input":{"command":"cp README.md x && cat x"}}
 {"id":"g370","expected":"allow","why":"round 14b control: .env.example is the documented safe template; a copy of it then a read is allowed.","input":{"command":"cp .env.example x && cat x"}}
+{"id":"g371","expected":"allow","why":"round 14c #70: git grep takes its pattern as text, so a credential-word pattern allows (grep -rn parity).","input":{"command":"git grep -n \"credentials\" src"}}
+{"id":"g372","expected":"allow","why":"round 14c #71: an unrelated $(ls) does not make a standalone find feed a reader; names only, nothing read.","input":{"command":"find . -name '*.env' -print; echo $(ls /tmp)"}}
+{"id":"g373","expected":"ask","why":"round 14c #71: a find glob that is genuinely piped into xargs cat still asks, even alongside a standalone find.","input":{"command":"find . -name '*.env' -print; find . -name '*.env' | xargs cat"}}
+{"id":"g374","expected":"block","why":"round 14c #70: a git grep whose operand is a secret store still blocks; only the pattern is text.","input":{"command":"git grep -n \"x\" ~/.ssh/id_rsa"}}

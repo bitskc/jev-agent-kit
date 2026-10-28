@@ -73,6 +73,29 @@ test("round 13 P1-2: standalone find or ls enumeration of a glob stays allowed (
   }
 });
 
+test("round 14 #70: git grep takes its pattern as text, so a credential-word or dotenv pattern allows; a secret file operand still blocks", async () => {
+  const fx = fixtureHome();
+  for (const cmd of [`git grep -n "credentials" src`, `git grep -n ".env" src`, `git -C proj grep -n "credentials" src`]) {
+    const r = await guard(cmd, fx, fx);
+    assert.equal(r.decision, "allow", cmd);
+  }
+  const blocked = await guard(`git grep -n "x" ${fx}/.ssh/id_rsa`, fx, fx);
+  assert.equal(blocked.decision, "block");
+  assert.equal(blocked.rule, "R1-secret-exposure");
+});
+
+test("round 14 #71: an unrelated $(ls) or piped listing does not make a standalone find feed a reader; a fed find still asks", async () => {
+  const fx = fixtureHome();
+  for (const cmd of [`find . -name '*.env' -print; echo $(ls /tmp)`, `find . -name '*.env' -print && echo $(ls /tmp)`, `ls *.env; echo $(ls /tmp)`]) {
+    const r = await guard(cmd, fx, fx);
+    assert.equal(r.decision, "allow", cmd);
+  }
+  for (const cmd of [`echo $(find . -name '*.env' -print)`, `find . -name '*.env' -print; find . -name '*.env' | xargs cat`]) {
+    const r = await guard(cmd, fx, fx);
+    assert.equal(r.decision, "ask", cmd);
+  }
+});
+
 test("round 13 P2-3: a bare credential word operand asks (never allows); the reads really print it", async () => {
   const fx = fixtureHome();
   assert.ok(run("sort credentials", fx).includes("AKIDMARK"), "repro leaks: sort credentials");
