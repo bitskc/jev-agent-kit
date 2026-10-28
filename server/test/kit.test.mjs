@@ -1313,6 +1313,26 @@ test("round 11 P2-3: non-reader verbs that print or copy a secret block; metadat
     "find . -name \"*.ts\" -type f", "ssh -i ~/.ssh/id_ed25519 host 'uptime'",
   ]) assert.equal((await g(c)).decision, "allow", c);
 });
+test("round 12 P2-E: a quoted pattern, commit or PR text, find predicate, test filter or config selector is not a path; the secret reads still block", async () => {
+  for (const c of [
+    "cat .env", "echo $DB_PASS", "docker compose --env-file=.env config", "cat credentials", "cat app-credentials.json",
+    "find . -name .env -exec cat {} \\;", "find . -name \"*.pem\" -print0 | xargs -0 cat", "find . -name \"*.env\" | xargs cat",
+    "cat ~/.aws/credentials", "cat .env.production", "grep -n SECRET_KEY .env",
+  ]) assert.equal((await g(c)).decision, "block", c);
+  for (const c of [
+    "find . -name \"*.pem\"", "npm test -- --grep .env", "git log --grep .env --oneline", "git commit -m .env",
+    "find src -name \"*credentials*\" -type f", "find . -name \"*credentials*\"",
+    "grep -rn \"credentials\" src", "grep -rn credentials src/", "rg \"credentials\" src", "git log --grep credentials --oneline",
+    "git log --oneline -- src/credentials.ts", "npx vitest run credentials", "bun test tests/credentials.test.ts",
+    "pytest tests/credentials.py", "node scripts/credentials.js", "npm test -- --grep credentials",
+    "gh pr create --title \"fix credentials handling\" --body \"rotate creds\"", "gh issue create --title \"Rotate the signing.key\" --body \"x\"",
+    "cat src/lib/credentials.ts", "git commit -m \"fix: credentials validation\"", "git add src/credentials.ts",
+    "grep -rn \"e.key\" src", "grep -rn \"event.key\" src", "grep -rn \"publicKey.pem\" src", "grep e.key",
+    "echo $MAX_TOKENS", "echo $PASSWORD_MIN_LENGTH", "echo \"$TOKEN_COUNT\"", "node -e \"console.log(process.env.MAX_TOKENS)\"",
+    "node -e \"console.log(process.env.PRIVATE_KEY_PATH)\"", "kubectl --kubeconfig ~/.kube/config get pods",
+    "grep -rn \".env\" .", "grep -rn \".env\" docs", "git commit -m \"fix token refresh\"",
+  ]) assert.equal((await g(c)).decision, "allow", c);
+});
 
 test("upstream resolution: gateway wins, then typesafe, then none; overrides", () => {
   assert.equal(resolveUpstream({}), null);

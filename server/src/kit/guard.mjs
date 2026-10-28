@@ -36,7 +36,8 @@ const SECRET_PATH_RES = [
   /[\\/]jev-kit[\\/]env\b/i,
   /[\\/]airlock[\\/]env\b/i,
   /\.credentials\.json\b/,
-  /\bcredentials(\.json|\.yml|\.yaml|\.ini)?\b(?!\.example)/,
+  // a credentials file by extension (app-credentials.json); credentials.ts is code, a bare basename is READER_ONLY_SECRET_RES
+  /(^|[\/._-])credentials\.(json|ya?ml|ini)$/,
   // dotenv family: `.env` plus any suffix chain (.env.local, .env.production.local, .env.a.b)
   /(^|\/)\.env(\.[A-Za-z0-9_.-]+)*$/,
   /(^|\/)\.env(\.[A-Za-z0-9_.-]+)*(\s|$)/,
@@ -58,6 +59,9 @@ const SECRET_PATH_RES = [
   /(^|\/)\.(ssh|aws|gnupg)(\/|$)/,
   /(^|\/)\.config\/gh(\/|$)/,
 ];
+// A bare `credentials` basename (no extension) is a secret store only when a reader prints it. Other programs take
+// it as a word: `npx vitest run credentials` names a test, not a file.
+const READER_ONLY_SECRET_RES = [/(^|[\/._-])credentials$/];
 const SAFE_PATH_RES = [
   /\.(example|sample|template|dist|md|rst|txt\.example)$/,
   /\.env\.(example|sample|template)\b/,
@@ -67,16 +71,22 @@ const SAFE_PATH_RES = [
 const AMBIGUOUS_SECRET_TOKENS = ["secret", "secrets", "token", "password", "passwd", "credential",
   "keyring", "keystore", "htpasswd", "vault", "apikey", "api_key"];
 const SECRET_VAR_RE = /\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?/g;
+// Credential words must be whole `_`-separated components (TOKEN, PASSWORD, API_KEY), not substrings of a longer
+// word: MAX_TOKENS is a count, not a secret. A non-secret qualifier as the last component (COUNT, LENGTH, PATH...)
+// clears the name: TOKEN_COUNT, PASSWORD_MIN_LENGTH and PRIVATE_KEY_PATH name a limit or a path, not the value.
 const SECRET_VAR_NAME_RE = new RegExp([
-  "SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL",
-  "_(PASS|CREDS?)$",
+  "^(?!.*_(?:COUNTS?|LENGTHS?|LEN|MIN|MAX|PATHS?|FILES?|DIRS?|TTL|EXPIR(?:Y|ES|ATION)|ENABLED?|TYPE|NAME)$)",
+  "(?:",
+  "(?=.*(?:^|_)(?:SECRETS?|TOKEN|PASSWORDS?|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIALS?)(?:_|$))",
+  "|.*_(?:PASS|CREDS?)$",
   // a service/admin/root role (SUPABASE_SERVICE_ROLE, DB_ADMIN_ROLE), not a bare role label (USER_ROLE)
-  "(^|_)(SERVICE|ADMIN|ROOT|SUPER|ELEVATED|PRIV)(?:_[A-Z0-9]+)*_ROLE$",
+  "|.*(?:^|_)(?:SERVICE|ADMIN|ROOT|SUPER|ELEVATED|PRIV)(?:_[A-Z0-9]+)*_ROLE$",
   // a key whose stem names a credential (SUPABASE_SERVICE_ROLE_KEY, SIGNING_KEY), not CACHE_KEY or AUTHOR_KEY
-  "(^|_)(ROLE|SECRET|PRIVATE|SIGNING|ENCRYPT|AUTH|SESSION|MASTER|ACCESS|SERVICE|CREDENTIAL)(?:_[A-Z0-9]+)*_KEY$",
+  "|.*(?:^|_)(?:ROLE|SECRET|PRIVATE|SIGNING|ENCRYPT|AUTH|SESSION|MASTER|ACCESS|SERVICE|CREDENTIAL)(?:_[A-Z0-9]+)*_KEY$",
   // a database/service password variable (MYSQL_PWD), not CURRENT_PWD; bare $PWD/$OLDPWD never match
-  "(^|_)(MYSQL|DB|DATABASE|POSTGRES|PG|LDAP|SMTP|REDIS|MONGO|ADMIN|ROOT|SERVICE)_PWD$",
-].join("|"), "i");
+  "|.*(?:^|_)(?:MYSQL|DB|DATABASE|POSTGRES|PG|LDAP|SMTP|REDIS|MONGO|ADMIN|ROOT|SERVICE)_PWD$",
+  ")",
+].join(""), "i");
 export const R1_SUGGESTION =
   "Do not print a secret. Load it into the environment in the same shell as the command that needs it " +
   "(`set -a; . ./.env; set +a`) and confirm it is present without revealing it " +
@@ -175,6 +185,82 @@ function gitSubIndex(args) {
   }
   return -1;
 }
+// Values that are a search pattern, a commit or PR text, a find predicate or a test filter, never a path. The
+// operand check drops only these option values; every other token stays a path candidate.
+const COMMIT_MSG_OPTS = new Set(["-m", "--message"]);
+const GIT_LOG_TEXT_OPTS = new Set(["--grep", "--author", "--committer", "--since", "--until", "-S", "-G"]);
+const GH_TEXT_OPTS = new Set(["-t", "--title", "-b", "--body"]);
+const FIND_PREDICATE_OPTS = new Set(["-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-wholename", "-iwholename", "-lname", "-ilname"]);
+const FIND_EXEC_OPTS = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+const TEST_FILTER_OPTS = new Set(["--grep", "--testNamePattern", "-t", "-k", "-m"]);
+const TEST_PROGS = new Set(["npm", "npx", "pnpm", "yarn", "bun", "bunx", "pytest", "vitest", "jest", "mocha"]);
+const GREP_PROGS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack"]);
+const GREP_VALUE_OPTS = new Set(["-A", "-B", "-C", "-m", "-d", "-D", "-g", "-t", "-T", "--include", "--exclude",
+  "--exclude-dir", "--max-count", "--label", "--glob", "--type", "--type-not", "--context", "--after-context",
+  "--before-context"]);
+const ENV_FILE_OPTS = new Set(["--env-file"]);
+const KUBECONFIG_OPTS = new Set(["--kubeconfig"]);
+const COMPOSE_VALUE_OPTS = new Set(["-f", "--file", "-p", "--project-name", "--env-file", "--profile", "--project-directory", "--ansi", "--parallel", "--progress"]);
+const KUBECTL_VALUE_OPTS = new Set(["--kubeconfig", "-n", "--namespace", "--context", "--cluster", "--user", "-s", "--server"]);
+// compose subcommands that never print the env file they are given (`config` prints the resolved values)
+const COMPOSE_NO_PRINT_SUBS = new Set(["up", "down", "ps", "build", "pull", "stop", "start", "restart"]);
+const isShortCluster = (a) => /^-[A-Za-z]+$/.test(a);
+/** `args` without the values of `valueOpts`: `-x VALUE` drops both tokens, `--x=VALUE` drops the one token. */
+function dropOptionValues(args, valueOpts) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    const eq = a.indexOf("=");
+    if (eq > 0 && valueOpts.has(a.slice(0, eq))) continue;
+    if (valueOpts.has(a)) { i++; continue; }
+    out.push(a);
+  }
+  return out;
+}
+function firstSubcommand(args, valueOpts) {
+  for (let i = 0; i < args.length; i++) {
+    if (valueOpts.has(args[i])) { i++; continue; }
+    if (!args[i].startsWith("-")) return args[i];
+  }
+  return null;
+}
+/** grep, rg, ag and `git grep`: the first positional is the pattern unless -e/--regexp/-f supplies it. */
+function grepPathArgs(args) {
+  let patternTaken = args.some((a) => a === "--regexp" || a.startsWith("--regexp=") || a === "--file" ||
+    a.startsWith("--file=") || (isShortCluster(a) && /[ef]/.test(a)));
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--regexp" || (isShortCluster(a) && a.includes("e"))) { i++; continue; }
+    if (a.startsWith("--regexp=")) continue;
+    if (a === "--file" || (isShortCluster(a) && a.includes("f"))) { if (i + 1 < args.length) out.push(args[++i]); continue; }
+    if (a.startsWith("--file=")) { out.push(a.slice("--file=".length)); continue; }
+    if (GREP_VALUE_OPTS.has(a)) { i++; continue; }
+    if (a.startsWith("-")) continue;
+    if (!patternTaken) { patternTaken = true; continue; }
+    out.push(a);
+  }
+  return out;
+}
+/** The argv tokens that can name a path. Patterns, messages, find predicates, test filters and config selectors
+ *  are values, not paths, so they drop out; every other token stays a path candidate. */
+function pathArgs(prog, args) {
+  if (GREP_PROGS.has(prog)) return grepPathArgs(args);
+  if (prog === "find") {
+    // A glob predicate (`-name "*credentials*"`) enumerates names and reads nothing, so it is not a path. A literal
+    // name (`-name .env`) names the file, and any `-exec`/`-ok` runs a command on the matches: both stay classified.
+    if (args.some((a) => FIND_EXEC_OPTS.has(a))) return args;
+    return args.filter((a, i) => !(i > 0 && FIND_PREDICATE_OPTS.has(args[i - 1]) && /[*?[\]]/.test(a)));
+  }
+  if (prog === "gh") return dropOptionValues(args, GH_TEXT_OPTS);
+  if (TEST_PROGS.has(prog)) return dropOptionValues(args, TEST_FILTER_OPTS);
+  if (prog === "docker" && args.includes("compose")) {
+    const sub = firstSubcommand(args.slice(args.indexOf("compose") + 1), COMPOSE_VALUE_OPTS);
+    if (COMPOSE_NO_PRINT_SUBS.has(sub)) return dropOptionValues(args, ENV_FILE_OPTS);
+  }
+  if (prog === "kubectl" && firstSubcommand(args, KUBECTL_VALUE_OPTS) !== "config") return dropOptionValues(args, KUBECONFIG_OPTS);
+  return args;
+}
 /** The operand tokens `prog` could print the bytes of, or null when it cannot print an operand's content. */
 function outputOperands(prog, args) {
   if (prog === "ssh") return sshRemoteOperands(args);
@@ -182,10 +268,13 @@ function outputOperands(prog, args) {
   if (prog === "git") {
     const i = gitSubIndex(args);
     if (i < 0 || GIT_NON_CONTENT_SUBS.has(args[i])) return null;
+    const rest = args.slice(i + 1);
+    const operands = args[i] === "grep" ? grepPathArgs(rest)
+      : ["log", "rev-list", "shortlog"].includes(args[i]) ? dropOptionValues(rest, GIT_LOG_TEXT_OPTS) : rest;
     // `<rev>:<path>` refspecs (`HEAD:.env`, `:.env`) name a path on their right-hand side.
-    return args.slice(i + 1).flatMap((a) => (a.includes(":") ? [a, a.slice(a.indexOf(":") + 1)] : [a]));
+    return operands.flatMap((a) => (a.includes(":") ? [a, a.slice(a.indexOf(":") + 1)] : [a]));
   }
-  return args;
+  return pathArgs(prog, args);
 }
 function quietGrep(args) {
   for (const a of args) {
@@ -288,7 +377,9 @@ function ruleSecret(ctx) {
     // program, so find's own operands are checked on the bare segment.
     const [bareProg, bareArgs] = programOf(seg);
     if (bareProg === "find") {
-      const hit = secretPathIn(bareArgs, home);
+      // `find ... | xargs cat` reads every name find matches, glob or not, so a pipe into xargs keeps the name operands.
+      const xargsFed = ctx.expandedSegments.some((s) => programOf(s)[0] === "xargs");
+      const hit = secretPathIn(xargsFed ? bareArgs : pathArgs("find", bareArgs), home);
       if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`find\` on a secret store (${hit}) would list it or hand it to a reader`, suggestion: R1_SUGGESTION };
     }
     const [prog, args] = resolveCommand(seg);
@@ -299,10 +390,11 @@ function ruleSecret(ctx) {
     // still print to the transcript.
     if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1] && args[i + 1] !== "-")) continue;
     const operands = outputOperands(prog, args);
-    const hit = operands && secretPathIn(operands, home);
+    // A bare `credentials` name is a secret store only for a reader; other programs take it as a word.
+    const hit = operands && (secretPathIn(operands, home) || (READERS.has(prog) && secretPathIn(operands, home, READER_ONLY_SECRET_RES)));
     if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${hit}) would print its contents`, suggestion: R1_SUGGESTION };
     if (READERS.has(prog)) {
-      const amb = ambiguousPathIn(args);
+      const amb = ambiguousPathIn(pathArgs(prog, args));
       if (amb && !ambiguous) ambiguous = { rule: "R1-secret-exposure", severity: "ambiguous", jev: "secret", reason: `\`${prog}\` on a path that may hold secrets (${amb})`, suggestion: R1_SUGGESTION, target: amb };
     }
     const interpHit = interpScriptSecretRead(prog, args, home);
@@ -1234,7 +1326,7 @@ function ruleCommitSecret(ctx) {
     const i = firstPositional(args, GIT_VALUE_OPTS);
     if (i === null || !["add", "commit", "stage"].includes(args[i])) continue;
     gitWrite = true;
-    const hit = secretPathIn(args.slice(i + 1), ctx.home);
+    const hit = secretPathIn(dropOptionValues(args.slice(i + 1), COMMIT_MSG_OPTS), ctx.home);
     if (hit) return { rule: "R9-commit-secret", severity: "block", reason: `\`git ${args[i]}\` would stage a secret file (${hit})`, suggestion: R9_SUGGESTION };
   }
   if (!gitWrite) return null;

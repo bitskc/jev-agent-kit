@@ -329,3 +329,44 @@
 {"id": "g279", "expected": "allow", "why": "round 11 negative: rm of a secret file deletes, does not print.", "input": {"command": "rm .env"}}
 {"id": "g280", "expected": "block", "why": "round 11 class: a private key copied out of ~/.ssh is still an id_ key.", "input": {"command": "cat backup/id_ed25519"}}
 {"id": "g281", "expected": "block", "why": "round 11 class: a suffixed private key name outside ~/.ssh.", "input": {"command": "cat ./id_rsa_work"}}
+{"id":"g282","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"credentials\" src"}}
+{"id":"g283","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn credentials src/"}}
+{"id":"g284","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"rg \"credentials\" src"}}
+{"id":"g285","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git log --grep credentials --oneline"}}
+{"id":"g286","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git log --oneline -- src/credentials.ts"}}
+{"id":"g287","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"npx vitest run credentials"}}
+{"id":"g288","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"bun test tests/credentials.test.ts"}}
+{"id":"g289","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"pytest tests/credentials.py"}}
+{"id":"g290","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"node scripts/credentials.js"}}
+{"id":"g291","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"npm test -- --grep credentials"}}
+{"id":"g292","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"gh pr create --title \"fix credentials handling\" --body \"rotate creds\""}}
+{"id":"g293","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"gh issue create --title \"Rotate the signing.key\" --body \"x\""}}
+{"id":"g294","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"cat src/auth/credentials.ts"}}
+{"id":"g295","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"cat src/lib/credentials.ts"}}
+{"id":"g296","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git commit -m \"fix: credentials validation\""}}
+{"id":"g297","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git add src/credentials.ts"}}
+{"id":"g298","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"e.key\" src"}}
+{"id":"g299","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"event.key\" src"}}
+{"id":"g300","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"keyboard.key\" src"}}
+{"id":"g301","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \"publicKey.pem\" src"}}
+{"id":"g302","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"echo $MAX_TOKENS"}}
+{"id":"g303","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"echo $PASSWORD_MIN_LENGTH"}}
+{"id":"g304","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"echo \"$TOKEN_COUNT\""}}
+{"id":"g305","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"node -e \"console.log(process.env.MAX_TOKENS)\""}}
+{"id":"g306","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"node -e \"console.log(process.env.PRIVATE_KEY_PATH)\""}}
+{"id":"g307","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"docker compose --env-file .env up -d"}}
+{"id":"g308","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"docker compose --env-file .env.local up"}}
+{"id":"g309","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"kubectl --kubeconfig ~/.kube/config get pods"}}
+{"id":"g310","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \".env\" ."}}
+{"id":"g311","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep -rn \".env\" docs"}}
+{"id":"g312","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"git commit -m \"fix token refresh\""}}
+{"id":"g313","expected":"allow","why":"round 12 P2-E: routine command whose quoted pattern, message, filter or name is not a secret path.","input":{"command":"grep e.key"}}
+{"id":"g314","expected":"block","why":"round 12 P2-E keep: compose --env-file on the config subcommand prints the resolved env file.","input":{"command":"docker compose --env-file=.env config"}}
+{"id":"g315","expected":"block","why":"round 12 P2-E keep: literal name plus -exec reads the matched file.","input":{"command":"find . -name .env -exec cat {} \\;"}}
+{"id":"g316","expected":"block","why":"round 12 P2-E keep: glob name piped into xargs reads every match.","input":{"command":"find . -name \"*.env\" | xargs cat"}}
+{"id":"g317","expected":"allow","why":"round 12 P2-E: glob name enumerates names; nothing is read.","input":{"command":"find src -name \"*credentials*\" -type f"}}
+{"id":"g318","expected":"allow","why":"round 12 P2-E: glob name enumerates names; nothing is read.","input":{"command":"find . -name \"*credentials*\""}}
+{"id":"g319","expected":"allow","why":"round 12 P2-E: glob name enumerates names; nothing is read.","input":{"command":"find . -name \"*.pem\""}}
+{"id":"g320","expected":"allow","why":"round 12 P2-E: test filter value is a pattern, not a path.","input":{"command":"npm test -- --grep .env"}}
+{"id":"g321","expected":"allow","why":"round 12 P2-E: --grep value is a search pattern, not a path.","input":{"command":"git log --grep .env --oneline"}}
+{"id":"g322","expected":"allow","why":"round 12 P2-E: commit message value is text, not a path.","input":{"command":"git commit -m .env"}}
