@@ -13,9 +13,9 @@
   },
   "scripts": {
     "vendor": "sh build-vendor.sh",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.mjs",
     "dev": "npm run vendor && wrangler dev",
-    "deploy": "npm run vendor && wrangler deploy"
+    "deploy": "npm run vendor && wrangler deploy --keep-vars"
   },
   "license": "MIT"
 }

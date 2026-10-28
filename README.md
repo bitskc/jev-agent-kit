@@ -17,6 +17,8 @@ Coding agents are good at writing code and bad at three judgment calls they make
 
 One Cloudflare Worker (your account, your Jev key, your bearer token), 15 MCP tools, 8 skills, 4 hooks.
 
+`jev-call` below is installed to `~/.local/bin/jev-call` by `install.sh`; from a bare checkout use `scripts/jev-call.sh` instead.
+
 ## What it looks like (real output, trimmed to the key fields)
 
 ```sh
@@ -150,7 +152,7 @@ Needs Node ≥ 22 and a Cloudflare account (free plan is fine).
 cd server && npm ci
 npm run vendor          # clones jkudish/jev-mcp at a pinned commit, builds, patches -> vendor/ (not committed)
 npm test                # offline tests, mocked Jev
-npx wrangler deploy     # -> https://jev-mcp.<your-subdomain>.workers.dev
+npx wrangler deploy --keep-vars   # -> https://jev-mcp.<your-subdomain>.workers.dev (keeps dashboard-set vars on redeploy)
 
 openssl rand -hex 32 > ~/.config/jev/token && chmod 600 ~/.config/jev/token && npx wrangler secret put MCP_BEARER_TOKEN < ~/.config/jev/token   # your JEV_MCP_TOKEN, never echoed
 printf %s "$AI_GATEWAY_API_KEY" | npx wrangler secret put AI_GATEWAY_API_KEY        # Vercel AI Gateway -> typesafe-ai/jev, or
@@ -170,7 +172,7 @@ curl -s -X POST "$JEV_MCP_URL" -H "authorization: Bearer $JEV_MCP_TOKEN" \
 ## Tests
 
 - `cd server && npm test` — offline, mocked Jev (guard rules, tier resolution, verify evidence rules).
-- `node --test hooks/honest/` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file.
+- `node --test hooks/honest/*.test.mjs` — Honest Jev hook runtime: level parsing, command parsing, skill filtering, flag file.
 - `bash tests/test-scripts.sh` — `install.sh`, `update.sh --timer`, statusline badge, `jev-call` exit codes, with stubbed network.
 - `bash tests/test-hook.sh` — live guard hook against your worker (needs `JEV_MCP_URL` + `JEV_MCP_TOKEN`).
 
