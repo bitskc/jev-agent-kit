@@ -1,6 +1,6 @@
 ---
 name: jev-honest
-description: The honesty layer ("Honest Jev" 🧔). Before claiming something is done, working, verified, safe, or "should be fine" — batch-classify your own claims with jev-mcp jev_classify into verified / hedged / unverifiable / misrepresented, and don't send what you can't show. Levels off/soft/standard/strict via a flag file + statusline badge; also runs an on-demand audit of recent claims ("be honest with me") or a deep pass on a draft reply.
+description: The honesty layer ("Honest Jev" 🧔). Before claiming something is done, working, verified, safe, or "should be fine" — batch-classify your own claims with jev-mcp jev_classify into verified / hedged / unverifiable / misrepresented, and don't send what you can't show. Trigger "honest jev <soft|standard|strict|off>" to set the level — the skill writes the flag file itself (no shell needed). Levels show as a statusline badge; also runs an on-demand audit of recent claims ("be honest with me") or a deep pass on a draft reply.
 ---
 
 # jev-honest — Honest Jev 🎩
@@ -19,6 +19,18 @@ Honest Jev runs at a level you set; the level decides how hard the claim-check b
 | **strict** | `strict` | Mode 1 on every substantive reply + Mode 2 audit on request; `hedged` also flagged — if you can't show it, don't assert it |
 
 Default with no file = **off** (opt-in). The statusline badge (`hooks/jev-honest-statusline.sh`) prints `[HONEST]` / `[HONEST:SOFT]` / `[HONEST:STRICT]` under the input box while armed — the beard mark tells you the honesty police is on duty.
+
+## Switching the level — say it, don't type it
+
+When the user says **"honest jev soft"**, **"honest jev standard"**, **"honest jev strict"**, or **"honest jev off"** (also "turn honest jev on/off", "set honesty to strict"), **you** write the flag file — don't hand them a command:
+
+```bash
+# Claude Code: ~/.claude/.jev-honest-active    omp: ~/.omp/agent/.jev-honest-active
+printf '%s\n' strict > ~/.claude/.jev-honest-active    # or soft | standard
+rm -f ~/.claude/.jev-honest-active                      # or write "off" — same thing
+```
+
+Then confirm in one line ("Honest Jev → strict 🧔") and act at that level from this turn on. The statusline badge picks up the flag on its next render — no restart. "honest jev" with no level = `standard`.
 
 Two modes, both `jev_classify`-backed:
 
