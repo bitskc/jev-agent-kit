@@ -125,10 +125,13 @@ function executesCheck(unit) {
 // Failure text a runner prints. Matched before any pass signal and regardless of exit status.
 const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
 const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
-/** An exit status that cannot be trusted: `|| true`, `|| exit 0`, or a pipe whose last stage sets the status. */
+/**
+ * An exit status that cannot be attributed to the check: a `||` fallback, a `;`/`&&`/newline chain (the recorded
+ * status is the last command's, not the check's), or a pipe whose last stage sets the status without pipefail.
+ */
 function exitIsMasked(command) {
-  if (/\|\|\s*(?:true|:|exit\s+0)(?![\w-])/.test(command)) return true;
-  return /(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command);
+  if (/\|\||;|&&|\n/.test(command)) return true;
+  return /\|/.test(command) && !/\bpipefail\b/.test(command);
 }
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 function checkSummary(output) {

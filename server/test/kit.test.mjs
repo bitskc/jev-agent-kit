@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { sizeDispatch } from "../src/kit/tier.mjs";
-import { verifyDone, checkSummary, runOutcome } from "../src/kit/verify.mjs";
+import { verifyDone, checkSummary, runOutcome, classifyToolResult } from "../src/kit/verify.mjs";
 import { resolveUpstream, askUpstream, GATEWAY_BASE, TYPESAFE_BASE } from "../src/kit/jev.mjs";
 
 const noJev = { ask: null, jevAvailable: false };
@@ -155,13 +155,37 @@ test("runOutcome: a masked exit status never counts as a pass", () => {
   assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 0), "unknown");
   assert.equal(runOutcome("npm test || true", "  12 passing (3s)", 0), "unknown");
   assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 1), "fail");
-  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  // A command chained after the check (even with pipefail set) leaves the recorded status unattributable.
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "unknown");
 });
 test("runOutcome: unmasked exit 0 passes with no output; nonzero fails; masked or absent status is unknown", () => {
   assert.equal(runOutcome("npx tsc --noEmit", "", 0), "pass");
   assert.equal(runOutcome("npx tsc --noEmit", "", 2), "fail");
   assert.equal(runOutcome("npx tsc --noEmit || true", "", 0), "unknown");
   assert.equal(runOutcome("npx tsc --noEmit", "", undefined), "unknown");
+});
+test("runOutcome: any chained command after the check masks its exit status (the recorded status is the last command's)", () => {
+  // Failure text still fails whatever follows the check; a clean summary or bare exit 0 after a chain is unknown.
+  assert.equal(runOutcome("npm test ; echo done", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test ; echo done", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test && echo done", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "boom", 0), "unknown");
+  // pipefail switches off the bare-`|` masking rule, so the `||` alternative has to mask on its own here.
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test || echo hi'", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test 2>&1", "  12 passing (3s)", 0), "pass");
+});
+test("classifyToolResult: a non-CHECK command's summary follows the same masking rule", () => {
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh | tail -3" }, false, "  12 passing (3s)"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh ; echo done" }, false, "  12 passing (3s)"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  1 failing"), "check-fail");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "all good"), "unknown");
+});
+test("verify_done: a clean-looking check followed by a chained command is not a pass", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npm test ; echo done", output: "Error: boom", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.equal(r.evidence.fresh_checks[0].passed, false);
 });
 test("verify_done: a failing run hidden behind a pipe is a fail, not an unproven check", async () => {
   const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx mocha | tail -3", output: "  1 failing", exit_code: 0 }] });

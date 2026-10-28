@@ -18,10 +18,13 @@ export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|ch
 // exits 0 while printing "1 failing". "0 failing" does not match (the count must be 1 or more).
 const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
 const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
-/** An exit status that cannot be trusted: `|| true`, `|| exit 0`, or a pipe whose last stage sets the status. */
+/**
+ * An exit status that cannot be attributed to the check: a `||` fallback, a `;`/`&&`/newline chain (the recorded
+ * status is the last command's, not the check's), or a pipe whose last stage sets the status without pipefail.
+ */
 export function exitIsMasked(command) {
-  if (/\|\|\s*(?:true|:|exit\s+0)(?![\w-])/.test(command)) return true;
-  return /(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command);
+  if (/\|\||;|&&|\n/.test(command)) return true;
+  return /\|/.test(command) && !/\bpipefail\b/.test(command);
 }
 /**
  * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says;
@@ -74,13 +77,10 @@ export const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEd
 export function classifyToolResult(tool, input = {}, failed = false, output = "") {
   if (MUTATING_TOOLS.has(tool)) return "mutation";
   const command = typeof input.command === "string" ? input.command : "";
-  const summary = checkSummary(output);
-  if (tool === "Bash" && CHECK_COMMAND.test(command)) {
-    const outcome = runOutcome(command, output, failed ? 1 : 0);
-    return outcome === "fail" ? "check-fail" : outcome === "pass" ? "check-pass" : "unknown";
-  }
-  if (summary) return summary === "fail" || failed ? "check-fail" : "check-pass";
-  return "unknown";
+  const isCheck = tool === "Bash" && CHECK_COMMAND.test(command);
+  if (!isCheck && !checkSummary(output)) return "unknown";
+  const outcome = runOutcome(command, output, failed ? 1 : 0);
+  return outcome === "fail" ? "check-fail" : outcome === "pass" ? "check-pass" : "unknown";
 }
 
 function textOf(content) {
