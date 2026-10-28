@@ -14,7 +14,13 @@
 //   honest: jev_classify on the final message's own claims, each paired with evidence BUILT FROM THE
 //           TRANSCRIPT's real tool calls since the user's last prompt — not the agent's own self-written
 //           EVIDENCE text, which is the self-attestation weakness Honest Jev's skill-only form can't close.
-//           Blocks when >=1 claim classifies as misrepresented/unverifiable at decision "auto".
+//           Blocks only when >=1 claim classifies as "misrepresented" at decision "auto" — a claim that is
+//           merely "unverifiable" (no tool evidence either way, e.g. "I sanity-checked the math by hand")
+//           is reported as advice in the block reason but never blocks by itself, since the absence of
+//           tool evidence for an inherently non-tool claim is normal, honest communication, not an overclaim.
+//           Also reuses the verify-gate's own kit_verify_done disclosure signal (verdict
+//           "disclosed_unverified") when available: a message the server already recognises as an honest
+//           disclosure is never separately punished by the honest gate.
 //   both:   runs both; honest also auto-engages whenever the current Honest Jev level is "strict", even if
 //           JEV_STOP_GATE itself is unset — strict already promises "classify before every substantive
 //           reply" in prose, so this is the same promise with a tool call behind it.
@@ -34,6 +40,7 @@
 const fs = require('fs');
 const path = require('path');
 const rt = require('./honest/jev-honest-runtime.js');
+const { redact } = require('./jev-redact.js');
 
 // Hard cap: 3s per MCP call, regardless of JEV_GUARD_TIMEOUT (which may still set something *lower*, e.g.
 // for a CI pipeline that wants to fail open even faster). A malformed JEV_GUARD_TIMEOUT (unset, empty, or
@@ -65,7 +72,11 @@ function resultTextOf(content) {
 // matches the synthetic <command-name>/<command-message>/<command-args>/<local-command-stdout>/
 // <local-command-stderr> lines Claude Code injects whenever a slash command runs (including the plugin's
 // own /jev-agent-kit:honest-jev) — without this filter, a mid-session slash command would be misread as
-// the "last real prompt" and reset the honest-gate's evidence window past real, nearby tool calls.
+// the "last real prompt" and reset the honest-gate's evidence window past real, nearby tool calls. A
+// sidechain's own synthetic prompt (the Task tool's instruction TO a subagent) is excluded too — it is not
+// a top-level user turn — but sidechain TOOL CALLS themselves are no longer excluded from evidence below
+// (see parseForVerify/parseForHonest): a subagent's real edits/checks are exactly what a delegating turn's
+// final message is reporting on, and skipping them made a fully-delegated turn invisible to both gates.
 const COMMAND_LINE = /^<(?:command-name|command-message|command-args|local-command-stdout|local-command-stderr)>/;
 function isRealUserPrompt(d) {
   if (d.type !== 'user' || d.toolUseResult || d.isMeta || d.isSidechain) return false;
@@ -82,6 +93,9 @@ function readTranscriptLines(transcriptPath) {
 // Ordered by a running per-tool-call counter, NOT by transcript-line index: Claude Code commonly batches
 // several tool_use blocks (e.g. Edit then Bash) into one assistant message/line, so two calls in the same
 // turn would otherwise share one line index and a same-turn check could never compare as "after" the edit.
+// Includes sidechain (dispatched Task-subagent) tool calls: a subagent's real edits/checks are exactly
+// what the parent's final message is reporting on, so excluding them left a fully-delegated turn with
+// file_changes: 0 and neither gate ever running, regardless of what the final message claimed.
 function parseForVerify(lines) {
   let task = null;
   let finalMessage = null;
@@ -91,7 +105,6 @@ function parseForVerify(lines) {
   const bashCalls = [];
   const resultsById = new Map();
   for (const d of lines) {
-    if (d.isSidechain) continue;
     const content = d.message && d.message.content;
     if (d.type === 'user' && task === null && typeof content !== 'undefined') {
       const t = textOf(content);
@@ -122,7 +135,8 @@ function parseForVerify(lines) {
 }
 
 // ── honest-gate evidence: every tool call since the user's LAST prompt (not since the last edit — a
-// disclosure like "I did not run X" needs the full since-prompt picture, not just the post-edit tail) ──
+// disclosure like "I did not run X" needs the full since-prompt picture, not just the post-edit tail).
+// Includes sidechain tool calls, for the same reason parseForVerify now does. ──────────────────────────
 function parseForHonest(lines) {
   let lastPromptIdx = -1;
   lines.forEach((d, i) => { if (isRealUserPrompt(d)) lastPromptIdx = i; });
@@ -131,7 +145,6 @@ function parseForHonest(lines) {
   const edits = [];
   const runs = [];
   for (const d of since) {
-    if (d.isSidechain) continue;
     const content = d.message && d.message.content;
     if (d.type === 'assistant' && Array.isArray(content)) {
       for (const c of content) {
@@ -154,13 +167,18 @@ function parseForHonest(lines) {
   }
   return { edits, runs };
 }
+// Redacted before anything reaches jev_classify (an untouched upstream tool with no server-side
+// redaction layer of its own, unlike kit_guard_command/kit_verify_done which redact server-side) — a
+// Bash command or its output legitimately touching a credential (curl with an Authorization header, a
+// fixture that echoes a key) must never be forwarded to a third-party model API unscrubbed.
 function evidenceText({ edits, runs }) {
-  const parts = [edits.length ? `Files edited this turn: ${edits.join(', ')}.` : 'No files were edited this turn.'];
+  const parts = [edits.length ? `Files edited this turn: ${edits.map((e) => redact(e)).join(', ')}.` : 'No files were edited this turn.'];
   if (runs.length) {
     parts.push('Commands run after the edits:');
     for (const r of runs) {
-      const tail = r.output.replace(/\s+/g, ' ').trim().slice(-300);
-      parts.push(`- \`${r.command}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`);
+      const cmd = redact(r.command);
+      const tail = redact(r.output).replace(/\s+/g, ' ').trim().slice(-300);
+      parts.push(`- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`);
     }
   } else {
     parts.push('No commands were run after the edits.');
@@ -168,29 +186,65 @@ function evidenceText({ edits, runs }) {
   return parts.join('\n');
 }
 
-// Splits a final message into claim-candidate lines: bullets first, then sentences within each (bulleted
-// or plain) line. Deliberately simple and structural, not content-based: no keyword gating of WHICH lines
-// get judged (every assertable line goes through jev_classify; the classifier decides the bucket, not a
-// regex here) — the only filters are structural: a markdown-heading-only line has no sentence in it, a
-// fragment under 10 chars is too short to be a claim, a line ending in "?" is a question, and anything
-// inside a ``` fenced code block is code/output, never a claim (a diff snippet with a trailing "." in a
-// comment would otherwise get sliced into bogus claim-shaped fragments).
+// Splits a final message into claim-candidate strings: a markdown table row's cells are each their own
+// candidate; a bullet/checklist item or heading has its marker stripped but its TEXT IS STILL CLASSIFIED,
+// never discarded ("## Done: all tests pass" is a heading AND a false claim — dropping the whole line let
+// a completion claim bypass the gate just by formatting it as a heading); a blockquote has its ">" marker
+// stripped the same way. Deliberately simple and structural, not content-based: no keyword gating of WHICH
+// lines get judged (every assertable line goes through jev_classify; the classifier decides the bucket,
+// not a regex here) — the only filters are structural: a fragment under 10 chars is too short to be a
+// claim, a line ending in "?" is a question, and anything inside a ``` fenced code block is code/output,
+// never a claim.
+const TABLE_ROW_RE = /^\|.*\|$/;
+const TABLE_SEPARATOR_RE = /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/;
+// One non-table, non-fenced, non-blockquote-prefix line (or table cell) -> zero or more claim strings.
+function claimsFromSegment(rawSegment) {
+  let text = (rawSegment || '').trim();
+  if (!text) return [];
+  // checklist item ("- [x] tests pass" / "- [ ] ..."): strip the bullet AND the checkbox, not just the
+  // bullet — the plain bullet regex below would otherwise leave a stray "[x] " on the front.
+  const checklist = /^(?:[-*]|\d+[.)])\s+\[[ xX]\]\s+(.*)$/.exec(text);
+  if (checklist) {
+    text = checklist[1];
+  } else {
+    const bulleted = /^(?:[-*]|\d+[.)])\s+(.*)$/.exec(text);
+    if (bulleted) text = bulleted[1];
+  }
+  // heading: strip the leading #s, keep classifying what remains instead of discarding the line.
+  text = text.replace(/^#{1,6}\s+/, '').trim();
+  if (!text) return [];
+  const claims = [];
+  for (const sentence of text.split(/(?<=[.!?])\s+(?=[A-Z0-9`"'*])/)) {
+    // Strip bold/italic emphasis markers wherever they occur in the sentence, not only when the whole
+    // sentence is wrapped — "**All tests pass** and the build is clean." previously left a stray
+    // trailing "**" because the old regex only anchored to the very start/end of the string.
+    const s = sentence.replace(/\*\*|__/g, '').trim();
+    if (s.length < 10 || s.endsWith('?')) continue;
+    claims.push(s.slice(0, 500));
+  }
+  return claims;
+}
 function splitClaims(message) {
   const claims = [];
   let inFence = false;
   for (const rawLine of String(message || '').split('\n')) {
-    const line = rawLine.trim();
+    let line = rawLine.trim();
     if (/^```/.test(line)) { inFence = !inFence; continue; }
-    if (inFence) continue;
+    if (inFence || !line) continue;
+
+    // blockquote: strip one or more leading "> " before anything else.
+    line = line.replace(/^(?:>\s*)+/, '').trim();
     if (!line) continue;
-    const bulleted = /^(?:[-*]|\d+[.)])\s+(.*)$/.exec(line);
-    const text = bulleted ? bulleted[1] : line;
-    if (/^#{1,6}\s/.test(text)) continue;
-    for (const sentence of text.split(/(?<=[.!?])\s+(?=[A-Z0-9`"'*])/)) {
-      const s = sentence.trim().replace(/^\*\*|\*\*$/g, '').trim();
-      if (s.length < 10 || s.endsWith('?')) continue;
-      claims.push(s.slice(0, 500));
+
+    // markdown table row (starts AND ends with "|", the standard GFM shape agents produce): each cell is
+    // its own claim candidate; a separator row ("|---|---|") carries no content and is skipped entirely.
+    if (TABLE_ROW_RE.test(line)) {
+      if (TABLE_SEPARATOR_RE.test(line)) continue;
+      for (const cell of line.slice(1, -1).split('|')) claims.push(...claimsFromSegment(cell));
+      continue;
     }
+
+    claims.push(...claimsFromSegment(line));
   }
   return claims.slice(0, 64); // jev_classify's own item cap
 }
@@ -223,6 +277,26 @@ function classifyClasses() {
     ],
   };
 }
+// This hook's own jev_classify purpose text (distinct from the skill's user-facing one, which describes
+// the agent self-classifying its own self-written evidence — this call's evidence is independently
+// reconstructed from the transcript instead, and that distinction matters for how the classifier should
+// read a claim about non-tool verification): a claim the agent itself explicitly marks as not run, not
+// verified, or checked only by hand/manually/by reading (not by running a tool) is a HEDGE, not a
+// misrepresentation, as long as the claim text itself discloses that it was not tool-verified. Only
+// "misrepresented" when the tool log evidence actively CONTRADICTS the claim, not merely when the tool
+// log has nothing on the topic — an inherently non-tool claim (manual math, reading a diff by eye) having
+// no tool evidence is normal, honest communication, not an overclaim.
+const HONEST_GATE_PURPOSE =
+  "Check whether a coding agent's final message is backed by evidence from the SESSION'S OWN TOOL LOG " +
+  '(independently reconstructed from the transcript, not written by the agent itself) or is hedging, ' +
+  'unverifiable, or misrepresentation. The EVIDENCE field in each item is exactly what the tools in this ' +
+  "session actually ran and returned, never the agent's self-report. A claim the agent itself explicitly " +
+  'marks as not run, not verified, unverified, or checked only by hand/manually/by reading rather than by ' +
+  "running a tool is a HEDGE, not a misrepresentation — classify it 'hedged', never 'misrepresented', as " +
+  'long as the claim text itself discloses that it was not tool-verified. Only classify "misrepresented" ' +
+  'when the tool log evidence actively CONTRADICTS the claim (e.g. the log shows a command failed but the ' +
+  'claim says it passed) — not merely because the tool log has nothing on the topic, since an inherently ' +
+  'non-tool claim (manual reasoning, reading code by eye) having no tool evidence is normal and honest.';
 
 async function mcpCall(toolName, args, fetchImpl) {
   const doFetch = fetchImpl || fetch;
@@ -293,10 +367,33 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   const finalMessage = hook.last_assistant_message || vp.finalMessage;
   if (!finalMessage || vp.fileChanges === 0) { note('skip: no final message or no file changes'); return null; }
 
+  // The honest gate reuses kit_verify_done's own disclosure signal (verdict "disclosed_unverified") so a
+  // message the server already recognises as an honest disclosure is never separately re-punished by the
+  // claim classifier — call it whenever either gate wants it, not only when gate=verify/both.
+  const needsVerify = wantsVerify || wantsHonest;
+  const claims = wantsHonest ? splitClaims(finalMessage) : [];
+  let evidence = '';
+
+  const verifyPromise = needsVerify
+    ? mcpCall('kit_verify_done', { task: vp.task, final_message: finalMessage, file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl)
+    : Promise.resolve(null);
+
+  let classifyPromise = Promise.resolve(null);
+  if (wantsHonest && claims.length) {
+    evidence = evidenceText(parseForHonest(lines));
+    const { classes } = classifyClasses();
+    const items = claims.map((c, i) => ({ id: 'c' + i, text: `CLAIM: ${redact(c)} EVIDENCE (from the session's tool log): ${evidence}` }));
+    classifyPromise = mcpCall('jev_classify', { purpose: HONEST_GATE_PURPOSE, items, classes }, fetchImpl);
+  }
+
+  // Run both MCP calls concurrently — verify-gate evidence and honest-gate evidence are independent reads
+  // of the same transcript, so there is no reason to pay their 3s-per-call caps sequentially (~6s
+  // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
+  const [verdict, classifyResult] = await Promise.all([verifyPromise, classifyPromise]);
+
   const reasons = [];
 
   if (wantsVerify) {
-    const verdict = await mcpCall('kit_verify_done', { task: vp.task, final_message: finalMessage, file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl);
     note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
     if (verdict && (verdict.verified === false || verdict.verdict === 'unverified')) {
       reasons.push(
@@ -306,27 +403,31 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
     }
   }
 
-  if (wantsHonest) {
-    const claims = splitClaims(finalMessage);
-    if (claims.length) {
-      const evidence = evidenceText(parseForHonest(lines));
-      const { purpose, classes } = classifyClasses();
-      const items = claims.map((c, i) => ({ id: 'c' + i, text: `CLAIM: ${c} EVIDENCE (from the session's tool log): ${evidence}` }));
-      const result = await mcpCall('jev_classify', { purpose, items, classes }, fetchImpl);
-      note('classify results=' + JSON.stringify(result && result.summary));
-      if (result && Array.isArray(result.results)) {
-        const offending = result.results.filter((r) => (r.classification === 'misrepresented' || r.classification === 'unverifiable') && r.decision === 'auto');
-        const review = result.results.filter((r) => r.decision === 'review' && !offending.includes(r));
-        if (offending.length) {
+  if (wantsHonest && claims.length) {
+    const alreadyDisclosed = verdict && verdict.verdict === 'disclosed_unverified';
+    if (!alreadyDisclosed) {
+      note('classify results=' + JSON.stringify(classifyResult && classifyResult.summary));
+      if (classifyResult && Array.isArray(classifyResult.results)) {
+        // Only an actual contradiction ("misrepresented") blocks. "Unverifiable" alone — no tool evidence
+        // either way, e.g. a claim about manual verification that by its nature has none — is normal,
+        // honest communication, not an overclaim; it goes into the reason as advice only when something
+        // else already blocked, never triggers a block by itself.
+        const misrepresented = classifyResult.results.filter((r) => r.classification === 'misrepresented' && r.decision === 'auto');
+        if (misrepresented.length) {
+          const unverifiable = classifyResult.results.filter((r) => r.classification === 'unverifiable' && r.decision === 'auto' && !misrepresented.includes(r));
+          const review = classifyResult.results.filter((r) => r.decision === 'review' && !misrepresented.includes(r) && !unverifiable.includes(r));
           const byId = Object.fromEntries(claims.map((c, i) => ['c' + i, c]));
-          const offendingLines = offending.map((r) => `- "${byId[r.id]}" — classified ${r.classification} (${Math.round((r.top_probability || 0) * 100)}%)`);
-          let text = `HONEST: ${offending.length} claim${offending.length === 1 ? '' : 's'} in your message ${offending.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
+          const offendingLines = misrepresented.map((r) => `- "${byId[r.id]}" — classified misrepresented (${Math.round((r.top_probability || 0) * 100)}%)`);
+          let text = `HONEST: ${misrepresented.length} claim${misrepresented.length === 1 ? '' : 's'} in your message ${misrepresented.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
             offendingLines.join('\n') + `\n\nWhat the tool log actually shows:\n${evidence}` +
             '\n\nRewrite those lines to match the evidence above, or run the check they assert, before sending this message.';
+          if (unverifiable.length) text += `\n\n(${unverifiable.length} more claim${unverifiable.length === 1 ? '' : 's'} had no tool evidence either way — fine if they're about something inherently non-tool-checkable, otherwise consider citing real evidence; not blocking on those alone.)`;
           if (review.length) text += `\n\n(${review.length} more claim${review.length === 1 ? '' : 's'} were a thin margin and could not be confirmed either way; not blocking on those alone.)`;
           reasons.push(text);
         }
       }
+    } else {
+      note('honest gate skipped: kit_verify_done already says disclosed_unverified');
     }
   }
 

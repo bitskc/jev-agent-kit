@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
 const here = path.dirname(new URL(import.meta.url).pathname);
@@ -181,7 +182,7 @@ test("missing transcript file: allow, stub never called", async () => {
 test("honest gate: a claim classified misrepresented at decision auto -> block, quoting the evidence", async () => {
   fresh(); setBaseEnv({ gate: "honest" });
   const { fetchImpl } = stubFetch((name, args) => {
-    assert.equal(name, "jev_classify");
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "a check passed" };
     return { results: args.items.map((item, i) => ({ id: item.id, classification: i === 0 ? "misrepresented" : "verified", top_probability: i === 0 ? 0.81 : 0.95, decision: "auto" })) };
   });
   const transcript = writeTranscript([
@@ -197,7 +198,10 @@ test("honest gate: a claim classified misrepresented at decision auto -> block, 
 
 test("honest gate: only review-decision items -> allow (never blocks on review alone)", async () => {
   fresh(); setBaseEnv({ gate: "honest" });
-  const { fetchImpl } = stubFetch((name, args) => ({ results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.55, decision: "review" })) }));
+  const { fetchImpl } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "a check passed" };
+    return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.55, decision: "review" })) };
+  });
   const transcript = writeTranscript(editedOneFile());
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Updated the file." }, { fetchImpl });
   assert.equal(out, null);
@@ -206,7 +210,10 @@ test("honest gate: only review-decision items -> allow (never blocks on review a
 test("honest gate auto-engages at Honest Jev level strict even with JEV_STOP_GATE unset", async () => {
   const d = fresh(); setBaseEnv(); // JEV_STOP_GATE unset entirely
   fs.writeFileSync(path.join(d, ".jev-honest-active"), "strict");
-  const { fetchImpl } = stubFetch((name, args) => ({ results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.9, decision: "auto" })) }));
+  const { fetchImpl } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "a check passed" };
+    return { results: args.items.map((item) => ({ id: item.id, classification: "misrepresented", top_probability: 0.9, decision: "auto" })) };
+  });
   const transcript = writeTranscript(editedOneFile());
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Done, works great." }, { fetchImpl });
   assert.ok(out);
@@ -221,6 +228,37 @@ test("honest gate at non-strict level does not auto-engage when JEV_STOP_GATE is
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Done, works great." }, { fetchImpl });
   assert.equal(out, null);
   assert.equal(calls.length, 0);
+});
+
+test("honest gate: a message that explicitly discloses non-tool verification is allowed, even with an 'unverifiable' classification (regression: honest disclosure no longer blocked by 'unverifiable' alone)", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: null, verdict: "unverified", action: "allow", reason: "not run" };
+    // The improved jev_classify purpose text asks the classifier to treat an explicit "not run"/"sanity-
+    // checked by hand" disclosure as hedged or (at worst) unverifiable, never "misrepresented" -- this
+    // test proves the HOOK's own decision rule honours that regardless: "unverifiable" alone never blocks.
+    return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.92, decision: "auto" })) };
+  });
+  const transcript = writeTranscript([
+    userPrompt("Add exponential backoff to the upload retry."),
+    assistantToolUse("t1", "Edit", { file_path: "upload.ts" }), toolResult("t1", "ok"),
+  ]);
+  const msg = "Implemented exponential backoff in upload.ts. I did not run the test suite for this change, " +
+    "so this is unverified. The backoff math itself I sanity-checked by hand against a few delay sequences.";
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: msg }, { fetchImpl });
+  assert.equal(out, null);
+});
+
+test("honest gate: skipped entirely once kit_verify_done already says disclosed_unverified, even if the classifier alone would have blocked", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: null, verdict: "disclosed_unverified", action: "allow", reason: "the message itself discloses that nothing was verified." };
+    return { results: args.items.map((item) => ({ id: item.id, classification: "misrepresented", top_probability: 0.95, decision: "auto" })) };
+  });
+  const transcript = writeTranscript(editedOneFile());
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Edited the file, did not verify." }, { fetchImpl });
+  assert.equal(out, null);
+  assert.equal(calls.length, 2); // both calls still ran (concurrently); the verify signal suppressed the block after the fact
 });
 
 test("gate both: runs verify and honest; either alone can block", async () => {
@@ -239,6 +277,26 @@ test("gate both: runs verify and honest; either alone can block", async () => {
   assert.match(out.reason, /HONEST:/); // verify passed (no VERIFY: section); honest still blocks
   assert.doesNotMatch(out.reason, /VERIFY:/);
   assert.equal(calls.length, 2);
+});
+
+test("P2: gate 'both' issues its two MCP calls concurrently, not back-to-back (worst case ~3s for either to time out, not ~6s)", async () => {
+  fresh(); setBaseEnv({ gate: "both", timeout: "3" });
+  const timestamps = {};
+  const fetchImpl = (url, opts) => {
+    const rpc = JSON.parse(opts.body);
+    timestamps[rpc.params.name] = Date.now();
+    const delay = rpc.params.name === "kit_verify_done" ? 150 : 0; // only one call is slow
+    return new Promise((resolve) => setTimeout(() => {
+      const result = rpc.params.name === "kit_verify_done"
+        ? { verified: true, verdict: "verified", action: "allow", reason: "ok" }
+        : { results: rpc.params.arguments.items.map((item) => ({ id: item.id, classification: "verified", top_probability: 0.9, decision: "auto" })) };
+      resolve({ ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: "2.0", id: rpc.id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } }) });
+    }, delay));
+  };
+  const transcript = writeTranscript([userPrompt("Fix it."), assistantToolUse("t1", "Edit", { file_path: "x.js" }), toolResult("t1", "ok")]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed it, verified by hand." }, { fetchImpl });
+  assert.ok(timestamps.kit_verify_done !== undefined && timestamps.jev_classify !== undefined, "both calls must fire");
+  assert.ok(Math.abs(timestamps.jev_classify - timestamps.kit_verify_done) < 50, `expected concurrent dispatch, saw a ${Math.abs(timestamps.jev_classify - timestamps.kit_verify_done)}ms gap between issue times`);
 });
 
 test("server error (504) on verify: fails open, allow", async () => {
@@ -260,14 +318,51 @@ test("missing JEV_MCP_TOKEN: fails open without attempting a call", async () => 
 });
 
 test("splitClaims: bullets and sentences, structural filters only (no keyword gating)", () => {
-  const msg = "## Header: not a claim\n- Fixed the bug in src/x.js. It now works correctly.\n- Not committed yet.\nIs that okay?\n## Another heading\nShort.";
+  const msg = "- Fixed the bug in src/x.js. It now works correctly.\n- Not committed yet.\nIs that okay?\nShort.";
   const claims = stopGate.splitClaims(msg);
   assert.ok(claims.some((c) => c.includes("Fixed the bug")));
   assert.ok(claims.some((c) => c.includes("works correctly")));
   assert.ok(claims.some((c) => c.includes("Not committed yet")));
-  assert.ok(!claims.some((c) => c.includes("Header"))); // heading-only line dropped
   assert.ok(!claims.some((c) => c.includes("Is that okay"))); // a question is not a claim
   assert.ok(!claims.some((c) => c === "Short.")); // under the 10-char floor
+});
+
+test("splitClaims: a markdown heading's TEXT is still classified, not discarded (regression: '## Done: all tests pass' bypassed the gate entirely)", () => {
+  const claims1 = stopGate.splitClaims("## Done: all tests pass, ready to merge\n\nFixed the null check in src/y.js.");
+  assert.ok(claims1.some((c) => c.includes("Done: all tests pass")));
+  const claims2 = stopGate.splitClaims("### All tests pass, build succeeds, ready for review");
+  assert.ok(claims2.some((c) => c.includes("All tests pass, build succeeds, ready for review")));
+});
+
+test("splitClaims: a blockquote's text is still classified, its '>' marker stripped", () => {
+  const claims = stopGate.splitClaims("> I confirmed the fix resolves the crash.");
+  assert.ok(claims.some((c) => c.includes("I confirmed the fix resolves the crash")));
+});
+
+test("splitClaims: a checklist item's text is still classified, its '- [x]'/'- [ ]' marker stripped", () => {
+  const claims = stopGate.splitClaims("- [x] All tests pass\n- [ ] Not yet reviewed by a human");
+  assert.ok(claims.some((c) => c.includes("All tests pass")));
+  assert.ok(claims.some((c) => c.includes("Not yet reviewed by a human")));
+  assert.ok(!claims.some((c) => c.includes("[x]")));
+  assert.ok(!claims.some((c) => c.includes("[ ]")));
+});
+
+test("splitClaims: a markdown table row's cells are each classified individually; the separator row is skipped", () => {
+  const msg = "| Check | Result |\n|---|---|\n| All tests pass | yes, verified locally |";
+  const claims = stopGate.splitClaims(msg);
+  assert.ok(claims.some((c) => c.includes("yes, verified locally")));
+  assert.ok(!claims.some((c) => c.includes("---")));
+});
+
+test("splitClaims: bold/italic markers are stripped wherever they occur, not only when wrapping the whole sentence (regression: stray trailing '**')", () => {
+  const claims = stopGate.splitClaims("- **All tests pass** and the build is clean.");
+  assert.ok(claims.some((c) => c === "All tests pass and the build is clean."));
+  assert.ok(!claims.some((c) => c.includes("**")));
+});
+
+test("splitClaims: an inline pipe character in ordinary prose is not mistaken for a markdown table row", () => {
+  const claims = stopGate.splitClaims("Use `foo | bar` to pipe the output into bar; this fixes the bug.");
+  assert.ok(claims.some((c) => c.includes("fixes the bug")));
 });
 
 test("parseForVerify: checks only count after the last edit", () => {
@@ -322,14 +417,33 @@ test("parseForVerify: a check batched in the SAME assistant turn as the edit sti
   assert.match(vp.checks[0].output, /3 passed/);
 });
 
-test("parseForVerify: isSidechain lines (a dispatched subagent's own tool calls) never count toward the main turn's evidence", () => {
+test("parseForVerify: isSidechain lines (a dispatched subagent's own tool calls) DO count toward the parent turn's evidence (delegated work must not become invisible to the gate)", () => {
   const lines = [
     userPrompt("Fix it."),
     { ...assistantToolUse("s1", "Edit", { file_path: "sub.js" }), isSidechain: true },
     { ...toolResult("s1", "ok"), isSidechain: true },
   ];
   const vp = stopGate.parseForVerify(lines);
-  assert.equal(vp.fileChanges, 0);
+  assert.equal(vp.fileChanges, 1);
+});
+
+test("parseForHonest: a fully-delegated turn (edit + passing Bash run only inside a Task subagent's sidechain) still produces real evidence, not an empty turn", () => {
+  const lines = [
+    userPrompt("Delegate: implement X and run the tests."),
+    { ...assistantToolUse("s1", "Edit", { file_path: "sub.js" }), isSidechain: true },
+    { ...toolResult("s1", "ok"), isSidechain: true },
+    { ...assistantToolUse("s2", "Bash", { command: "npm test" }), isSidechain: true },
+    { ...toolResult("s2", "5 passed"), isSidechain: true },
+  ];
+  const ev = stopGate.parseForHonest(lines);
+  assert.deepEqual(ev.edits, ["sub.js"]);
+  assert.equal(ev.runs.length, 1);
+  assert.equal(ev.runs[0].command, "npm test");
+});
+
+test("isRealUserPrompt: a sidechain's own synthetic prompt line (the Task tool's instruction TO a subagent) is still never mistaken for a top-level user prompt", () => {
+  const line = { type: "user", isSidechain: true, message: { role: "user", content: "Implement X and run the tests." } };
+  assert.equal(stopGate.isRealUserPrompt(line), false);
 });
 
 test("isRealUserPrompt / parseForHonest: a mid-session slash-command synthetic line is not mistaken for the last real prompt", () => {
@@ -364,4 +478,51 @@ test("decide(): never throws past its own try/catch safety net even on an unexpe
   const dirAsTranscript = fs.mkdtempSync(path.join(os.tmpdir(), "not-a-file-"));
   const out = await stopGate.decide({ transcript_path: dirAsTranscript, last_assistant_message: "Fixed, all tests pass." }, {});
   assert.equal(out, null);
+});
+
+test("evidenceText: secrets in a Bash command or its output are redacted before being embedded (never reach jev_classify unredacted)", () => {
+  const ev = stopGate.evidenceText({
+    edits: [],
+    runs: [{ command: "curl -H 'Authorization: Bearer sk-live-abcdefghijklmnop' https://api.example.com", isError: false, output: "token=sk-live-abcdefghijklmnop ok" }],
+  });
+  assert.ok(!ev.includes("sk-live-abcdefghijklmnop"));
+  assert.match(ev, /<redacted>/);
+});
+
+test("decide(): a secret surfaced via Bash output during the honest gate's evidence never reaches jev_classify unredacted (full pipeline, not just evidenceText() in isolation)", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "ok" };
+    return { results: args.items.map((item) => ({ id: item.id, classification: "verified", top_probability: 0.9, decision: "auto" })) };
+  });
+  const transcript = writeTranscript([
+    userPrompt("Deploy the key rotation script."),
+    assistantToolUse("t1", "Edit", { file_path: "rotate.sh" }), toolResult("t1", "ok"),
+    assistantToolUse("t2", "Bash", { command: "cat .env" }),
+    toolResult("t2", "API_KEY=sk-live-supersecrettoken1234567890\nDONE"),
+  ]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Rotated the key successfully." }, { fetchImpl });
+  const classifyCall = calls.find((c) => c.name === "jev_classify");
+  assert.ok(classifyCall);
+  for (const item of classifyCall.arguments.items) assert.ok(!item.text.includes("sk-live-supersecrettoken1234567890"), `leaked into: ${item.text}`);
+});
+
+test("jev-redact.js (hook's local port) stays byte-identical to server/src/kit/shell.mjs's redact() on the server's own test strings -- a drift sentinel: if the two SECRET_RULES tables diverge, this fails even though nothing else exercises both copies together", async () => {
+  const serverShellPath = path.join(here, "..", "server", "src", "kit", "shell.mjs");
+  const { redact: serverRedact } = await import(pathToFileURL(serverShellPath).href);
+  const { redact: hookRedact } = require("./jev-redact.js");
+  const samples = [
+    "export ENCRYPTION_KEY=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    'PASSWORD="correct horse battery staple"',
+    "curl -u admin:Tr0ub4dor https://api.internal/v1",
+    "aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "mysql -u root --password hunter2hunter2",
+    "MY_DEPLOY_KEY=abc123 ./deploy.sh",
+    "mysql -h db -p sup3rsecret",
+    "ls -la src/key_store.rs", 'git commit -m "release: bump version"', "echo $HOME/.ssh",
+    "mkdir -p DIR", "cp -p src dst", "scp -p file.txt host:/tmp", "ssh -p 22 user@host",
+    "docker run -p 8080:80 image", "sort -u file.txt", "git push -u origin main", "psql -p 5432 -U app",
+    'git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"',
+  ];
+  for (const s of samples) assert.equal(hookRedact(s), serverRedact(s), `redact() output diverged on: ${s}`);
 });
