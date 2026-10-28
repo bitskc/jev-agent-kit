@@ -1,0 +1,9 @@
+{
+  "name": "jev-mcp",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-05-01",
+  "compatibility_flags": ["nodejs_compat", "nodejs_compat_populate_process_env"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true }
+}

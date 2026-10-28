@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jev": {
+      "type": "http",
+      "url": "${JEV_MCP_URL}",
+      "headers": {
+        "Authorization": "Bearer ${JEV_MCP_TOKEN}"
+      }
+    }
+  }
+}

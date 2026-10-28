@@ -1,0 +1,21 @@
+{
+  "name": "jev-mcp-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@jkudish/jev-agent-tools": "^0.2.1",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@typesafe-ai/sdk": "^0.7.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  },
+  "scripts": {
+    "vendor": "sh build-vendor.sh",
+    "test": "node --test test/",
+    "dev": "npm run vendor && wrangler dev",
+    "deploy": "npm run vendor && wrangler deploy"
+  },
+  "license": "MIT"
+}

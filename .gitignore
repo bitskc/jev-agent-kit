@@ -1,0 +1,18 @@
+# secrets and local state: never commit
+.env
+.env.*
+.dev.vars
+*.pem
+*.key
+secrets/
+*token*.txt
+*bearer*.txt
+# build output and deps
+node_modules/
+.wrangler/
+.build/
+server/vendor/
+dist/
+__pycache__/
+*.pyc
+*.tar.gz
