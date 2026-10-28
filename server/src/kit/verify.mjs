@@ -38,7 +38,10 @@ export function checkSummary(output) {
   if (build) return build[1].startsWith("SUCCESS") ? "pass" : "fail";
   const eslint = /^[✖x] \d+ problems? \((\d+) errors?/m.exec(tail);
   if (eslint) return Number(eslint[1]) > 0 ? "fail" : "pass";
-  if (/\berror TS\d{4,}:/.test(tail)) return "fail";
+  const mocha = /^\s*(\d+) (passing|failing)\b/m.test(tail) && /^\s*(\d+) failing\b/m.exec(tail);
+  if (mocha) return Number(mocha[1]) > 0 ? "fail" : "pass";
+  if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
+  if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return "fail";
   return undefined;
 }
 
@@ -183,10 +186,16 @@ export async function verifyDone(input, deps = {}) {
   }
   if (!evidence && (input.file_changes !== undefined || input.checks)) {
     const checks = (input.checks || []).map((c) => {
-      const detected = classifyToolResult("Bash", { command: c.command }, false, c.output || "");
-      const passed = typeof c.passed === "boolean" ? c.passed : detected === "check-pass";
-      const isCheck = typeof c.passed === "boolean" || detected !== "unknown";
-      return isCheck ? { call: redact(c.command || "check").slice(0, 200), passed } : null;
+      const command = c.command || "check";
+      const call = redact(command).slice(0, 200);
+      if (typeof c.passed === "boolean") return { call, passed: c.passed };
+      const summary = checkSummary(c.output || "");
+      if (typeof c.exit_code === "number") return { call, passed: c.exit_code === 0 && summary !== "fail" };
+      if (summary) return { call, passed: summary === "pass" };
+      if (!CHECK_COMMAND.test(command)) return null;
+      // A check command with no recognised runner summary and no exit code is unproven, never a pass.
+      notes.push(`Check '${call}' had no recognised pass/fail summary and no exit_code, so it is not counted as passing. Send exit_code or paste the runner's summary lines.`);
+      return { call, passed: false, unproven: true };
     }).filter(Boolean);
     // supplied checks are assumed to have run after the supplied changes
     evidence = { mutations: input.file_changes ?? (checks.length ? 1 : 0), checks, checksBeforeMutation: 0 };

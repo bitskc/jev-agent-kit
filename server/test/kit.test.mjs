@@ -131,6 +131,52 @@ test("checkSummary", () => {
   assert.equal(checkSummary("Tests: 2 failed, 8 passed, 10 total"), "fail");
   assert.equal(checkSummary("test result: ok. 5 passed"), "pass");
 });
+test("checkSummary: mocha and npm lifecycle failures are recognised", () => {
+  assert.equal(checkSummary("  5 passing (40ms)\n  2 failing\n\nnpm ERR! Test failed."), "fail");
+  assert.equal(checkSummary("  12 passing (90ms)\n"), "pass");
+  assert.equal(checkSummary("npm ERR! code ELIFECYCLE\nnpm ERR! errno 1"), "fail");
+});
+test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
+  const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },
+    outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });
+  // bare command name, no output: not evidence
+  let r = await verifyDone({ file_changes: 2, final_message: "Fixed, all tests pass", checks: [{ command: "npm test" }] }, j);
+  assert.equal(r.verified, false); assert.equal(r.evidence.fresh_checks[0].passed, false); assert.match(r.notes.join(" "), /exit_code/);
+  // unrecognised output on a check command: still not evidence
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npm test", output: "something unparseable" }] }, j);
+  assert.equal(r.verified, false);
+  // exit_code 0 with silent runner (tsc): verified
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npx tsc --noEmit", output: "", exit_code: 0 }] }, j);
+  assert.equal(r.verified, true);
+  // exit_code 0 but output shows a failure: failure wins
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "npm test", output: "  2 failing", exit_code: 0 }] }, j);
+  assert.equal(r.verified, false);
+  // non-check command with no evidence is ignored, not counted either way
+  r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "ls -la" }] }, j);
+  assert.equal(r.evidence.fresh_checks.length, 0);
+});
+test("rungFor: claude-* ids resolve to their own family, not the generic director alias", async () => {
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-fable-5-1" }, noJev)).chosen.tier, "fable");
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-haiku-4-5" }, noJev)).chosen.tier, "scout");
+  assert.equal((await sizeDispatch({ description: "x", model: "anthropic/claude-opus-4" }, noJev)).chosen.tier, "director");
+  assert.equal((await sizeDispatch({ description: "x", model: "claude-3" }, noJev)).chosen.tier, "director");
+  const unknown = await sizeDispatch({ description: "x", model: "llama-9" }, noJev);
+  assert.equal(unknown.chosen.tier, "director"); assert.equal(unknown.chosen.recognised, false);
+});
+test("redact: name-based keys, quoted passphrases, CLI option values and aws secrets never reach upstream", async () => {
+  const { redact } = await import("../src/kit/shell.mjs");
+  const leaks = [
+    ["export ENCRYPTION_KEY=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "9f86d081"],
+    ['PASSWORD="correct horse battery staple"', "horse"],
+    ["curl -u admin:Tr0ub4dor https://api.internal/v1", "Tr0ub4dor"],
+    ["aws configure set aws_secret_access_key wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "wJalrXUt"],
+    ["mysql -u root --password hunter2hunter2", "hunter2"],
+    ["MY_DEPLOY_KEY=abc123 ./deploy.sh", "abc123"],
+  ];
+  for (const [input, secret] of leaks) assert.ok(!redact(input).includes(secret), `leaked: ${redact(input)}`);
+  for (const benign of ["ls -la src/key_store.rs", 'git commit -m "release: bump version"', "echo $HOME/.ssh"]) assert.equal(redact(benign), benign);
+  assert.equal((await g('git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"')).rule, "R9-commit-secret");
+});
 const jl = (...l) => l.map((x) => JSON.stringify(x)).join("\n");
 const turn = (extra) => jl(
   { type: "user", message: { content: "fix the bug" } },

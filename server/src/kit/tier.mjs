@@ -44,7 +44,13 @@ export function rungFor(chosen, ladder) {
   const t = (chosen || "").trim();
   for (const rung of ladder) if (rung.includes(t)) return { rung: rung[0], recognised: true };
   const low = t.toLowerCase();
-  // family-name containment, e.g. "claude-sonnet-4-5" -> sonnet's rung
+  // Specific family first, vendor prefix stripped: "claude-fable-5-1" -> fable, "claude-haiku-4-5" -> haiku's rung.
+  // Without this the generic "claude" alias (director) wins for every claude-* id, including fable.
+  const stripped = low.replace(/^(?:anthropic\/)?claude-/, "");
+  for (const rung of ladder) {
+    for (const n of rung) if (n.length >= 4 && n !== "claude" && stripped.includes(n.toLowerCase())) return { rung: rung[0], recognised: true, via: "family" };
+  }
+  // generic family-name containment, e.g. "claude-3" -> director
   for (const rung of ladder) {
     for (const n of rung.slice(1)) if (n.length >= 4 && low.includes(n.toLowerCase())) return { rung: rung[0], recognised: true, via: "family" };
   }
