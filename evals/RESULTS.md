@@ -165,9 +165,11 @@ Round 17 closes two live leaks in the round-14 recursive-grep ask (#84, #85, PR 
 
 Still open and unchanged in round 17: #46 and #65 (proc-sub quadratic and glob budget), #48 (`sh -c "$(curl …)"`), #66 (`$PGPASSWORD` under the narrowed name rule), #67 (default-deny env-file consumers), #63 (DATABASE_URL naming scope), #85 false asks on `grep -rne`. New issues: #99 (a disable of one R7 id masks other destructive matches in the same command) and #100 (a bulk remote copy of a directory is not scanned for secret stores).
 
+Round 18 closes the three partial items in the PR #30 verdict on `f7dff03` (comment 6482214789). #84: a recursive grep whose pattern names a credential (`DATABASE_URL`, `AWS_ACCESS_KEY_ID`, `_TOKEN$`) asks through `SECRET_NAME_RE`; a pattern that matches an assignment-name sample (`SECR.T_X`, `=`) asks through `patternMatchesValueName`. #47: the `?` glob matches any filename character (`a-z`, `0-9`, `._-`), so `cat .en?`, `cat .e?v`, and `curl -d @.en?` expand to `.env` and block. Known over-block: `cat ?env` also blocks, though bash never expands `?` to a leading dot. #85: bare `auth` and `token` ask only when the recursive root is broad (`.`, `..`, `~`, `/`, or no path); `grep -rn auth src`, `rg auth src`, `rg token README.md`, and `grep -rne foo src/auth/` now allow. Operands are parsed getopt-style in `grepArgv`, so `-drecurse`, `-d recurse`, and `-ePAT` read correctly. New deliberate false asks: `grep -rn KEY src`, `grep -rn '[A-Z]' src`, and `grep -rn '.*' src`, because they match uppercase or wildcard assignment names. Corpus g396–g408. Test: `round 18` in `server/test/secret-tiers.test.mjs`, fixture-executed. Mutation-verified: M1–M4 killed by round 18; M5 (`-d` not a value option) killed by round 17.
+
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 445 | 99.1% | 98.5% | 100.0% | **0.0%** |
+| guard | 458 | 99.1% | 98.5% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's

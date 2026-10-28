@@ -115,6 +115,8 @@ function* pathParts(tokens) {
 // `~/.ssh/*`, `~/.aws/cred*` without writing out each spelling.
 const GLOB_CHAR_RE = /[*?[]/;
 const GLOB_UNIT_RE = /\[!?[^\]]*\]|\*|\?|[^*?[]+|\[/g;
+// `?` is one filename character: the secret names are lowercase letters, digits, `.`, `_`, `-` (`.en?` is `.env`).
+const GLOB_ANY_CHARS = [..."abcdefghijklmnopqrstuvwxyz0123456789._-"];
 function bracketChars(body) {
   const out = [];
   for (let i = 0; i < body.length; i++) {
@@ -130,7 +132,7 @@ function globSamples(p) {
   for (const u of p.match(GLOB_UNIT_RE) ?? []) {
     let alts;
     if (u === "*") alts = ["", "x", ".x"];
-    else if (u === "?") alts = ["x"];
+    else if (u === "?") alts = GLOB_ANY_CHARS;
     else if (u.length > 1 && u.startsWith("[")) alts = u.startsWith("[!") ? ["x"] : bracketChars(u.slice(1, -1));
     else alts = [u];
     cands = cands.flatMap((c) => alts.map((a) => c + a)).slice(0, 2048);
@@ -300,17 +302,65 @@ function quietGrep(args) {
 }
 // A grep/rg whose pattern names a secret prints each matching line whole, and that line often carries the value
 // (`SECRET_X=hunter2`). Recursive, or fed by find/xargs, it prints those lines from every file it reaches.
-const SECRET_NAME_RE = /SECRET|TOKEN|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|AUTH|CRED|SERVICE_ROLE|API_KEY|_PASS$/i;
+const SECRET_NAME_RE = /SECRET|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|CRED|SERVICE_ROLE|API_KEY|DATABASE_URL|ACCESS_KEY|_PASS$|_TOKEN$/i;
+// A bare credential word names a family, not a secret: `grep -rn auth src` is a source search. Searched from a broad
+// root (`.`, `~`, `/`, or no path), it still asks: that root holds the .env files whose lines carry the values.
+const GENERIC_CRED_WORD_RE = /^(?:auth|token)$/i;
+const BROAD_ROOT_RE = /^(?:\.|\.\/|\.\.|\.\.\/|~|~\/|\$HOME|\$HOME\/|\/)$/;
+// Assignment-name samples. A pattern that is a regex matching one of these names (`SECR.T_X`), or the assignment
+// operator (`=`), selects the assignment lines of every .env file it reaches.
+const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
+function patternMatchesValueName(p) {
+  if (GENERIC_CRED_WORD_RE.test(p)) return false;
+  let re;
+  try { re = new RegExp(p); } catch { return false; }
+  return VALUE_NAME_SAMPLES.some((s) => re.test(s));
+}
+// Splits a grep/rg argv the way getopt does: short options take their value from the rest of the cluster or the next
+// token (`-drecurse`, `-d recurse`, `-ePAT`, `-e PAT`), so no option value is read as a flag. Returns the -e/--regexp
+// texts, the operands, and whether a -f/--file pattern file is named. `rg` also takes values on -g/-t/-j/-M/-E.
+function grepArgv(prog, args) {
+  const valueShort = prog === "rg" ? "ABCDdefmgtjME" : "ABCDdefm";
+  const patterns = [];
+  const operands = [];
+  let fileMode = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") { operands.push(...args.slice(i + 1)); break; }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const name = eq > 0 ? a.slice(0, eq) : a;
+      const inline = eq > 0 ? a.slice(eq + 1) : null;
+      if (name === "--regexp") patterns.push(inline ?? args[++i] ?? "");
+      else if (name === "--file") { fileMode = true; if (inline === null) i++; }
+      else if (GREP_VALUE_OPTS.has(name) && inline === null) i++;
+      continue;
+    }
+    if (a.length > 1 && a.startsWith("-")) {
+      for (let k = 1; k < a.length; k++) {
+        const c = a[k];
+        if (!valueShort.includes(c)) continue;
+        const rest = a.slice(k + 1);
+        const value = rest.length > 0 ? rest : (args[++i] ?? "");
+        if (c === "e") patterns.push(value);
+        if (c === "f") fileMode = true;
+        break;
+      }
+      continue;
+    }
+    operands.push(a);
+  }
+  return { patterns, operands, fileMode };
+}
 function grepNamesSecret(prog, args) {
   if (!GREP_PATTERN_PROGS.has(prog)) return false;
-  // -e/-f/--regexp/--file: any token may hold the pattern, so every token is checked.
-  if (args.some((a) => a === "--regexp" || a === "--file" || a.startsWith("--regexp=") || a.startsWith("--file=") || /^-[^-]*[ef]/.test(a))) {
-    return args.some((a) => SECRET_NAME_RE.test(a));
-  }
-  const rest = dropOptionValues(args, GREP_VALUE_OPTS);
-  const dd = rest.indexOf("--");
-  const at = dd >= 0 ? dd + 1 : rest.findIndex((a) => !a.startsWith("-"));
-  return at >= 0 && SECRET_NAME_RE.test(rest[at]);
+  const { patterns, operands, fileMode } = grepArgv(prog, args);
+  // -f/--file: the pattern is a file's contents, so every token is name-checked and no pattern text is probed.
+  const pats = fileMode ? args : patterns.length > 0 ? patterns : operands.slice(0, 1);
+  const roots = patterns.length > 0 || fileMode ? operands : operands.slice(1);
+  if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && patternMatchesValueName(p)))) return true;
+  const broad = roots.length === 0 || roots.some((r) => BROAD_ROOT_RE.test(r));
+  return broad && pats.some((p) => GENERIC_CRED_WORD_RE.test(p));
 }
 function grepRecursive(prog, args) {
   if (prog === "rg" || prog === "ag") return true; // both descend into directories by default
