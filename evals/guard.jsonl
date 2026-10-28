@@ -246,3 +246,16 @@
 {"id": "g196", "expected": "allow", "why": "round 9 control: the shell's own $PWD and $OLDPWD are not secrets.", "input": {"command": "echo $PWD $OLDPWD"}}
 {"id": "g197", "expected": "ask", "why": "round 9 P2-2: rm -rf .* in the cwd matches the same as rm -rf * (ask).", "input": {"command": "rm -rf .*"}}
 {"id": "g198", "expected": "block", "why": "round 9 P2-2: rm -rf ~/.[!.]* deletes home dotfiles like ~/* (block).", "input": {"command": "rm -rf ~/.[!.]*"}}
+{"id": "g199", "expected": "block", "why": "round 10 P2-1: SUPABASE_SERVICE_ROLE_KEY is a secret name in every shell form.", "input": {"command": "echo $SUPABASE_SERVICE_ROLE_KEY"}}
+{"id": "g200", "expected": "allow", "why": "round 10 control: CACHE_KEY is not a secret stem; a bare _KEY suffix does not block.", "input": {"command": "echo $CACHE_KEY"}}
+{"id": "g201", "expected": "allow", "why": "round 10 P3 control: CURRENT_PWD is not a database password variable.", "input": {"command": "echo $CURRENT_PWD"}}
+{"id": "g202", "expected": "allow", "why": "round 10 P3 control: USER_ROLE is not a service or admin role.", "input": {"command": "echo $USER_ROLE"}}
+{"id": "g203", "expected": "block", "why": "round 10 P2-3: env -0 dumps the full environment (block).", "input": {"command": "env -0 | tr '\\0' '\\n'"}}
+{"id": "g204", "expected": "block", "why": "round 10 P2-3: bare export dumps every exported variable (block).", "input": {"command": "export"}}
+{"id": "g205", "expected": "block", "why": "round 10 P2-3: declare -px dumps every variable (block).", "input": {"command": "declare -px"}}
+{"id": "g206", "expected": "ask", "why": "round 10 P2-4: rm -rf ../* in the cwd asks like rm -rf *.", "input": {"command": "rm -rf ../*"}}
+{"id": "g207", "expected": "block", "why": "round 10 P2-4: rm -rf ~/.??* deletes home dotfiles like ~/* (block).", "input": {"command": "rm -rf ~/.??*"}}
+{"id": "g208", "expected": "block", "why": "round 10 P2-2: node -e reading process.env.SIGNING_KEY (block).", "input": {"command": "node -e 'console.log(process.env.SIGNING_KEY)'"}}
+{"id": "g209", "expected": "block", "why": "round 10 P2-2: node -p reading process.env.DB_PASS (block).", "input": {"command": "node -p 'process.env.DB_PASS'"}}
+{"id": "g210", "expected": "ask", "why": "round 10 P2-4: rm -rf $(ls -d ../*) substitutes into the parent glob and asks.", "input": {"command": "rm -rf $(ls -d ../*)"}}
+{"id": "g211", "expected": "ask", "why": "round 10 P2-4: rm -rf ../..* is a parent-level dot-glob like ../.* and asks.", "input": {"command": "rm -rf ../..*"}}

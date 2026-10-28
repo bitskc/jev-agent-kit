@@ -1226,6 +1226,66 @@ test("round 9 P2-2: cwd dotfile globs ask like rm -rf *; home and root dotfile g
     assert.equal((await g(c)).decision, "allow", c);
   }
 });
+test("round 10 P2-1: SERVICE_ROLE_KEY and SIGNING/SESSION _KEY names block in every shell form; CACHE_KEY, PRIMARY_KEY, AUTHOR_KEY stay allowed", async () => {
+  for (const c of ["echo $SUPABASE_SERVICE_ROLE_KEY", "echo ${SUPABASE_SERVICE_ROLE_KEY}", "echo ${SUPABASE_SERVICE_ROLE_KEY:-x}", "echo $SIGNING_KEY", "echo $SESSION_KEY"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R1-secret-exposure", c);
+  }
+  for (const c of ["echo $CACHE_KEY", "echo $PRIMARY_KEY", "echo $AUTHOR_KEY"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
+test("round 10 P2-2: interpreter env reads of secret names block; HOME reads stay allowed", async () => {
+  for (const c of [
+    "node -e 'console.log(process.env.DB_PASS)'", "node -p 'process.env.DB_PASS'", "node -e 'console.log(process.env)'",
+    "bun -e 'console.log(process.env.DB_PASS)'", "python3 -c 'import os;print(os.environ[\"SUPABASE_SERVICE_ROLE_KEY\"])'",
+    "python3 -c 'import os;print(os.environ)'", "ruby -e 'puts ENV[\"DB_PASS\"]'", "perl -e 'print $ENV{DB_PASS}'",
+    "deno eval 'console.log(Deno.env.get(\"DB_PASS\"))'",
+  ]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R1-secret-exposure", c);
+  }
+  for (const c of ["node -e 'console.log(process.env.HOME)'", "python3 -c 'import os;print(os.environ.get(\"HOME\"))'"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
+test("round 10 P2-3: full-environment dumps block in every spelling; secret-free export/declare/env assignments stay allowed", async () => {
+  for (const c of ["export", "export | grep KEY", "export -p", "declare -p", "declare -px", "typeset -px", "typeset -p",
+    "env -0 | tr '\\0' '\\n'", "printenv -0", "env --null", "env | grep X", "printenv", "declare -p DB_PASS"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R1-secret-exposure", c);
+  }
+  for (const c of ["export DB_PASS=abc", "DB_PASS=abc", "declare -a arr", "env FOO=1 make"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
+test("round 10 P2-4: dot-led and ../ globs ask at cwd, block under ~ and /; ../build subtrees stay allowed", async () => {
+  for (const c of ["rm -rf .??*", "rm -rf .[a-z]*", "rm -rf .?*", "rm -rf ./.??*", "cd ~ && rm -rf .??*",
+    "rm -rf ../*", "rm -rf ../.*", "rm -rf ../.??*", "rm -rf ../../*", "rm -rf $(ls -d ../*)", "rm -rf $(ls -d *)"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "ask", c);
+    assert.equal(r.rule, "R7-destructive", c);
+  }
+  for (const c of ["rm -rf ~/.??*", "rm -rf ~/.[a-z]*", "rm -rf ~/.*/", "rm -rf /.??*", "rm -rf ${HOME}/.*"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R7-root-delete", c);
+  }
+  for (const c of ["rm -rf ../build/*", "rm -rf ~/.config/*", "rm -rf ~/.cache", "rm -rf $(ls *.o)", "rm -rf $(ls -d ../build/*)"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
+test("round 10 P3: $USER_ROLE, $EXPECTED_ROLE and $CURRENT_PWD are not secrets; $SUPABASE_SERVICE_ROLE, $MYSQL_PWD still block", async () => {
+  for (const c of ["echo $USER_ROLE", "echo \"role=$EXPECTED_ROLE\"", "echo $CURRENT_PWD", "echo $ROLE", "echo $PWD"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+  for (const c of ["echo $SUPABASE_SERVICE_ROLE", "echo $MYSQL_PWD", "echo $DB_PWD"]) {
+    assert.equal((await g(c)).rule, "R1-secret-exposure", c);
+  }
+});
 
 test("upstream resolution: gateway wins, then typesafe, then none; overrides", () => {
   assert.equal(resolveUpstream({}), null);

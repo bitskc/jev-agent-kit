@@ -651,6 +651,7 @@ export const INTERP_SCRIPT_PROGS = new Set(["python", "python3", "node", "nodejs
   "deno", "bun", "pwsh", "powershell", "lua"]);
 const INTERP_SCRIPT_OPTS = new Set(["-c", "-e", "--eval", "-r"]);
 const INTERP_PROG_BASES = new Set(["python", "node", "nodejs", "ruby", "perl", "php", "deno", "bun", "lua", "pwsh", "powershell"]);
+const NODE_PRINT_BASES = new Set(["node", "nodejs"]);
 const INTERP_VERSION_RE2 = /^([a-z]+?)(\d+(?:\.\d+)*)$/i;
 function interpBase(prog) {
   if (INTERP_PROG_BASES.has(prog)) return prog;
@@ -670,6 +671,7 @@ export function interpScriptText(prog, args) {
     const a = args[i];
     if (a === "--") break;
     if (INTERP_SCRIPT_OPTS.has(a) && args[i + 1] !== undefined) return args[i + 1];
+    if (NODE_PRINT_BASES.has(b) && (a === "-p" || a === "-pe" || a === "--print") && args[i + 1] !== undefined) return args[i + 1];
     if (a.startsWith("--eval=")) return a.slice("--eval=".length);
   }
   return null;

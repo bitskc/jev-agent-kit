@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-Guard corpus grown to 248 cases (`evals/guard.jsonl`) across five independent adversarial review rounds on
+Guard corpus grown to 261 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
@@ -49,9 +49,26 @@ allowed. The corpus gains g191–g198. Each of the four mechanisms, reverted alo
 `PASSWORD` inside longer names such as `PASSWORDLESS_MODE` (pre-existing, unchanged); the guard stays lexical, so
 dotfile globs through symlinks already on disk are not resolved.
 
+Round 10 (PR #30 review comment 6479157210, reviewed at `c50cc14`) fixed the four P2 items and the three P3
+`$USER_ROLE`/`$EXPECTED_ROLE`/`$CURRENT_PWD` false-blocks. P2-1: `$SUPABASE_SERVICE_ROLE_KEY` blocks in the bare,
+`${...}`, and `${...:-x}` forms. P2-2: interpreter reads of secret env values (`node -e`/`-p`, `python3`
+`os.environ`, `ruby ENV`, `perl $ENV{}`, `bun`, `deno`) block, as do whole-environment prints (`process.env`,
+`os.environ`). P2-3: `export` (bare and piped), `declare -px`, `typeset -px`, `env -0`, `env --null`, and
+`printenv -0` block like `env`/`printenv`. P2-4: cwd and `../` dot-globs (`.??*`, `.[a-z]*`, `.?*`, `./.??*`,
+`../.*`, `../.??*`, `../..*`, `../*`, `$(ls -d ../*)`, including after `cd ~ &&`) ask; `~/.??*`, `~/.[a-z]*`,
+`~/.*/`, and `/.??*` block. `$SIGNING_KEY` and `$SESSION_KEY` now block. The corpus gains g199–g211. Each
+mechanism was checked by a 14-mutation harness in a scratch copy (all 14 caught; baseline 109/109). A 99-command
+benign sweep against HEAD `c50cc14` (from `git archive`) changes no verdict. Disclosed, not fixed (P3, non-blocking,
+owner naming decision): secret-looking names `$DATABASE_URL`, `$POSTGRES_URL`, `$REDIS_URL`, `$OPENAI_KEY`,
+`$STRIPE_KEY`, `$SENDGRID_KEY`, `$ENCRYPTION_KEY`, `$GITHUB_PAT`, `$DB_PASSPHRASE`, `$DB_PASS_BACKUP`,
+`$SUPABASE_JWT`, and `$JWT_KEY` still allow; indirect prints (`x=$(printenv DB_PASS)`, `${!v}`,
+`compgen -e | xargs printenv`) and dump surfaces (`/proc/self/environ`, `docker compose config`, `docker inspect`,
+`kubectl get secret -o yaml`, `gh auth token`, `npm config get ..._authToken`) still allow;
+`supabase db reset` and `docker system prune -af` remain in the R10 fail-open class.
+
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 248 | 98.4% | 97.1% | 100.0% | **0.0%** |
+| guard | 261 | 98.5% | 97.3% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's

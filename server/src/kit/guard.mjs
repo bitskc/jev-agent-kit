@@ -62,7 +62,16 @@ const SAFE_PATH_RES = [
 const AMBIGUOUS_SECRET_TOKENS = ["secret", "secrets", "token", "password", "passwd", "credential",
   "keyring", "keystore", "htpasswd", "vault", "apikey", "api_key"];
 const SECRET_VAR_RE = /\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?/g;
-const SECRET_VAR_NAME_RE = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL)|_(PASS|PWD|ROLE|CREDS?)$/i;
+const SECRET_VAR_NAME_RE = new RegExp([
+  "SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL",
+  "_(PASS|CREDS?)$",
+  // a service/admin/root role (SUPABASE_SERVICE_ROLE, DB_ADMIN_ROLE), not a bare role label (USER_ROLE)
+  "(^|_)(SERVICE|ADMIN|ROOT|SUPER|ELEVATED|PRIV)(?:_[A-Z0-9]+)*_ROLE$",
+  // a key whose stem names a credential (SUPABASE_SERVICE_ROLE_KEY, SIGNING_KEY), not CACHE_KEY or AUTHOR_KEY
+  "(^|_)(ROLE|SECRET|PRIVATE|SIGNING|ENCRYPT|AUTH|SESSION|MASTER|ACCESS|SERVICE|CREDENTIAL)(?:_[A-Z0-9]+)*_KEY$",
+  // a database/service password variable (MYSQL_PWD), not CURRENT_PWD; bare $PWD/$OLDPWD never match
+  "(^|_)(MYSQL|DB|DATABASE|POSTGRES|PG|LDAP|SMTP|REDIS|MONGO|ADMIN|ROOT|SERVICE)_PWD$",
+].join("|"), "i");
 export const R1_SUGGESTION =
   "Do not print a secret. Load it into the environment in the same shell as the command that needs it " +
   "(`set -a; . ./.env; set +a`) and confirm it is present without revealing it " +
@@ -127,6 +136,57 @@ function interpScriptSecretRead(prog, args, home) {
   return null;
 }
 
+// Env reads inside an interpreter payload (`node -e`, `python3 -c`, `ruby -e`, `perl -e`, `php -r`, `pwsh -c`):
+// a named read of a secret-named variable, or a whole-environment reference (`process.env`, `os.environ`, ...).
+// Lexical only: a name built at runtime (`process.env[k]`) isn't resolved.
+const INTERP_ENV_RULES = {
+  node: {
+    named: [/\bprocess\.env\.([A-Za-z_]\w*)/g, /\bprocess\.env\[\s*(['"`])([^'"`]*)\1\s*\]/g, /\bDeno\.env\.get\(\s*(['"`])([^'"`]*)\1\s*\)/g],
+    whole: [/\bprocess\.env(?![\w.[])/, /\bDeno\.env\.toObject\b/],
+  },
+  python: {
+    named: [/\bos\.environ\[\s*(['"])([^'"]*)\1\s*\]/g, /\bos\.(?:environ\.get|getenv)\(\s*(['"])([^'"]*)\1/g],
+    whole: [/\bos\.environ\b(?!\s*(?:\[|\.get\s*\())/],
+  },
+  ruby: {
+    named: [/(?<![\w$@])ENV\[\s*(['"])([^'"]*)\1\s*\]/g, /(?<![\w$@])ENV\.fetch\(\s*(['"])([^'"]*)\1/g],
+    whole: [/(?<![\w$@])ENV\b(?!\s*(?:\[|\.(?:fetch|key\?|has_key\?|include\?)\b))/],
+  },
+  perl: { named: [/\$ENV\{\s*(['"]?)([A-Za-z_]\w*)\1\s*\}/g], whole: [/%ENV\b/] },
+  php: {
+    named: [/\bgetenv\(\s*(['"])([^'"]*)\1/g, /\$_(?:ENV|SERVER)\[\s*(['"])([^'"]*)\1\s*\]/g],
+    whole: [/\$_(?:ENV|SERVER)\b(?!\s*\[)/, /\bgetenv\(\s*\)/],
+  },
+  pwsh: { named: [/\$env:([A-Za-z_]\w*)/gi], whole: [/\b(?:Get-ChildItem|gci|dir|ls)\s+env:/i] },
+};
+const INTERP_ENV_BASE = { node: "node", nodejs: "node", bun: "node", deno: "node", python: "python", ruby: "ruby",
+  perl: "perl", php: "php", pwsh: "pwsh", powershell: "pwsh" };
+/** The env-read reason for an interpreter invocation's payload, or null. Named reads are checked first so a
+ *  secret-named read reports its variable; any whole-environment reference is the dump case. */
+function interpEnvLeak(prog, args) {
+  const payload = interpScriptText(prog, args);
+  if (payload === null) return null;
+  const rules = INTERP_ENV_RULES[INTERP_ENV_BASE[prog.replace(/\d+(\.\d+)*$/, "")]];
+  if (!rules) return null;
+  for (const re of rules.named) {
+    for (const m of payload.matchAll(re)) {
+      const name = m[m.length - 1];
+      if (SECRET_VAR_NAME_RE.test(name)) return `reads $${name} from the environment`;
+    }
+  }
+  return rules.whole.some((re) => re.test(payload)) ? "dumps every environment variable, secrets included" : null;
+}
+// `env` with no command operand prints the environment; `VAR=value` operands only set variables.
+function envPrintsEnvironment(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-u" || a === "--unset" || a === "-C" || a === "--chdir") { i++; continue; }
+    if (a.startsWith("-") || a.includes("=")) continue;
+    return false;
+  }
+  return true;
+}
+
 function ruleSecret(ctx) {
   const { tool, home } = ctx;
   if (tool === "Read" || tool === "NotebookRead") {
@@ -160,18 +220,26 @@ function ruleSecret(ctx) {
     }
     const interpHit = interpScriptSecretRead(prog, args, home);
     if (interpHit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` runs an inline script that reads a secret store (${interpHit})`, suggestion: R1_SUGGESTION };
+    const interpEnv = interpEnvLeak(prog, args);
+    if (interpEnv) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` runs an inline script that ${interpEnv}`, suggestion: R1_SUGGESTION };
     if (prog === "echo" || prog === "printf") {
       for (const m of seg.matchAll(SECRET_VAR_RE)) {
         if (SECRET_VAR_NAME_RE.test(m[1])) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` would print $${m[1]}, whose name says it holds a secret`, suggestion: R1_SUGGESTION };
       }
     }
     if (prog === "printenv") {
-      if (!args.length) return { rule: "R1-secret-exposure", severity: "block", reason: "bare `printenv` dumps every variable, secrets included", suggestion: R1_SUGGESTION };
-      for (const a of args) if (SECRET_VAR_NAME_RE.test(a)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`printenv ${a}\` would print a secret value`, suggestion: R1_SUGGESTION };
+      const names = args.filter((a) => !a.startsWith("-"));
+      if (!names.length) return { rule: "R1-secret-exposure", severity: "block", reason: "bare `printenv` dumps every variable, secrets included", suggestion: R1_SUGGESTION };
+      for (const a of names) if (SECRET_VAR_NAME_RE.test(a)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`printenv ${a}\` would print a secret value`, suggestion: R1_SUGGESTION };
     }
-    if ((prog === "env" || prog === "set") && !args.length) return { rule: "R1-secret-exposure", severity: "block", reason: `bare \`${prog}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
-    if (prog === "export" && args.length === 1 && args[0] === "-p") return { rule: "R1-secret-exposure", severity: "block", reason: "`export -p` dumps every exported variable, secrets included", suggestion: R1_SUGGESTION };
-    if (prog === "declare" && args.length && (args[0] === "-x" || args[0] === "-p")) return { rule: "R1-secret-exposure", severity: "block", reason: `\`declare ${args[0]}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
+    if ((prog === "env" && envPrintsEnvironment(args)) || (prog === "set" && !args.length)) return { rule: "R1-secret-exposure", severity: "block", reason: `bare \`${prog}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
+    if (prog === "export" && args.every((a) => a.startsWith("-")) && (!args.length || args.includes("-p"))) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${args.length ? "export -p" : "export"}\` dumps every exported variable, secrets included`, suggestion: R1_SUGGESTION };
+    if (prog === "declare" || prog === "typeset") {
+      const flags = args.filter((a) => /^[-+][A-Za-z]+$/.test(a)).join("");
+      const names = args.filter((a) => !/^[-+]/.test(a)).map((a) => a.split("=")[0]);
+      if (!names.length && /[px]/.test(flags)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog} ${args.join(" ")}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
+      if (flags.includes("p")) for (const n of names) if (SECRET_VAR_NAME_RE.test(n)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog} -p ${n}\` would print a secret value`, suggestion: R1_SUGGESTION };
+    }
     if (["curl", "http", "wget"].includes(prog)) {
       const verbose = args.some((a) => ["-v", "--verbose", "--trace", "--trace-ascii", "-i", "--include"].includes(a));
       if (verbose && /authorization\s*:/i.test(seg)) {
@@ -515,6 +583,11 @@ function linkAliases(segments) {
   return m;
 }
 const trimSlash = (x) => x.replace(/\/+$/, "") || "/";
+// A whole-tree glob as the last path component: `*` or a dot-glob (`.*`, `.??*`, `.?*`, `.[a-z]*`, `.[!.]*`).
+const WHOLE_TREE_GLOB_LEAF_RE = /\/(\*|\.(?:\[[^\]/]*\]|\?|\*)*\*)$/;
+// Cwd-level and parent-level whole-tree globs: `*`, `./*`, `.??*`, `./.??*`, `../*`, `../.??*`, `../../*`, `../..*`.
+const CWD_GLOB_RE = /^(?:\.\/)*(?:\*|\.(?:\[[^\]/]*\]|\?|\*)*\*)$/;
+const UP_GLOB_RE = /^(?:\.\.\/)+(?:\*|\.(?:\[[^\]/]*\]|\.|\?|\*)*\*)$/;
 /** Does `a` lexically resolve to `/`, to `home`, or to a top-level system tree once `.`/`..` segments and duplicate
  *  slashes are collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
  *  `~/projects/../..` both resolve to / or home the same way an unguarded literal does; a literal-string
@@ -525,15 +598,27 @@ function resolvesToRootOrHome(a, home) {
   const p = a.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, homeRoot);
   if (!p.startsWith("/")) return false;
   // `/usr/*` and `/usr/.*` empty the whole tree just as `/usr` does: the trailing whole-tree glob doesn't change the target.
-  const n = trimSlash(normalizePath(p.replace(/\/(\*|\.\*|\.\[!\.\]\*)$/, "") || "/"));
+  const n = trimSlash(normalizePath(p.replace(/\/+$/, "").replace(WHOLE_TREE_GLOB_LEAF_RE, "") || "/"));
   return n === "/" || n === trimSlash(normalizePath(homeRoot)) || SYSTEM_TREE_ROOTS.has(n);
 }
 function wholeTreeTarget(a, home) {
   if (["/", "/*", "~", "~/", "$HOME", "${HOME}", "*", ".", "./", "..", "../", "./*", ".*", "./.*", ".[!.]*", "./.[!.]*"].includes(a)) return a;
+  const t = a.replace(/(?<=.)\/+$/, "");
+  if (CWD_GLOB_RE.test(t) || UP_GLOB_RE.test(t)) return a;
   let p = expand(a, home);
   if (p.endsWith("/*")) p = p.slice(0, -2);
   if (p.replace(/\/+$/, "") === "~") return a;
   if (resolvesToRootOrHome(a, home)) return a;
+  return null;
+}
+// `rm -rf $(ls -d ../*)`: the substitution's output is unknown lexically, but a whole-tree glob inside it
+// expands to the whole tree. Only glob-bearing words count, so `$(find . -name x)` isn't flagged.
+function substWholeTreeGlob(args, home) {
+  if (!args.some((a) => /\$\(|`/.test(a))) return null;
+  for (const a of args) {
+    const w = a.replace(/^[\s$(`"']+|[\s)`"']+$/g, "");
+    if (/[*?[]/.test(w) && wholeTreeTarget(w, home)) return w;
+  }
   return null;
 }
 
@@ -704,6 +789,8 @@ function ruleDestructive(ctx) {
         if (a.startsWith("-")) continue;
         if (wholeTreeTarget(a, ctx.home)) return m(`\`rm -rf ${a}\` would delete a whole tree`);
       }
+      const subst = substWholeTreeGlob(args, ctx.home);
+      if (subst) return m(`\`rm -rf\` on a command substitution that expands \`${subst}\` would delete a whole tree`);
     }
     // Item-feeding indirections (xargs/parallel) and find -exec/-execdir/-ok/-okdir: the invoked argv is
     // what resolveCommand() returned above (already the effective [prog,args] for every OTHER check in
