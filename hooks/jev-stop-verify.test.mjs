@@ -13,6 +13,31 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
+
+// The hook carries a copy of the server's outcome rules (it ships standalone). This pins the copy to the source.
+test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => {
+  const hook = require("./jev-stop-verify.js");
+  const server = await import("../server/src/kit/verify.mjs");
+  const cases = [
+    ["npx mocha | tail -3", "  1 failing\n  11 passing", 0],
+    ["npm test | tail -5", "  12 passing (3s)", 0],
+    ["npm test", "  12 passing (3s)\nnpm ERR! code ELIFECYCLE", 0],
+    ["npm test || true", "Tests:  2 failed, 8 passed, 10 total", 0],
+    ["npx tsc --noEmit", "", 0],
+    ["npx tsc --noEmit", "", 2],
+    ["npx tsc --noEmit || true", "", 0],
+    ["pytest -q | tail -2", "=== 3 passed in 0.2s ===", 0],
+    ["cargo test", "test result: FAILED. 1 passed; 1 failed", 0],
+    ["go test ./...", "--- FAIL: TestX (0.00s)\nFAIL\tpkg\t0.1s", 0],
+    ["npx eslint .", "✖ 3 problems (3 errors, 0 warnings)", 0],
+    ["npm test", "  0 failing\n  12 passing", undefined],
+    ["npm test", "", undefined],
+  ];
+  for (const [command, output, exit] of cases) {
+    assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);
+    assert.equal(hook.checkSummary(output), server.checkSummary(output), `checkSummary ${JSON.stringify(output)}`);
+  }
+});
 const here = path.dirname(new URL(import.meta.url).pathname);
 const stopGate = require("./jev-stop-verify.js");
 const rt = require("./honest/jev-honest-runtime.js");

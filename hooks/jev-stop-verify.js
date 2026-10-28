@@ -121,6 +121,61 @@ const EXEC_PREFIX_RE = /^(?:(?:[A-Za-z_][A-Za-z0-9_]*=\S*|sudo|env|time|nohup)\s
 function executesCheck(unit) {
   return unit.split(/\|(?!\|)/).some((seg) => ANCHORED_CHECK_RE.test(seg.trim().replace(EXEC_PREFIX_RE, '')));
 }
+// Mirror of server/src/kit/verify.mjs outcome rules (checkSummary, runOutcome). Parity is enforced by a test.
+// Failure text a runner prints. Matched before any pass signal and regardless of exit status.
+const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
+const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
+/** An exit status that cannot be trusted: `|| true`, `|| exit 0`, or a pipe whose last stage sets the status. */
+function exitIsMasked(command) {
+  if (/\|\|\s*(?:true|:|exit\s+0)(?![\w-])/.test(command)) return true;
+  return /(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command);
+}
+/** What a runner's own output summary reports: "pass" | "fail" | undefined. */
+function checkSummary(output) {
+  if (typeof output !== 'string' || !output) return undefined;
+  const tail = output.slice(-6000);
+  // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER).
+  if (FAILURE_MARKER.test(tail) || EXIT_MENTION.test(tail)) return 'fail';
+  const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
+  if (nodeTest) return Number(nodeTest[1]) > 0 ? 'fail' : 'pass';
+  const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
+  if (jest) return jest[1] && Number(jest[1]) > 0 ? 'fail' : 'pass';
+  const pytest = /^=+ .*?(?:(\d+) failed|(\d+) error).*?in [\d.]+s/m.exec(tail) ?? /^=+ (\d+) passed.*? in [\d.]+s/m.exec(tail);
+  if (pytest) return /\d+ (?:failed|error)/.test(pytest[0]) ? 'fail' : 'pass';
+  const cargoOrGo = /^test result: (ok|FAILED)\./m.exec(tail) ?? /^(ok|FAIL)\s+\S+\s+[\d.]+s$/m.exec(tail);
+  if (cargoOrGo) return cargoOrGo[1] === 'ok' ? 'pass' : 'fail';
+  const vitest = /^\s*Tests\s{2,}([^\n]*\(\d+\))\s*$/m.exec(tail);
+  if (vitest) return /\d+ failed/.test(vitest[1]) ? 'fail' : 'pass';
+  const bunFail = /^\s*(\d+) fail\s*$/m.exec(tail);
+  if (bunFail && /^\s*\d+ pass\s*$/m.test(tail)) return Number(bunFail[1]) > 0 ? 'fail' : 'pass';
+  const mix = /^(?:\d+ doctests?, )?\d+ tests?, (\d+) failures?/m.exec(tail);
+  if (mix) return Number(mix[1]) > 0 ? 'fail' : 'pass';
+  const dotnet = /^(Passed|Failed)!\s+-\s+Failed:\s+\d+/m.exec(tail);
+  if (dotnet) return dotnet[1] === 'Passed' ? 'pass' : 'fail';
+  const build = /^(?:\[INFO\] )?BUILD (SUCCESSFUL|SUCCESS|FAILED|FAILURE)/m.exec(tail);
+  if (build) return build[1].startsWith('SUCCESS') ? 'pass' : 'fail';
+  const eslint = /^[✖x] \d+ problems? \((\d+) errors?/m.exec(tail);
+  if (eslint) return Number(eslint[1]) > 0 ? 'fail' : 'pass';
+  const mocha = /^\s*(\d+) failing\b/m.exec(tail);
+  if (mocha) return Number(mocha[1]) > 0 ? 'fail' : 'pass';
+  // Check fail signals before the bare "N passing" match: a later lifecycle/build failure in the same
+  // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
+  if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return 'fail';
+  if (/^\s*\d+ passing\b/m.test(tail)) return 'pass';
+  return undefined;
+}
+/**
+ * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says;
+ * a masked exit status is never a pass; an unmasked exit 0 with no failure text passes; anything else is unknown.
+ */
+function runOutcome(command, output, exitCode) {
+  if (typeof exitCode === 'number' && exitCode !== 0) return 'fail';
+  if (checkSummary(output) === 'fail') return 'fail';
+  if (exitIsMasked(command)) return 'unknown';
+  if (checkSummary(output) === 'pass') return 'pass';
+  if (exitCode === 0) return 'pass';
+  return 'unknown';
+}
 function sameCallCheckIsEvidence(command) {
   const bare = stripHeredocBodies(command).replace(/'[^']*'|"[^"]*"/g, '""');
   const units = bare.split(CHAIN_SPLIT_RE).map((u) => u.trim()).filter(Boolean);
@@ -273,7 +328,9 @@ function parseForHonest(lines) {
   }
   const runs = bashCalls.filter((b) => resultsById.has(b.id)).map((b) => {
     const r = resultsById.get(b.id);
-    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall), check: commandRunsCheck(b.command) };
+    const check = commandRunsCheck(b.command);
+    const outcome = check ? runOutcome(b.command, r.text, r.isError ? 1 : 0) : (r.isError ? 'fail' : 'pass');
+    return { command: b.command, isError: r.isError, outcome, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall), check };
   });
   return { edits, runs };
 }
@@ -313,7 +370,8 @@ function evidenceText({ edits, runs }, budget = Infinity) {
   const line = (r) => {
     const cmd = safe(r.command).slice(0, 300);
     const tail = safe(r.output).slice(-300);
-    return `- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`;
+    const label = r.outcome === 'fail' ? 'failed' : r.outcome === 'pass' ? 'ok' : 'unknown (no trustworthy result: no recognised summary, or the exit status is masked; not counted as passing)';
+    return `- \`${cmd}\` -> ${label}${tail ? `, output tail: "${tail}"` : ''}`;
   };
   const afterIdx = runs.map((_, i) => i).filter((i) => !runs[i].stale);
   const staleIdx = runs.map((_, i) => i).filter((i) => runs[i].stale);
@@ -322,7 +380,7 @@ function evidenceText({ edits, runs }, budget = Infinity) {
   const latestByCmd = new Map();
   for (const i of checkIdx) latestByCmd.set(cmdKey(runs[i].command), i);
   const latest = newestFirst(latestByCmd.values());
-  const failing = checkIdx.filter((i) => runs[i].isError);
+  const failing = checkIdx.filter((i) => runs[i].outcome === 'fail');
   const seenVerbs = new Set();
   const perVerb = latest.filter((i) => {
     const v = checkVerb(runs[i].command);
@@ -340,7 +398,7 @@ function evidenceText({ edits, runs }, budget = Infinity) {
   enqueue(newestFirst(staleIdx));
   const checkLine = !checkIdx.length
     ? 'No check command ran after the edits.'
-    : `Check commands after the edits, latest run of each: ${latest.length} (${latest.filter((i) => !runs[i].isError).length} ok, ${latest.filter((i) => runs[i].isError).length} failed).`;
+    : `Check commands after the edits, latest run of each: ${latest.length} (${latest.filter((i) => runs[i].outcome === 'pass').length} ok, ${latest.filter((i) => runs[i].outcome === 'fail').length} failed, ${latest.filter((i) => runs[i].outcome === 'unknown').length} unknown).`;
   // Chronological; a run of dropped indices collapses into one omission line.
   const section = (idxs, keep) => {
     const out = [];
@@ -388,7 +446,8 @@ function classifyItemText(claim, nonce, ev) {
 function claimField(raw) {
   const claim = redact(raw);
   if (JSON.stringify(claim).length <= CLAIM_FIELD_MAX) return JSON.stringify(claim);
-  let cut = claim;
+  // The JSON form is never shorter than the raw text, so no cut longer than CLAIM_FIELD_MAX can fit: start there, not at the full claim (O(L²) on long finals).
+  let cut = claim.length > CLAIM_FIELD_MAX ? claim.slice(0, CLAIM_FIELD_MAX) : claim;
   while (JSON.stringify(`${cut} […]`).length > CLAIM_FIELD_MAX) cut = cut.slice(0, -1);
   const ends = [...cut.matchAll(/[.!?](?=\s)/g)];
   if (ends.length) {
@@ -769,4 +828,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS };
+module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS, runOutcome, checkSummary };

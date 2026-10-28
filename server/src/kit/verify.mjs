@@ -14,10 +14,33 @@ const MESSAGE_CAP = 2000;
 
 export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
 
+// Failure text a runner prints. Matched before any pass signal and regardless of exit status: `npx mocha | tail -3`
+// exits 0 while printing "1 failing". "0 failing" does not match (the count must be 1 or more).
+const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
+const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
+/** An exit status that cannot be trusted: `|| true`, `|| exit 0`, or a pipe whose last stage sets the status. */
+export function exitIsMasked(command) {
+  if (/\|\|\s*(?:true|:|exit\s+0)(?![\w-])/.test(command)) return true;
+  return /(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command);
+}
+/**
+ * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says;
+ * a masked exit status is never a pass; an unmasked exit 0 with no failure text passes; anything else is unknown.
+ */
+export function runOutcome(command, output, exitCode) {
+  if (typeof exitCode === "number" && exitCode !== 0) return "fail";
+  if (checkSummary(output) === "fail") return "fail";
+  if (exitIsMasked(command)) return "unknown";
+  if (checkSummary(output) === "pass") return "pass";
+  if (exitCode === 0) return "pass";
+  return "unknown";
+}
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 export function checkSummary(output) {
   if (typeof output !== "string" || !output) return undefined;
   const tail = output.slice(-6000);
+  // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER).
+  if (FAILURE_MARKER.test(tail) || EXIT_MENTION.test(tail)) return "fail";
   const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
   if (nodeTest) return Number(nodeTest[1]) > 0 ? "fail" : "pass";
   const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
@@ -52,7 +75,10 @@ export function classifyToolResult(tool, input = {}, failed = false, output = ""
   if (MUTATING_TOOLS.has(tool)) return "mutation";
   const command = typeof input.command === "string" ? input.command : "";
   const summary = checkSummary(output);
-  if (tool === "Bash" && CHECK_COMMAND.test(command)) return failed || summary === "fail" ? "check-fail" : "check-pass";
+  if (tool === "Bash" && CHECK_COMMAND.test(command)) {
+    const outcome = runOutcome(command, output, failed ? 1 : 0);
+    return outcome === "fail" ? "check-fail" : outcome === "pass" ? "check-pass" : "unknown";
+  }
   if (summary) return summary === "fail" || failed ? "check-fail" : "check-pass";
   return "unknown";
 }
@@ -161,7 +187,7 @@ export function nudge(verdict, evidence) {
   const failed = freshChecks(evidence).filter((c) => !c.passed);
   const last = failed.at(-1);
   const next = !last ? "Run the project's tests, build, or lint (whatever exists) on what you changed."
-    : last.unproven ? `The last check (\`${last.call}\`) could not be proven: no recognised pass/fail summary and no exit_code. Send exit_code or paste the runner's summary lines.`
+    : last.unproven ? `The last check (\`${last.call}\`) could not be proven: no trustworthy pass/fail result (no recognised summary and no exit_code, or its exit status is masked). Send exit_code or paste the runner's summary lines.`
     : `The last check that ran failed: ${last.call}. Fix that first.`;
   return `${verdict.reasons.join("; ")}. ${next} Then report the actual result. If no check exists or can run, say so plainly instead of presenting the work as done.`;
 }
@@ -194,13 +220,11 @@ export async function verifyDone(input, deps = {}) {
       const command = c.command || "check";
       const call = redact(command).slice(0, 200);
       if (typeof c.passed === "boolean") return { call, passed: c.passed };
-      const isCheck = CHECK_COMMAND.test(command);
-      const summary = checkSummary(c.output || "");
-      if (typeof c.exit_code === "number") return isCheck ? { call, passed: c.exit_code === 0 && summary !== "fail" } : null;
-      if (summary) return isCheck ? { call, passed: summary === "pass" } : null;
-      if (!isCheck) return null;
-      // A check command with no recognised runner summary and no exit code is unproven, never a pass.
-      notes.push(`Check '${call}' had no recognised pass/fail summary and no exit_code, so it is not counted as passing. Send exit_code or paste the runner's summary lines.`);
+      if (!CHECK_COMMAND.test(command)) return null;
+      const outcome = runOutcome(command, c.output || "", typeof c.exit_code === "number" ? c.exit_code : undefined);
+      if (outcome !== "unknown") return { call, passed: outcome === "pass" };
+      // No trustworthy result (no recognised summary and no exit_code, or a masked exit status): never a pass.
+      notes.push(`Check '${call}' has no trustworthy pass/fail result (no recognised summary and no exit_code, or its exit status is masked by || true or a pipe). Send exit_code or paste the runner's summary lines.`);
       return { call, passed: false, unproven: true };
     }).filter(Boolean);
     // supplied checks are assumed to have run after the supplied changes

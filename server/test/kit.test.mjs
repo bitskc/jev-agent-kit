@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { sizeDispatch } from "../src/kit/tier.mjs";
-import { verifyDone, checkSummary } from "../src/kit/verify.mjs";
+import { verifyDone, checkSummary, runOutcome } from "../src/kit/verify.mjs";
 import { resolveUpstream, askUpstream, GATEWAY_BASE, TYPESAFE_BASE } from "../src/kit/jev.mjs";
 
 const noJev = { ask: null, jevAvailable: false };
@@ -141,6 +141,32 @@ test("checkSummary: a fail signal after an early 'passing' line still reports fa
   assert.equal(checkSummary("12 passing (3s)\nnpm ERR! code ELIFECYCLE\nnpm ERR! Test failed."), "fail");
   // a combined build+test command: tests passed, the build step after them did not.
   assert.equal(checkSummary("5 passing (1s)\nsrc/foo.ts(10,5): error TS2345: argument of type"), "fail");
+});
+test("runOutcome: failure text beats a clean exit status through a pipe (the masked-failure regression)", () => {
+  // `npx mocha | tail -3` exits 0 while the runner printed "1 failing".
+  assert.equal(runOutcome("npx mocha | tail -3", "  1 failing\n  11 passing", 0), "fail");
+  // Other runners' failure text behind a masked exit 0 must also be a fail (FAILURE_MARKER is not mocha-only).
+  assert.equal(runOutcome("go test ./... | tail -3", "--- FAIL: TestAdd (0.00s)\nFAIL\texample/pkg\t0.01s", 0), "fail");
+  assert.equal(runOutcome("python -m unittest | tail -3", "Ran 3 tests\nFAILED (failures=1)", 0), "fail");
+  assert.equal(runOutcome("npx jest | tail -3", "Tests:       1 failed, 4 passed, 5 total", 0), "fail");
+  assert.equal(checkSummary("  0 failing\n  12 passing (3s)"), "pass");
+});
+test("runOutcome: a masked exit status never counts as a pass", () => {
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test || true", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 1), "fail");
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+});
+test("runOutcome: unmasked exit 0 passes with no output; nonzero fails; masked or absent status is unknown", () => {
+  assert.equal(runOutcome("npx tsc --noEmit", "", 0), "pass");
+  assert.equal(runOutcome("npx tsc --noEmit", "", 2), "fail");
+  assert.equal(runOutcome("npx tsc --noEmit || true", "", 0), "unknown");
+  assert.equal(runOutcome("npx tsc --noEmit", "", undefined), "unknown");
+});
+test("verify_done: a failing run hidden behind a pipe is a fail, not an unproven check", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx mocha | tail -3", output: "  1 failing", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.ok(r.evidence.fresh_checks.some((c) => c.passed === false && !c.unproven));
 });
 test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
   const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },
