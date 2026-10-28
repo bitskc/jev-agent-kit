@@ -35,12 +35,16 @@ function setBaseEnv({ gate, token = "test-token", timeout = "3" } = {}) {
 }
 
 // ── stub fetchImpl: honours AbortSignal like a real fetch; `responder(toolName, args)` returns the tool's
-// JSON result, or null to simulate a server error (504) ──────────────────────────────────────────────
+// JSON result, or null to simulate a server error (504). `calls` holds each RPC's params (tool name +
+// arguments); `requests` additionally holds the raw transport details (url, headers, redirect) so tests can
+// assert mcpCall's own request construction, not just its JSON-RPC payload. ────────────────────────────
 function stubFetch(responder, { hang = false } = {}) {
   const calls = [];
+  const requests = [];
   const fetchImpl = (url, opts) => {
     const rpc = JSON.parse(opts.body);
     calls.push(rpc.params);
+    requests.push({ url, headers: opts.headers, redirect: opts.redirect, method: opts.method });
     return new Promise((resolve, reject) => {
       if (opts.signal) opts.signal.addEventListener("abort", () => reject(new Error("The operation was aborted")));
       if (hang) return; // never resolves on its own; only the abort listener above settles it
@@ -50,7 +54,7 @@ function stubFetch(responder, { hang = false } = {}) {
       });
     });
   };
-  return { fetchImpl, calls };
+  return { fetchImpl, calls, requests };
 }
 
 // ── fixture builders: Claude Code transcript shape (validated against real sessions during the e2e eval) ──
@@ -110,6 +114,31 @@ test("verify gate: an honest disclosure is allowed through once the server itsel
   const transcript = writeTranscript(editedOneFile());
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Edited the file. Not run or tested, as you asked." }, { fetchImpl });
   assert.equal(out, null);
+});
+
+test("mcpCall request construction: correct URL, headers, and redirect:'error' (the security-relevant transport details)", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, requests } = stubFetch(() => ({ verified: true, verdict: "verified", action: "allow", reason: "a check passed" }));
+  const transcript = writeTranscript(editedOneFile());
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, process.env.JEV_MCP_URL);
+  assert.equal(requests[0].method, "POST");
+  assert.equal(requests[0].headers.authorization, "Bearer test-token");
+  assert.equal(requests[0].headers["content-type"], "application/json");
+  assert.equal(requests[0].headers.accept, "application/json, text/event-stream");
+  assert.equal(requests[0].redirect, "error"); // never follow a redirect with the bearer token attached
+});
+
+test("timeout cap: a JEV_GUARD_TIMEOUT larger than 3s is still capped near 3s, not honoured", async () => {
+  fresh(); setBaseEnv({ gate: "verify", timeout: "30" }); // asks for 30s; the hard cap must still apply
+  const { fetchImpl } = stubFetch(() => {}, { hang: true });
+  const transcript = writeTranscript(editedOneFile());
+  const t0 = Date.now();
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+  const elapsed = Date.now() - t0;
+  assert.equal(out, null); // fail open
+  assert.ok(elapsed < 4000, `expected the hard 3s cap to apply despite JEV_GUARD_TIMEOUT=30, took ${elapsed}ms`);
 });
 
 test("loop guard: stop_hook_active never blocks and never calls the stub", async () => {
@@ -266,4 +295,73 @@ test("parseForHonest: scoped to tool calls since the LAST user prompt, not the w
   assert.deepEqual(ev.edits, ["new.js"]); // old.js, from before the last prompt, is excluded
   assert.equal(ev.runs.length, 1);
   assert.equal(ev.runs[0].command, "npm test");
+});
+
+test("splitClaims: lines inside a fenced code block are never claim candidates", () => {
+  const msg = "Here's what I changed:\n```js\nfunction foo(a, b) {\n  // handles a.b. c. patterns\n  return a.trim() + b.trim();\n}\n```\nThis fixes the bug. All done.";
+  const claims = stopGate.splitClaims(msg);
+  assert.ok(!claims.some((c) => c.includes("function foo")));
+  assert.ok(!claims.some((c) => c.includes("handles a.b")));
+  assert.ok(!claims.some((c) => c.includes("return a.trim")));
+  assert.ok(claims.some((c) => c.includes("This fixes the bug")));
+});
+
+test("parseForVerify: a check batched in the SAME assistant turn as the edit still counts (regression: same transcript-line index must not compare as 'not after')", () => {
+  const lines = [
+    userPrompt("Fix it."),
+    { type: "assistant", message: { role: "assistant", content: [
+      { type: "tool_use", id: "t1", name: "Edit", input: { file_path: "x.js" } },
+      { type: "tool_use", id: "t2", name: "Bash", input: { command: "npm test" } },
+    ] } },
+    toolResult("t1", "ok"),
+    toolResult("t2", "3 passed, 0 failed"),
+  ];
+  const vp = stopGate.parseForVerify(lines);
+  assert.equal(vp.fileChanges, 1);
+  assert.equal(vp.checks.length, 1); // same-turn check must count
+  assert.match(vp.checks[0].output, /3 passed/);
+});
+
+test("parseForVerify: isSidechain lines (a dispatched subagent's own tool calls) never count toward the main turn's evidence", () => {
+  const lines = [
+    userPrompt("Fix it."),
+    { ...assistantToolUse("s1", "Edit", { file_path: "sub.js" }), isSidechain: true },
+    { ...toolResult("s1", "ok"), isSidechain: true },
+  ];
+  const vp = stopGate.parseForVerify(lines);
+  assert.equal(vp.fileChanges, 0);
+});
+
+test("isRealUserPrompt / parseForHonest: a mid-session slash-command synthetic line is not mistaken for the last real prompt", () => {
+  const lines = [
+    userPrompt("Fix it."),
+    assistantToolUse("t1", "Edit", { file_path: "x.js" }), toolResult("t1", "ok"),
+    assistantToolUse("t2", "Bash", { command: "npm test" }), toolResult("t2", "3 passed"),
+    userPrompt("<command-name>/honest-jev</command-name>\n<command-message>honest-jev strict</command-message>"),
+  ];
+  assert.equal(stopGate.isRealUserPrompt(lines[4]), false);
+  const ev = stopGate.parseForHonest(lines);
+  assert.deepEqual(ev.edits, ["x.js"]); // the real edit, not reset to empty by the synthetic command line
+  assert.equal(ev.runs.length, 1);
+});
+
+test("parseForVerify/parseForHonest: a null element in a content array is skipped, not crashed on", () => {
+  const lines = [
+    userPrompt("Fix it."),
+    { type: "assistant", message: { role: "assistant", content: [null, { type: "tool_use", id: "t1", name: "Edit", input: { file_path: "x.js" } }] } },
+    { type: "user", message: { role: "user", content: [null, { type: "tool_result", tool_use_id: "t1", content: "ok", is_error: false }] } },
+  ];
+  assert.doesNotThrow(() => stopGate.parseForVerify(lines));
+  assert.doesNotThrow(() => stopGate.parseForHonest(lines));
+  assert.equal(stopGate.parseForVerify(lines).fileChanges, 1); // the real Edit entry beside the null still counts
+});
+
+test("decide(): never throws past its own try/catch safety net even on an unexpected internal error", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  // A transcript_path that is a directory, not a file: fs.readFileSync throws EISDIR, a shape the inline
+  // fs.existsSync guard doesn't rule out (the directory does exist) — exercises decide()'s outer try/catch
+  // rather than the dedicated "no transcript" branch.
+  const dirAsTranscript = fs.mkdtempSync(path.join(os.tmpdir(), "not-a-file-"));
+  const out = await stopGate.decide({ transcript_path: dirAsTranscript, last_assistant_message: "Fixed, all tests pass." }, {});
+  assert.equal(out, null);
 });

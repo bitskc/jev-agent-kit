@@ -36,9 +36,13 @@ const path = require('path');
 const rt = require('./honest/jev-honest-runtime.js');
 
 // Hard cap: 3s per MCP call, regardless of JEV_GUARD_TIMEOUT (which may still set something *lower*, e.g.
-// for a CI pipeline that wants to fail open even faster).
+// for a CI pipeline that wants to fail open even faster). A malformed JEV_GUARD_TIMEOUT (unset, empty, or
+// not a number) falls back to the 3s default rather than NaN, which would otherwise make every call abort
+// near-instantly and silently disable the gate.
 function timeoutMs() {
-  return Math.min(Number(process.env.JEV_GUARD_TIMEOUT || 3) * 1000, 3000);
+  const raw = Number(process.env.JEV_GUARD_TIMEOUT);
+  const seconds = Number.isFinite(raw) && raw > 0 ? raw : 3;
+  return Math.min(seconds * 1000, 3000);
 }
 
 function note(msg) {
@@ -57,10 +61,16 @@ function resultTextOf(content) {
   return content.map((c) => (typeof c === 'string' ? c : c && typeof c.text === 'string' ? c.text : '')).join('\n');
 }
 // Port of server/src/kit/verify.mjs's own isUserPrompt convention (not imported: the server is a separate
-// Cloudflare Worker package with its own deps; a hook here stays zero-dependency Node).
+// Cloudflare Worker package with its own deps; a hook here stays zero-dependency Node). COMMAND_LINE
+// matches the synthetic <command-name>/<command-message>/<command-args>/<local-command-stdout>/
+// <local-command-stderr> lines Claude Code injects whenever a slash command runs (including the plugin's
+// own /jev-agent-kit:honest-jev) — without this filter, a mid-session slash command would be misread as
+// the "last real prompt" and reset the honest-gate's evidence window past real, nearby tool calls.
+const COMMAND_LINE = /^<(?:command-name|command-message|command-args|local-command-stdout|local-command-stderr)>/;
 function isRealUserPrompt(d) {
   if (d.type !== 'user' || d.toolUseResult || d.isMeta || d.isSidechain) return false;
-  return textOf(d.message && d.message.content).trim() !== '';
+  const text = textOf(d.message && d.message.content).trim();
+  return text !== '' && !COMMAND_LINE.test(text);
 }
 function readTranscriptLines(transcriptPath) {
   return fs.readFileSync(transcriptPath, 'utf8').split('\n').map((l) => l.trim()).filter(Boolean)
@@ -68,15 +78,20 @@ function readTranscriptLines(transcriptPath) {
 }
 
 // ── verify-gate evidence: file_changes + Bash checks run after the LAST edit, across the whole transcript
-// (matches jev-verify-before-done/SKILL.md's own "a check that ran before your last edit does not count") ──
+// (matches jev-verify-before-done/SKILL.md's own "a check that ran before your last edit does not count").
+// Ordered by a running per-tool-call counter, NOT by transcript-line index: Claude Code commonly batches
+// several tool_use blocks (e.g. Edit then Bash) into one assistant message/line, so two calls in the same
+// turn would otherwise share one line index and a same-turn check could never compare as "after" the edit.
 function parseForVerify(lines) {
   let task = null;
   let finalMessage = null;
   let fileChanges = 0;
-  let lastEditIdx = -1;
+  let lastEditCall = -1;
+  let callSeq = -1;
   const bashCalls = [];
   const resultsById = new Map();
-  lines.forEach((d, idx) => {
+  for (const d of lines) {
+    if (d.isSidechain) continue;
     const content = d.message && d.message.content;
     if (d.type === 'user' && task === null && typeof content !== 'undefined') {
       const t = textOf(content);
@@ -84,20 +99,22 @@ function parseForVerify(lines) {
     }
     if (d.type === 'assistant' && Array.isArray(content)) {
       for (const c of content) {
+        if (!c) continue;
         if (c.type === 'text' && c.text) finalMessage = c.text;
         if (c.type === 'tool_use') {
-          if (c.name === 'Edit' || c.name === 'Write' || c.name === 'NotebookEdit') { fileChanges += 1; lastEditIdx = idx; }
-          if (c.name === 'Bash') bashCalls.push({ idx, id: c.id, command: (c.input && c.input.command) || '' });
+          callSeq += 1;
+          if (c.name === 'Edit' || c.name === 'Write' || c.name === 'NotebookEdit') { fileChanges += 1; lastEditCall = callSeq; }
+          if (c.name === 'Bash') bashCalls.push({ seq: callSeq, id: c.id, command: (c.input && c.input.command) || '' });
         }
       }
     }
     if (d.type === 'user' && Array.isArray(content)) {
       for (const c of content) {
-        if (c.type === 'tool_result' && c.tool_use_id) resultsById.set(c.tool_use_id, { text: resultTextOf(c.content), isError: !!c.is_error });
+        if (c && c.type === 'tool_result' && c.tool_use_id) resultsById.set(c.tool_use_id, { text: resultTextOf(c.content), isError: !!c.is_error });
       }
     }
-  });
-  const checks = bashCalls.filter((b) => b.idx > lastEditIdx).map((b) => {
+  }
+  const checks = bashCalls.filter((b) => b.seq > lastEditCall).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
     return { command: b.command, output: r.text.slice(-4000), exit_code: r.isError === null ? undefined : r.isError ? 1 : 0 };
   });
@@ -118,14 +135,16 @@ function parseForHonest(lines) {
     const content = d.message && d.message.content;
     if (d.type === 'assistant' && Array.isArray(content)) {
       for (const c of content) {
-        if (c.type !== 'tool_use') continue;
+        if (!c || c.type !== 'tool_use') continue;
         pending.set(c.id, c);
-        if (c.name === 'Edit' || c.name === 'Write' || c.name === 'NotebookEdit') edits.push((c.input && c.input.file_path) || '(unknown file)');
+        if (c.name === 'Edit' || c.name === 'Write' || c.name === 'NotebookEdit') {
+          edits.push((c.input && (c.input.file_path || c.input.notebook_path)) || '(unknown file)');
+        }
       }
     }
     if (d.type === 'user' && Array.isArray(content)) {
       for (const c of content) {
-        if (c.type !== 'tool_result' || !c.tool_use_id) continue;
+        if (!c || c.type !== 'tool_result' || !c.tool_use_id) continue;
         const call = pending.get(c.tool_use_id);
         if (call && call.name === 'Bash') {
           runs.push({ command: (call.input && call.input.command) || '', isError: !!c.is_error, output: resultTextOf(c.content).slice(-1500) });
@@ -153,11 +172,16 @@ function evidenceText({ edits, runs }) {
 // or plain) line. Deliberately simple and structural, not content-based: no keyword gating of WHICH lines
 // get judged (every assertable line goes through jev_classify; the classifier decides the bucket, not a
 // regex here) — the only filters are structural: a markdown-heading-only line has no sentence in it, a
-// fragment under 10 chars is too short to be a claim, and a line ending in "?" is a question, not a claim.
+// fragment under 10 chars is too short to be a claim, a line ending in "?" is a question, and anything
+// inside a ``` fenced code block is code/output, never a claim (a diff snippet with a trailing "." in a
+// comment would otherwise get sliced into bogus claim-shaped fragments).
 function splitClaims(message) {
   const claims = [];
+  let inFence = false;
   for (const rawLine of String(message || '').split('\n')) {
     const line = rawLine.trim();
+    if (/^```/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) continue;
     if (!line) continue;
     const bulleted = /^(?:[-*]|\d+[.)])\s+(.*)$/.exec(line);
     const text = bulleted ? bulleted[1] : line;
@@ -236,8 +260,20 @@ async function mcpCall(toolName, args, fetchImpl) {
 
 // Pure decision function: hookInput is the Stop hook's own JSON (session_id, transcript_path,
 // last_assistant_message, stop_hook_active, ...). Returns null (allow) or {decision:"block", reason}.
-// Never calls process.exit — the CLI wrapper below does that.
-async function decide(hookInput, { fetchImpl } = {}) {
+// Never calls process.exit — the CLI wrapper below does that. Never throws — decideInner can (a malformed
+// transcript line can still shape-mismatch past the parsers' own null-guards in a way nothing anticipated),
+// so this wrapper is the hook's actual fail-open guarantee, not just the per-step note()+return-null calls
+// inside decideInner.
+async function decide(hookInput, opts) {
+  try {
+    return await decideInner(hookInput, opts);
+  } catch (e) {
+    note('decide() threw, failing open: ' + (e && e.message));
+    return null;
+  }
+}
+
+async function decideInner(hookInput, { fetchImpl } = {}) {
   const hook = hookInput || {};
   if (hook.stop_hook_active) { note('loop guard: stop_hook_active, allowing'); return null; }
 
