@@ -24,12 +24,11 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Read",
+        "matcher": "Bash|Read|NotebookRead|Grep",
         "hooks": [
           { "type": "command", "command": "$HOME/.local/share/jev-agent-skills/hooks/jev-guard-hook.sh", "timeout": 5 }
         ]
       }
     ]
-  },
-  "statusLine": { "type": "command", "command": "bash \"$HOME/.local/share/jev-agent-skills/hooks/jev-honest-statusline.sh\"" }
+  }
 }

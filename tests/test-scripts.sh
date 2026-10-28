@@ -117,5 +117,10 @@ PYEOF
 )
 ok "$redirect_test" "PASS" "guard: redirect refusal -> ask, never silent allow"
 
+# ── PreToolUse matcher must cover every tool jev_guard_hook.py branches on ──────
+matcher_has_grep() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("Grep" in d["hooks"]["PreToolUse"][0]["matcher"])' "$1"; }
+ok "$(matcher_has_grep "$root/hooks/claude-plugin-hooks.json")" True "hooks/claude-plugin-hooks.json: PreToolUse matcher includes Grep"
+ok "$(matcher_has_grep "$root/config/claude-settings-hook.json")" True "config/claude-settings-hook.json: PreToolUse matcher includes Grep"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
