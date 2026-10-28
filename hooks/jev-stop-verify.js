@@ -73,6 +73,9 @@ const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 // a redirect into the repo, tee, cp/mv/rm, git apply) is checked separately here. Deliberately narrow: a read-only
 // command (npm test, git status, ls > /tmp/x) is not an edit. Targets under /tmp, /var/tmp, /dev or $TMPDIR are scratch.
 const SCRATCH_TARGET_RE = /^(?:\/tmp\/|\/var\/tmp\/|\/dev\/|\$TMPDIR|&)/;
+// /tmp/wt-<name>/ is a git worktree checkout (this repo's convention): project files, never scratch.
+const WORKTREE_PATH_RE = /(?:^|\/)wt-[^/\s]*(?:\/|$)/;
+const isScratchTarget = (t) => SCRATCH_TARGET_RE.test(t) && !WORKTREE_PATH_RE.test(t);
 // Returns one label per project-file write found; empty means the command wrote nothing project-side.
 function bashWriteTargets(command) {
   const labels = [];
@@ -82,17 +85,36 @@ function bashWriteTargets(command) {
     const bare = seg.replace(/'[^']*'|"[^"]*"/g, '""'); // quoted text is data, not a path or an operator
     const label = 'bash: ' + seg.slice(0, 200);
     const redirects = [...bare.matchAll(/(?<![<>\d=-])>>?\s*([^\s;&|)<>]*)/g)].map((m) => m[1]);
-    if (redirects.some((t) => t && !SCRATCH_TARGET_RE.test(t))) { labels.push(label); continue; }
+    if (redirects.some((t) => t && !isScratchTarget(t))) { labels.push(label); continue; }
     if (/\bsed\b[^|]*?\s(?:-[A-Za-z]*i[A-Za-z]*(?:\.\S*)?|--in-place(?:=\S*)?)(?=\s|$)/.test(bare) || /\bperl\b[^|]*?\s-[a-z]*i[a-z]*(?=\s|$)/.test(bare)) { labels.push(label); continue; }
     if (/^git\s+apply\b/.test(bare) && !/\s--(?:check|stat|summary|numstat)\b/.test(bare)) { labels.push(label); continue; }
     const words = bare.replace(/^sudo\s+/, '').split(/\s+/);
     if (/^(?:cp|mv|rm|dd|truncate|patch|install|tee)$/.test(words[0])) {
       const args = words.slice(1).filter((a) => a && !a.startsWith('-'));
-      if (args.some((a) => !SCRATCH_TARGET_RE.test(a))) labels.push(label);
+      if (args.some((a) => !isScratchTarget(a))) labels.push(label);
     }
   }
   return labels;
 }
+
+// Checks and writes inside ONE Bash call. Chain elements (&&, ||, ;, newline, lone &) are units; a pipeline stays one
+// unit, so `npm test 2>&1 | tee test.log` is a check that also writes a log. A check in the same call is evidence for
+// that call's own edit unless a LATER chain element writes after it (`npm test && cp broken.js src/a.js` is not).
+const CHECK_VERB_RE = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bbun\s+test\b|\bnode\s+--test\b|\bdeno\s+test\b|\b(?:npx\s+)?(?:jest|vitest|mocha|pytest|tsc|eslint|ruff|mypy)\b|\bpython3?\s+-m\s+(?:pytest|unittest)\b|\bcargo\s+(?:test|build|check|clippy)\b|\bgo\s+(?:test|build|vet)\b|\bmake\s+(?:test|check|lint|build)\b/;
+const CHAIN_SPLIT_RE = /&&|\|\||[;\n]|(?<![&>\d])&(?![&>])/;
+function sameCallCheckIsEvidence(command) {
+  const bare = String(command || '').replace(/'[^']*'|"[^"]*"/g, '""');
+  const units = bare.split(CHAIN_SPLIT_RE).map((u) => u.trim()).filter(Boolean);
+  const writes = units.map((u) => bashWriteTargets(u).length > 0);
+  return units.some((u, i) => CHECK_VERB_RE.test(u) && !writes.slice(i + 1).some(Boolean));
+}
+// Evidence after the last edit call: any later Bash call, or the last edit call itself when it runs a check after its writes.
+function bashIsEvidenceAfterEdit(b, lastEditCall) {
+  return b.seq > lastEditCall || (b.seq === lastEditCall && sameCallCheckIsEvidence(b.command));
+}
+// jev_classify takes at most 64 items per call (skills/jev-classify). A long message keeps its LAST CLAIM_CAP claims: the
+// closing conclusion is what the gate checks, and a long preamble must not push it out of the window.
+const CLAIM_CAP = 64;
 
 // Hard cap: 3s per MCP call, regardless of JEV_GUARD_TIMEOUT (which may still set something *lower*, e.g.
 // for a CI pipeline that wants to fail open even faster). A malformed JEV_GUARD_TIMEOUT (unset, empty, or
@@ -183,7 +205,7 @@ function parseForVerify(lines) {
       }
     }
   }
-  const checks = bashCalls.filter((b) => b.seq > lastEditCall).map((b) => {
+  const checks = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
     return { command: b.command, output: r.text.slice(-4000), exit_code: r.isError === null ? undefined : r.isError ? 1 : 0 };
   });
@@ -232,7 +254,7 @@ function parseForHonest(lines) {
   }
   const runs = bashCalls.filter((b) => resultsById.has(b.id)).map((b) => {
     const r = resultsById.get(b.id);
-    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: b.seq <= lastEditCall };
+    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall) };
   });
   return { edits, runs };
 }
@@ -363,7 +385,10 @@ function splitClaims(message) {
   // joined, but only when no longer claim qualified. Questions never enter shortCandidates, so a message that is
   // only a question ("Want me to run the tests?") still produces no claims.
   if (!claims.length && shortCandidates.length) claims.push(shortCandidates.join(' ').slice(0, 500));
-  return claims.slice(0, 64); // jev_classify's own item cap
+  if (claims.length > CLAIM_CAP) {
+    process.stderr.write(`jev-stop-verify: ${claims.length - CLAIM_CAP} of ${claims.length} claims were not judged (jev_classify takes ${CLAIM_CAP} per call; the last ${CLAIM_CAP} are judged)\n`);
+  }
+  return claims.slice(-CLAIM_CAP);
 }
 
 // jev_classify needs its `classes` on every call (unlike the Honest Jev level table, which the hooks

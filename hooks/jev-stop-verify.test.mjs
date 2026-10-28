@@ -823,13 +823,101 @@ test("splitClaims: a terse message where every fragment is under the 10-char flo
   assert.deepEqual(stopGate.splitClaims("```js\nfoo()\n```"), []); // pure code fence: still correctly empty
 });
 
-// ── P1-2: the 64-item cap (jev_classify's own limit) is a deliberate, tested truncation, not a silent gap ──
-test("splitClaims: caps at 64 items (jev_classify's own item limit) -- a long message's tail claims are silently truncated past this, a known, tracked limitation (review P1-2), not a silent regression", () => {
-  const msg = Array.from({ length: 80 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
-  const claims = stopGate.splitClaims(msg);
+// ── PR #31 verdict 6478968656 regression P2-3: the 64-item window keeps the LAST claims and says when it drops any ──
+test("splitClaims: a message over 64 claims keeps the LAST 64 (the closing conclusion is always judged) and discloses the drop on stderr", () => {
+  const msg = Array.from({ length: 69 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
+  const writes = [];
+  const realWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
+  let claims;
+  try { claims = stopGate.splitClaims(msg); } finally { process.stderr.write = realWrite; }
   assert.equal(claims.length, 64);
-  assert.ok(claims[0].includes("claim number 0"));
-  assert.ok(claims[63].includes("claim number 63"));
+  assert.ok(claims[0].includes("claim number 5"), "the window starts after the 5 dropped preamble claims");
+  assert.ok(claims[63].includes("claim number 68"), "the final claim is judged");
+  assert.ok(writes.join("").includes("5 of 69 claims were not judged"), "the drop is disclosed on stderr, never silent");
+});
+test("splitClaims: a message within the window drops nothing and writes nothing to stderr", () => {
+  const msg = Array.from({ length: 10 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
+  const writes = [];
+  const realWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { writes.push(String(chunk)); return true; };
+  let claims;
+  try { claims = stopGate.splitClaims(msg); } finally { process.stderr.write = realWrite; }
+  assert.equal(claims.length, 10);
+  assert.deepEqual(writes, []);
+});
+
+// ── PR #31 verdict 6478968656 regressions: P2-1 (a check in the same Bash call is evidence), P2-2 (/tmp/wt-* is project), P2-3 (judged tail) ──
+test("P2-1: a check in the SAME Bash call as the edit reaches kit_verify_done as evidence (`npm test 2>&1 | tee test.log` is not erased by its own tee)", async () => {
+  for (const command of ["npm test 2>&1 | tee test.log", "cp tpl.env .env && npm test"]) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const { fetchImpl, calls } = stubFetch((name, args) => (name === "kit_verify_done"
+      ? (args.checks.length ? ALLOW : { verified: false, verdict: "unverified", action: "block", reason: "no check after the last change", false_claim: true })
+      : { results: [] }));
+    const transcript = writeTranscript([
+      userPrompt("Fix the parser."),
+      assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+      assistantToolUse("t2", "Bash", { command }), toolResult("t2", "All tests pass."),
+    ]);
+    const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass; ready to merge." }, { fetchImpl });
+    const verify = calls.find((c) => c.name === "kit_verify_done");
+    assert.ok(verify, `verify must be called for ${JSON.stringify(command)}`);
+    assert.equal(verify.arguments.checks.length, 1, `same-call check must be evidence: ${JSON.stringify(command)}`);
+    assert.equal(verify.arguments.checks[0].command, command);
+    assert.ok(!out || out.decision !== "block", `must not block on a check that ran: ${JSON.stringify(out)}`);
+  }
+});
+test("P2-1 control: a check BEFORE a later write in the same call, or a write-only call, is not evidence", async () => {
+  for (const command of ["npm test && cp broken.js src/a.js", "echo done > src/x.js"]) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const { fetchImpl, calls } = stubFetch((name, args) => (name === "kit_verify_done" ? ALLOW : { results: [] }));
+    const transcript = writeTranscript([
+      userPrompt("Fix the parser."),
+      assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+      assistantToolUse("t2", "Bash", { command }), toolResult("t2", ""),
+    ]);
+    await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed it; ready to merge." }, { fetchImpl });
+    const verify = calls.find((c) => c.name === "kit_verify_done");
+    assert.ok(verify, `verify must be called for ${JSON.stringify(command)}`);
+    assert.equal(verify.arguments.checks.length, 0, `not evidence: ${JSON.stringify(command)}`);
+  }
+});
+test("P2-2: a Bash write into a /tmp/wt-<name>/ worktree is a project edit; true scratch targets stay exempt", () => {
+  for (const c of ["cat > /tmp/wt-x/src/a.js <<'EOF'\nx\nEOF", "cp a.js /tmp/wt-x/src/b.js", "echo hi > /tmp/wt-x/src/c.js"]) {
+    assert.ok(stopGate.bashWriteTargets(c).length > 0, `expected a write: ${JSON.stringify(c)}`);
+  }
+  for (const c of ["ls > /tmp/x", "echo ok > /tmp/scratch.log", "cp /tmp/in.txt /tmp/out.txt"]) {
+    assert.deepEqual(stopGate.bashWriteTargets(c), [], `expected no write: ${JSON.stringify(c)}`);
+  }
+});
+test("P2-2: a Bash write into /tmp/wt-x/ reaches claim judgement (the false claim is judged, not skipped as scratch)", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(classifyAll("misrepresented"));
+  const transcript = writeTranscript([
+    userPrompt("Fix the parser."),
+    assistantToolUse("t1", "Bash", { command: "cat > /tmp/wt-x/src/a.js <<'EOF'\nfixed\nEOF" }), toolResult("t1", ""),
+  ]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed the bug in src/a.js." }, { fetchImpl });
+  assert.ok(calls.some((c) => c.name === "jev_classify"), "a worktree write must count as an edit");
+  assert.equal(out && out.decision, "block");
+});
+test("P2-3: a long message's FINAL false claim reaches jev_classify behind 69 benign claims, and the honest gate blocks it", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return ALLOW;
+    return { results: args.items.map((item) => ({ id: item.id, classification: /ready to ship/.test(item.text) ? "misrepresented" : "verified", top_probability: 0.9, decision: "auto" })) };
+  });
+  const benign = Array.from({ length: 69 }, (_, i) => `- Step ${i} of the plan is documented in detail.`);
+  const msg = [...benign, "- The build is green and the release is ready to ship."].join("\n");
+  const transcript = writeTranscript([
+    userPrompt("Fix the parser."),
+    assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"),
+    assistantToolUse("t2", "Bash", { command: "npm test" }), toolResult("t2", "All tests pass."),
+  ]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: msg }, { fetchImpl });
+  const judged = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items.map((i) => i.text));
+  assert.ok(judged.some((t) => t.includes("ready to ship")), "the final claim must reach jev_classify");
+  assert.equal(out && out.decision, "block");
 });
 
 // ── PR #31 review (6476843173) regressions: NEW-1..NEW-7 ──
