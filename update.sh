@@ -15,6 +15,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --project) args+=("$1" "$2"); shift;;
   --timer) timer=1;; --check) check=1;; -h|--help) sed -n 2,9p "$0"; exit 0;;
   *) echo "unknown arg $1" >&2; exit 2;; esac; shift; done
+[ "$check" = 1 ] && [ "$timer" = 1 ] && { echo "--check and --timer are mutually exclusive" >&2; exit 2; }
 
 api() { curl -fsSL -H 'accept: application/vnd.github+json' -H 'user-agent: jev-update' "https://api.github.com/repos/$repo/$1"; }
 json_field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d'"$1"')'; }
@@ -34,8 +35,8 @@ stamp="$HOME/.local/share/jev-agent-skills/installed-ref"
 installed="$(cat "$stamp" 2>/dev/null || echo none)"
 if [ "$check" = 1 ]; then
   echo "latest:    $label"; echo "installed: $installed"
-  [ "$installed" = "$sha" ] && echo "up to date" || echo "update available: run jev-update"
-  exit 0
+  if [ "$installed" = "$sha" ]; then echo "up to date"; exit 0; fi
+  echo "update available: run jev-update"; exit 1
 fi
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT

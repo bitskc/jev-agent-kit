@@ -61,7 +61,7 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 # Server-side input caps (server/src/kit/tools.mjs). Anything longer would be rejected by the schema, and a
 # schema rejection must not turn into a silent allow, so oversized input is answered with "ask" before any call.
-CAPS = {"command": 20000, "file_path": 2000, "cwd": 1000, "home": 500, "description": 500}
+CAPS = {"command": 20000, "file_path": 2000, "cwd": 1000, "home": 500, "description": 1000}
 
 
 class ServerRejected(Exception):
@@ -70,12 +70,12 @@ class ServerRejected(Exception):
 
 def call_guard(args):
     token = os.environ.get("JEV_MCP_TOKEN", "").strip()
+    if not URL:
+        fail_open("JEV_MCP_URL is not set")
     if not URL.startswith("https://"):
         fail_open("JEV_MCP_URL must be https:// (got %r)" % URL[:40])
     if not token:
         fail_open("JEV_MCP_TOKEN is not set")
-    if not URL:
-        fail_open("JEV_MCP_URL is not set")
     body = json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "kit_guard_command", "arguments": args},
@@ -129,7 +129,7 @@ def main():
     if tool == "Bash" and ti.get("command"):
         args = {"tool": "Bash", "command": str(ti["command"])}
         if ti.get("description"):
-            args["description"] = str(ti["description"])[:500]
+            args["description"] = str(ti["description"])
     elif tool in ("Read", "NotebookRead") and (ti.get("file_path") or ti.get("notebook_path")):
         args = {"tool": "Read", "file_path": str(ti.get("file_path") or ti.get("notebook_path"))}
     elif tool == "Grep" and ti.get("pattern"):

@@ -60,6 +60,11 @@ ok "$(cat "$U/.local/share/jev-agent-skills/installed-ref")" "000000000000000000
 HOME=$U PATH="$stub:$PATH" REPO_ROOT="$root" JEV_REF=main bash "$root/update.sh" --timer --project "$tmp/a\"b c" >/dev/null 2>&1
 ok "$(grep ExecStart "$U/.config/systemd/user/jev-skill-sync.service")" "ExecStart=$U/.local/bin/jev-update \"--project\" \"$tmp/a\\\"b c\"" "update: --timer quotes args systemd-style"
 ok "$(HOME=$U PATH="$stub:$PATH" REPO_ROOT="$root" JEV_REF=main bash "$root/update.sh" --check 2>&1 | tail -1)" "up to date" "update: --check after install -> up to date"
+HOME=$U PATH="$stub:$PATH" REPO_ROOT="$root" JEV_REF=main bash "$root/update.sh" --check >/dev/null 2>&1; ok "$?" 0 "update: --check up to date -> exit 0"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$U/.local/share/jev-agent-skills/installed-ref"
+HOME=$U PATH="$stub:$PATH" REPO_ROOT="$root" JEV_REF=main bash "$root/update.sh" --check >/dev/null 2>&1; ok "$?" 1 "update: --check update available -> exit 1"
+printf '0000000000000000000000000000000000000000\n' > "$U/.local/share/jev-agent-skills/installed-ref"
+bash "$root/update.sh" --check --timer >/dev/null 2>&1; ok "$?" 2 "update: --check --timer -> rejected"
 
 # ── jev-call exit codes (offline) ───────────────────────────────────────────────
 jc="$root/scripts/jev-call.sh"
