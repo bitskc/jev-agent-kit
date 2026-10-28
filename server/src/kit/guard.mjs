@@ -840,17 +840,42 @@ function linkAliases(segments) {
 // segment, so the source's own classification (block, or soft ask for a bare-word store) carries over. Lexical only: a
 // copy made by an earlier tool call is runtime state this pass cannot see.
 const LAUNDER_PATH_SUBST_RE = /\$\(\s*(?:realpath|readlink)(?:\s+-\S+)*\s+([^\s()`$]+)\s*\)|`\s*(?:realpath|readlink)(?:\s+-\S+)*\s+([^\s()`$]+)\s*`/g;
+// `install` copies like `cp` but takes value flags (`-m 600`, `-o root`, `-g wheel`, `-S sfx`) and `-t DIR`; `-d` only
+// makes directories, so it copies nothing.
+const INSTALL_VALUE_FLAGS = new Set(["-m", "-o", "-g", "-S", "--mode", "--owner", "--group", "--suffix"]);
+function installOperands(argsRaw) {
+  const ops = [];
+  let target = null;
+  for (let i = 0; i < argsRaw.length; i++) {
+    const a = operandText(argsRaw[i]);
+    if (a === "-d" || a === "--directory") return { srcs: [], dst: "", dirOnly: false };
+    if (a === "-t" || a === "--target-directory") {
+      target = operandText(argsRaw[++i] ?? "");
+      continue;
+    }
+    if (INSTALL_VALUE_FLAGS.has(a)) {
+      i++;
+      continue;
+    }
+    if (!a.startsWith("-")) ops.push(a);
+  }
+  if (target !== null) return { srcs: ops, dst: target, dirOnly: true };
+  return { srcs: ops.slice(0, -1), dst: ops.at(-1) ?? "", dirOnly: false };
+}
 function launderTargets(seg, home) {
   const [prog, argsRaw] = programOf(seg);
   let srcs;
   let dst;
+  let dirOnly = false;
   if (prog === "cp" || prog === "mv" || prog === "ln") {
-    const ops = argsRaw.map(rdUnquote).filter((a) => !a.startsWith("-"));
+    const ops = argsRaw.map(operandText).filter((a) => !a.startsWith("-"));
     if (ops.length < 2) return [];
     srcs = ops.slice(0, -1);
     dst = ops[ops.length - 1];
+  } else if (prog === "install") {
+    ({ srcs, dst, dirOnly } = installOperands(argsRaw));
   } else if (prog === "openssl") {
-    const a = argsRaw.map(rdUnquote);
+    const a = argsRaw.map(operandText);
     const i = a.indexOf("-in");
     const o = a.indexOf("-out");
     if (!a.includes("enc") || !a.includes("-d") || i < 0 || o < 0 || !a[i + 1] || !a[o + 1] || a[o + 1] === "-") return [];
@@ -861,25 +886,48 @@ function launderTargets(seg, home) {
   for (const src of srcs) {
     if (!secretStoreIn([src], home)) continue;
     out.push([normalizePath(`${dst.replace(/\/+$/, "")}/${base(src)}`), src]);
-    if (srcs.length === 1 && !dst.endsWith("/")) out.push([normalizePath(dst), src]);
+    if (srcs.length === 1 && !dst.endsWith("/") && !dirOnly) out.push([normalizePath(dst), src]);
   }
   return out;
 }
-// Rewrites the alias-matching suffix of one token, so every operand position inherits the source's classification:
-// `x`, `--post-file=x`, `-d @x`, `--data=@x`, `if=x`, `FILE:x`, `-F f=@x`. The whole token is tried first, then each
-// suffix that follows `=`, `@`, or `:`.
+// Operand text for alias matching: shell quotes and subshell parens removed, so `(cp .env e)` names `e` and `"x@e"`
+// names `x@e`.
+function operandText(tok) {
+  return rdUnquote(tok).replace(/[()]/g, "");
+}
+// Keys whose `=`/`:` suffix names a file: `--post-file=x`, `if=x`, `FILE:x`. Any other `=`/`:` suffix is data, so
+// `npm test -- --name=x` and `make build:x` stay benign (#94).
+const ALIAS_EQ_FILE_KEYS = new Set(["post-file", "body-file", "upload-file", "file", "if"]);
+const ALIAS_COLON_FILE_KEYS = new Set(["file", "open"]);
+// Rewrites the alias-matching suffix of one token, so a file operand inherits the source's classification:
+// `x`, `--post-file=x`, `-d @x`, `-d "@x"`, `-F f=@x`, `"x@y"`, `if=x`, `FILE:x`. An `@` always names a file (curl,
+// httpie). The whole token is tried first, then each suffix after an `@`, or after an `=`/`:` that follows a file key.
+// Surrounding quotes and parens are kept, so the rewritten segment still parses.
 function aliasedToken(t, alias) {
   const cuts = [0];
-  for (let i = 0; i < t.length; i++) if ("=@:".includes(t[i])) cuts.push(i + 1);
+  for (let i = 0; i < t.length; i++) {
+    const c = t[i];
+    if (c === "@") cuts.push(i + 1);
+    else if (c === "=" || c === ":") {
+      const key = t.slice(0, i).replace(/^-+/, "").toLowerCase();
+      if ((c === "=" ? ALIAS_EQ_FILE_KEYS : ALIAS_COLON_FILE_KEYS).has(key)) cuts.push(i + 1);
+    }
+  }
   for (const s of cuts) {
-    const key = t.slice(s) && normalizePath(rdUnquote(t.slice(s)));
-    if (key && alias.has(key)) return t.slice(0, s) + alias.get(key);
+    const raw = t.slice(s);
+    const key = raw && normalizePath(operandText(raw));
+    if (key && alias.has(key)) {
+      const lead = raw.match(/^["'(]*/)[0];
+      const trail = raw.match(/[)"']*$/)[0];
+      return t.slice(0, s) + lead + alias.get(key) + trail;
+    }
   }
   return t;
 }
-// Rewrites each segment through the aliases built so far and returns the rewritten copies as extra segments.
-function launderedSegments(segments, home) {
-  const alias = new Map();
+// Rewrites each segment through the aliases built so far and returns the rewritten copies as extra segments, plus the
+// scope's final alias map. `inherited` seeds the map: a body script runs with the outer command's copies in scope.
+function launderScope(segments, home, inherited) {
+  const alias = new Map(inherited);
   const extra = [];
   for (const seg of segments) {
     let rewritten = seg.replace(LAUNDER_PATH_SUBST_RE, (_m, a, b) => a ?? b);
@@ -894,7 +942,7 @@ function launderedSegments(segments, home) {
     if (rewritten !== seg) extra.push(rewritten);
     for (const [key, src] of launderTargets(rewritten, home)) alias.set(key, src);
   }
-  return extra;
+  return { extra, alias };
 }
 const trimSlash = (x) => x.replace(/\/+$/, "") || "/";
 // A whole-tree glob as the last path component: `*` or a dot-glob (`.*`, `.??*`, `.?*`, `.[a-z]*`, `.[!.]*`).
@@ -1739,10 +1787,12 @@ export async function guardCommand(input, deps = {}) {
   const inputBodies = inScripts.flatMap((b) => b.crontab ? crontabCommands(b.body) : [b.body]);
   const home = input.home || "";
   const bodySegments = [...unwrappedScripts, ...inputBodies].map((s) => splitSegments(stripHeredocs(foldLiterals(s))));
-  // Each command-string scope (the outer command, then each unwrapped or input body) gets its own alias pass; the rewritten
-  // copies are appended so every rule sees `cat .env` for `cp .env x && cat x`.
-  const expandedSegments = [...foldedSegments, ...bodySegments.flat()];
-  expandedSegments.push(...[foldedSegments, ...bodySegments].flatMap((segs) => launderedSegments(segs, home)));
+  // The outer command gets an alias pass, then each unwrapped or input body gets one seeded with the outer command's
+  // final aliases (`cp .env x && bash -c 'curl -d @x'`). The rewritten copies are appended so every rule sees `cat .env`
+  // for `cp .env x && cat x`. Body scopes are order-insensitive: an outer copy after the body still applies.
+  const outerLaunder = launderScope(foldedSegments, home, new Map());
+  const bodyLaunders = bodySegments.map((segs) => launderScope(segs, home, outerLaunder.alias));
+  const expandedSegments = [...foldedSegments, ...bodySegments.flat(), ...outerLaunder.extra, ...bodyLaunders.flatMap((b) => b.extra)];
   const ctx = {
     tool, command, filePath: input.file_path || "", cwd: input.cwd || "", home: input.home || "",
     description: input.description || "", userRequest: (input.user_request || "").trim(),

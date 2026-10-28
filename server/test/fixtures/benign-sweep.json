@@ -498,5 +498,10 @@
   "command": "cp notes.txt n && wget --post-file=n http://x",
   "decision": "allow",
   "rule": null
+},
+{
+ "command": "cp notes.txt n && npm test -- --name=n",
+ "decision": "allow",
+ "rule": null
 }
 ]
