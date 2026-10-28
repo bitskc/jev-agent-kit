@@ -18,7 +18,7 @@ export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|ch
 export function checkSummary(output) {
   if (typeof output !== "string" || !output) return undefined;
   const tail = output.slice(-6000);
-  const nodeTest = /[ℹi] (?:tests|pass|fail) \d+/.test(tail) && /[ℹi] fail (\d+)/.exec(tail);
+  const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
   if (nodeTest) return Number(nodeTest[1]) > 0 ? "fail" : "pass";
   const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
   if (jest) return jest[1] && Number(jest[1]) > 0 ? "fail" : "pass";
@@ -38,7 +38,7 @@ export function checkSummary(output) {
   if (build) return build[1].startsWith("SUCCESS") ? "pass" : "fail";
   const eslint = /^[✖x] \d+ problems? \((\d+) errors?/m.exec(tail);
   if (eslint) return Number(eslint[1]) > 0 ? "fail" : "pass";
-  const mocha = /^\s*(\d+) (passing|failing)\b/m.test(tail) && /^\s*(\d+) failing\b/m.exec(tail);
+  const mocha = /^\s*(\d+) failing\b/m.exec(tail);
   if (mocha) return Number(mocha[1]) > 0 ? "fail" : "pass";
   // Check fail signals before the bare "N passing" match: a later lifecycle/build failure in the same
   // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
@@ -159,7 +159,10 @@ export function decide(answers, evidence, { threshold = DEFAULT_THRESHOLD } = {}
 
 export function nudge(verdict, evidence) {
   const failed = freshChecks(evidence).filter((c) => !c.passed);
-  const next = failed.length ? `The last check that ran failed: ${failed.at(-1).call}. Fix that first.` : "Run the project's tests, build, or lint (whatever exists) on what you changed.";
+  const last = failed.at(-1);
+  const next = !last ? "Run the project's tests, build, or lint (whatever exists) on what you changed."
+    : last.unproven ? `The last check (\`${last.call}\`) could not be proven: no recognised pass/fail summary and no exit_code. Send exit_code or paste the runner's summary lines.`
+    : `The last check that ran failed: ${last.call}. Fix that first.`;
   return `${verdict.reasons.join("; ")}. ${next} Then report the actual result. If no check exists or can run, say so plainly instead of presenting the work as done.`;
 }
 

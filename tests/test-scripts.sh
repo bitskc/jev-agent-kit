@@ -17,6 +17,7 @@ ok "$got_off" "" "statusline: off -> empty"
 ok "$got_soft" $'\033[38;5;130m[HONEST:SOFT]\033[0m' "statusline: soft badge"
 ok "$got_standard" $'\033[38;5;130m[HONEST]\033[0m' "statusline: standard badge"
 ok "$got_strict" $'\033[38;5;130m[HONEST:STRICT]\033[0m' "statusline: strict badge"
+printf 'BOGUS\n' > "$cfg/.jev-honest-active"; ok "$(CLAUDE_CONFIG_DIR=$cfg bash "$sl")" "" "statusline: unrecognised level -> empty, not a bogus badge"
 
 # ── install.sh: both targets, project scope with spaces, hooks + helpers landed ──
 H="$tmp/home"; mkdir -p "$H/.omp/agent" "$H/.claude"

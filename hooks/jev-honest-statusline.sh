@@ -8,5 +8,6 @@ mode=$(head -n1 "$flag" | tr -d '[:space:]')
 case "$mode" in
   off|"") exit 0;;
   standard) printf '\033[38;5;130m[HONEST]\033[0m';;
-  *) printf '\033[38;5;130m[HONEST:%s]\033[0m' "$(printf '%s' "$mode" | tr '[:lower:]' '[:upper:]')";;
+  soft|strict) printf '\033[38;5;130m[HONEST:%s]\033[0m' "$(printf '%s' "$mode" | tr '[:lower:]' '[:upper:]')";;
+  *) exit 0;;
 esac
