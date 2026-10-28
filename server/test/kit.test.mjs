@@ -136,6 +136,12 @@ test("checkSummary: mocha and npm lifecycle failures are recognised", () => {
   assert.equal(checkSummary("  12 passing (90ms)\n"), "pass");
   assert.equal(checkSummary("npm ERR! code ELIFECYCLE\nnpm ERR! errno 1"), "fail");
 });
+test("checkSummary: a fail signal after an early 'passing' line still reports fail (ordering regression)", () => {
+  // mocha's run passed but a later lifecycle step in the same combined command failed.
+  assert.equal(checkSummary("12 passing (3s)\nnpm ERR! code ELIFECYCLE\nnpm ERR! Test failed."), "fail");
+  // a combined build+test command: tests passed, the build step after them did not.
+  assert.equal(checkSummary("5 passing (1s)\nsrc/foo.ts(10,5): error TS2345: argument of type"), "fail");
+});
 test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
   const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },
     outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });

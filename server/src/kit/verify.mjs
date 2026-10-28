@@ -40,8 +40,10 @@ export function checkSummary(output) {
   if (eslint) return Number(eslint[1]) > 0 ? "fail" : "pass";
   const mocha = /^\s*(\d+) (passing|failing)\b/m.test(tail) && /^\s*(\d+) failing\b/m.exec(tail);
   if (mocha) return Number(mocha[1]) > 0 ? "fail" : "pass";
-  if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
+  // Check fail signals before the bare "N passing" match: a later lifecycle/build failure in the same
+  // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
   if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return "fail";
+  if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
   return undefined;
 }
 
