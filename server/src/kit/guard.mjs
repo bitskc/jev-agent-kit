@@ -827,6 +827,57 @@ function linkAliases(segments) {
   LINK_ALIASES.set(segments, m);
   return m;
 }
+// Same-command laundering: `cp .env x && cat x` reads a secret through `x`. A copy, move, link, or `openssl enc -d` whose
+// source is a secret store makes its destination an alias of that source for the rest of the command string, and
+// `$(realpath X)`, `$(readlink [-f] X)`, and backtick forms stand for `X`. Each rewritten segment is checked as an extra
+// segment, so the source's own classification (block, or soft ask for a bare-word store) carries over. Lexical only: a
+// copy made by an earlier tool call is runtime state this pass cannot see.
+const LAUNDER_PATH_SUBST_RE = /\$\(\s*(?:realpath|readlink)(?:\s+-\S+)*\s+([^\s()`$]+)\s*\)|`\s*(?:realpath|readlink)(?:\s+-\S+)*\s+([^\s()`$]+)\s*`/g;
+function launderTargets(seg, home) {
+  const [prog, argsRaw] = programOf(seg);
+  let srcs;
+  let dst;
+  if (prog === "cp" || prog === "mv" || prog === "ln") {
+    const ops = argsRaw.map(rdUnquote).filter((a) => !a.startsWith("-"));
+    if (ops.length < 2) return [];
+    srcs = ops.slice(0, -1);
+    dst = ops[ops.length - 1];
+  } else if (prog === "openssl") {
+    const a = argsRaw.map(rdUnquote);
+    const i = a.indexOf("-in");
+    const o = a.indexOf("-out");
+    if (!a.includes("enc") || !a.includes("-d") || i < 0 || o < 0 || !a[i + 1] || !a[o + 1] || a[o + 1] === "-") return [];
+    srcs = [a[i + 1]];
+    dst = a[o + 1];
+  } else return [];
+  const out = [];
+  for (const src of srcs) {
+    if (!secretStoreIn([src], home)) continue;
+    out.push([normalizePath(`${dst.replace(/\/+$/, "")}/${base(src)}`), src]);
+    if (srcs.length === 1 && !dst.endsWith("/")) out.push([normalizePath(dst), src]);
+  }
+  return out;
+}
+// Rewrites each segment through the aliases built so far and returns the rewritten copies as extra segments.
+function launderedSegments(segments, home) {
+  const alias = new Map();
+  const extra = [];
+  for (const seg of segments) {
+    let rewritten = seg.replace(LAUNDER_PATH_SUBST_RE, (_m, a, b) => a ?? b);
+    if (alias.size) {
+      rewritten = rewritten
+        .split(/(\s+)/)
+        .map((t) => {
+          const key = t.trim() && normalizePath(rdUnquote(t));
+          return key && alias.has(key) ? alias.get(key) : t;
+        })
+        .join("");
+    }
+    if (rewritten !== seg) extra.push(rewritten);
+    for (const [key, src] of launderTargets(rewritten, home)) alias.set(key, src);
+  }
+  return extra;
+}
 const trimSlash = (x) => x.replace(/\/+$/, "") || "/";
 // A whole-tree glob as the last path component: `*` or a dot-glob (`.*`, `.??*`, `.?*`, `.[a-z]*`, `.[!.]*`).
 const WHOLE_TREE_GLOB_LEAF_RE = /\/(\*|\.(?:\[[^\]/]*\]|\?|\*)*\*)$/;
@@ -1668,14 +1719,19 @@ export async function guardCommand(input, deps = {}) {
   // with the 5-field schedule prefix stripped.
   const inScripts = command ? inputScripts(foldedCommand) : [];
   const inputBodies = inScripts.flatMap((b) => b.crontab ? crontabCommands(b.body) : [b.body]);
+  const home = input.home || "";
+  const bodySegments = [...unwrappedScripts, ...inputBodies].map((s) => splitSegments(stripHeredocs(foldLiterals(s))));
+  // Each command-string scope (the outer command, then each unwrapped or input body) gets its own alias pass; the rewritten
+  // copies are appended so every rule sees `cat .env` for `cp .env x && cat x`.
+  const expandedSegments = [...foldedSegments, ...bodySegments.flat()];
+  expandedSegments.push(...[foldedSegments, ...bodySegments].flatMap((segs) => launderedSegments(segs, home)));
   const ctx = {
     tool, command, filePath: input.file_path || "", cwd: input.cwd || "", home: input.home || "",
     description: input.description || "", userRequest: (input.user_request || "").trim(),
     segments: rawSegments,
     unwrappedScripts,
     inputScripts: inScripts,
-    expandedSegments: [...foldedSegments, ...unwrappedScripts.flatMap((s) => splitSegments(stripHeredocs(foldLiterals(s)))),
-      ...inputBodies.flatMap((s) => splitSegments(stripHeredocs(foldLiterals(s))))],
+    expandedSegments,
   };
   const out = {
     tool: "kit_guard_command", decision: "allow", score: 0, reason: "No rule matched: nothing here reaches outside the working tree or prints a secret.",

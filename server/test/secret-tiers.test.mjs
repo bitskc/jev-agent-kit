@@ -171,3 +171,51 @@ test("round 14 P2-C: a recursive or find-fed grep for a secret name asks, and su
   const blocked = await guard(`grep -rn SECRET_X ${fx}/.ssh`, proj, fx);
   assert.equal(blocked.decision, "block");
 });
+
+// Round 14b: a same-command copy, link, decrypt, or realpath/readlink substitution reads a secret through its new name.
+// Each block case runs in the fixture first (proving the leak), then the guard must block it.
+test("round 14b P2: same-command laundering through cp, mv, ln, openssl enc -d, or realpath/readlink is blocked", async () => {
+  const fx = fixtureHome();
+  mkdirSync(join(fx, "d1"));
+  writeFileSync(join(fx, ".ssh", "config"), "HOSTMARK\n");
+  const cases = [
+    { cmd: "cp .env x1 && cat x1", leak: "SECRETVAL1" },
+    { cmd: `cp .env ${fx}/x2 && cat ${fx}/x2`, leak: "SECRETVAL1" },
+    { cmd: "ln -s .env x3 && cat x3", leak: "SECRETVAL1" },
+    { cmd: "mv mv-src.env x4 && cat x4", leak: "SECRETVAL1", setup: () => writeFileSync(join(fx, "mv-src.env"), "DB_PASS=SECRETVAL1\n") },
+    { cmd: "cp .env x7 && cp x7 x8 && cat x8", leak: "SECRETVAL1" },
+    { cmd: `cp ${fx}/.ssh/id_rsa ${fx}/d1/ && cat ${fx}/d1/id_rsa`, leak: "PRIVKEYMARK" },
+    { cmd: `cp ${fx}/.ssh/config ${fx}/d1/ && cat ${fx}/d1/config`, leak: "HOSTMARK" },
+    { cmd: "cat $(realpath .env)", leak: "SECRETVAL1" },
+    { cmd: "cat $(readlink -f .env)", leak: "SECRETVAL1" },
+    { cmd: "cat `realpath .env`", leak: "SECRETVAL1" },
+    {
+      cmd: "openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:pw -in .env.enc -out x6 && cat x6",
+      leak: "SECRETVAL1",
+      setup: () => run("openssl enc -aes-256-cbc -pbkdf2 -pass pass:pw -in .env -out .env.enc", fx),
+    },
+  ];
+  for (const { cmd, leak, setup } of cases) {
+    if (setup) setup();
+    assert.ok(run(cmd, fx).includes(leak), `fixture leak must be real: ${cmd}`);
+    const r = await guard(cmd, fx, fx);
+    assert.equal(r.decision, "block", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+  // Credentials are a soft store: the same copy shape asks, not blocks.
+  const soft = await guard("cp credentials cz && cat cz", fx, fx);
+  assert.equal(soft.decision, "ask");
+  assert.equal(soft.rule, "R1-secret-exposure");
+  // Controls: copies of non-secret sources, unrelated reads, and non-secret encrypted inputs stay allowed.
+  for (const cmd of [
+    "cp package.json x9 && cat x9",
+    "cp .env.example x10 && cat x10",
+    "cp .env x11",
+    "cp .env x12 && cat y12",
+    "cat $(realpath proj)",
+    "openssl enc -d -aes-256-cbc -pbkdf2 -pass pass:pw -in f.enc -out x13 && cat x13",
+  ]) {
+    const r = await guard(cmd, fx, fx);
+    assert.equal(r.decision, "allow", cmd);
+  }
+});

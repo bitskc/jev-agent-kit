@@ -408,3 +408,13 @@
 {"id":"g358","expected":"allow","why":"round 14: names-only quiet form under recursion lists files, prints no values.","input":{"command":"grep -rln SECRET_X ."}}
 {"id":"g359","expected":"allow","why":"round 14: recursive text search with no secret-name pattern is allowed.","input":{"command":"grep -rn TODO ."}}
 {"id":"g360","expected":"block","why":"round 14: a recursive secret-name grep into a secret store still blocks.","input":{"command":"grep -rn SECRET_X ~/.ssh"}}
+{"id":"g361","expected":"block","why":"round 14b: a same-command cp of a secret store, then a read of the copy, blocks.","input":{"command":"cp .env x && cat x"}}
+{"id":"g362","expected":"block","why":"round 14b: same-command cp of a secret store to a /tmp path, then read of that path, blocks.","input":{"command":"cp .env /tmp/x.txt && cat /tmp/x.txt"}}
+{"id":"g363","expected":"block","why":"round 14b: a same-command symlink to a secret store, then a read through the link, blocks.","input":{"command":"ln -s .env x && cat x"}}
+{"id":"g364","expected":"block","why":"round 14b: a same-command mv of a secret store, then a read of the new name, blocks.","input":{"command":"mv .env x && cat x"}}
+{"id":"g365","expected":"block","why":"round 14b: $(realpath) of a secret store inside a read is the secret path and blocks.","input":{"command":"cat $(realpath .env)"}}
+{"id":"g366","expected":"block","why":"round 14b: $(readlink -f) of a secret store inside a read is the secret path and blocks.","input":{"command":"cat $(readlink -f .env)"}}
+{"id":"g367","expected":"block","why":"round 14b: a same-command openssl enc -d of an encrypted secret store, then a read of the output, blocks.","input":{"command":"openssl enc -d -in .env.enc -out x && cat x"}}
+{"id":"g368","expected":"ask","why":"round 14b: a same-command copy of a bare credential word store asks (soft tier), then a read of the copy asks.","input":{"command":"cp credentials cz && cat cz"}}
+{"id":"g369","expected":"allow","why":"round 14b control: a same-command copy of a non-secret file then a read of the copy is allowed.","input":{"command":"cp README.md x && cat x"}}
+{"id":"g370","expected":"allow","why":"round 14b control: .env.example is the documented safe template; a copy of it then a read is allowed.","input":{"command":"cp .env.example x && cat x"}}
