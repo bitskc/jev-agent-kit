@@ -24,6 +24,7 @@ import json
 import os
 import signal
 import sys
+import urllib.error
 import urllib.request
 
 URL = os.environ.get("JEV_MCP_URL", "").strip()
@@ -86,8 +87,15 @@ def call_guard(args):
         "authorization": "Bearer " + token,
         "user-agent": "jev-guard-hook/1.0",  # Cloudflare 403s the default Python-urllib UA
     })
-    with _opener.open(req, timeout=TIMEOUT) as resp:
-        raw = resp.read().decode("utf-8", "replace")
+    try:
+        with _opener.open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        # 4xx (bad/revoked token, Cloudflare block, bad request): the server answered and refused the call,
+        # same class as a JSON-RPC error -- ask, never a silent allow. 5xx/network stays an outage: fail open.
+        if 400 <= e.code < 500:
+            raise ServerRejected("HTTP %d from the guard endpoint" % e.code)
+        raise
     # The server answers JSON or a single SSE `data:` frame.
     payload = None
     for line in raw.splitlines():

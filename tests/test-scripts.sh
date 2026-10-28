@@ -130,6 +130,37 @@ print("PASS")
 PYEOF
 )
 ok "$redirect_test" "PASS" "guard: redirect refusal -> ask, never silent allow"
+http_status_test=$(python3 - "$root" <<'PYEOF'
+import sys, io, urllib.error, importlib.util, os
+root = sys.argv[1]
+
+os.environ["JEV_MCP_URL"] = "https://example.invalid/mcp"
+os.environ["JEV_MCP_TOKEN"] = "t"
+spec = importlib.util.spec_from_file_location("jev_guard_hook", os.path.join(root, "hooks/jev_guard_hook.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# Exercise call_guard()'s real HTTPError handling: no live server needed, _opener.open is replaced with a
+# function that raises the exact exception urllib raises for a non-2xx response, so the rest of call_guard
+# (the try/except around _opener.open, inside the actual hook file) runs unmodified.
+def classify(status):
+    def fake_open(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, status, "err", {}, io.BytesIO(b""))
+    mod._opener.open = fake_open
+    try:
+        mod.call_guard({"tool": "Bash", "command": "x"})
+        return "no-error"
+    except mod.ServerRejected:
+        return "ServerRejected"
+    except urllib.error.HTTPError:
+        return "re-raised (fail-open path)"
+
+assert classify(401) == "ServerRejected", "401 must classify as ServerRejected (ask)"
+assert classify(503) == "re-raised (fail-open path)", "503 must not be ServerRejected"
+print("PASS")
+PYEOF
+)
+ok "$http_status_test" "PASS" "guard: HTTP 4xx -> ServerRejected (ask); 5xx stays fail-open"
 
 # ── PreToolUse matcher must cover every tool jev_guard_hook.py branches on ──────
 matcher_has_grep() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("Grep" in d["hooks"]["PreToolUse"][0]["matcher"])' "$1"; }

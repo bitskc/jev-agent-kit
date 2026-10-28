@@ -43,7 +43,9 @@ async function guard(args: Record<string, unknown>): Promise<GuardResult> {
         params: { name: "kit_guard_command", arguments: args },
       }),
     });
-    if (!res.ok) return { kind: "unavailable" };
+    // 4xx (bad/revoked token, Cloudflare block, bad request): the server answered and refused the call, same
+    // class as a JSON-RPC error -- ask, never a silent allow. 5xx stays an outage: fail open.
+    if (!res.ok) return res.status >= 400 && res.status < 500 ? { kind: "rejected", detail: `HTTP ${res.status}` } : { kind: "unavailable" };
     const raw = await res.text();
     for (let line of raw.split("\n")) {
       line = line.trim();
