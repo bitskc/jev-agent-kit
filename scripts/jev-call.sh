@@ -9,6 +9,8 @@ tool="$1"; args="${2:-{\}}"
 : "${JEV_MCP_TOKEN:?set JEV_MCP_TOKEN (never hardcode it)}"
 url="${JEV_MCP_URL:?set JEV_MCP_URL, e.g. https://<your-worker>.workers.dev/mcp}"
 case "$url" in https://*) ;; *) echo "jev-call: JEV_MCP_URL must be https://" >&2; exit 2;; esac
+# a token with a newline (or a quote/backslash) would inject extra curl -K config directives on the line below
+case "$JEV_MCP_TOKEN" in *[![:graph:]]*|*\"*|*\\*) echo "jev-call: JEV_MCP_TOKEN contains invalid characters" >&2; exit 2;; esac
 # tool name and args travel on stdin/env, not argv: /proc/*/cmdline is world-readable on a shared host.
 body=$(JEV_TOOL="$tool" JEV_ARGS="$args" python3 - 2>/dev/null <<'PY'
 import json, os

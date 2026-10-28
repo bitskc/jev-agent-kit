@@ -73,6 +73,8 @@ bash "$root/update.sh" --check --timer >/dev/null 2>&1; ok "$?" 2 "update: --che
 jc="$root/scripts/jev-call.sh"
 JEV_MCP_TOKEN=t JEV_MCP_URL=https://x/mcp bash "$jc" x '{' 2>/dev/null; ok "$?" 2 "jev-call: bad args JSON -> exit 2"
 JEV_MCP_TOKEN=t JEV_MCP_URL=http://x/mcp bash "$jc" x '{}' 2>/dev/null; ok "$?" 2 "jev-call: http:// URL -> exit 2"
+JEV_MCP_TOKEN=$'abc\ninsecure' JEV_MCP_URL=https://x/mcp bash "$jc" x '{}' 2>/dev/null; ok "$?" 2 "jev-call: token with embedded newline -> exit 2, no curl config injection"
+JEV_MCP_TOKEN='abc"def' JEV_MCP_URL=https://x/mcp bash "$jc" x '{}' 2>/dev/null; ok "$?" 2 "jev-call: token with embedded quote -> exit 2"
 cat > "$stub/curl" <<'EOF'
 #!/usr/bin/env bash
 cat >/dev/null; echo 'data: {"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}'
