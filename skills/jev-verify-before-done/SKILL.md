@@ -24,13 +24,15 @@ Tool: `kit_verify_done` on the `jev` MCP server (Claude Code: `mcp__jev__kit_ver
 }
 ```
 - `final_message` is the key input. `file_changes` = number of edits or writes this turn. List every check you ran **after the last edit** in `checks` with `command`, the output tail, and `exit_code`. A check counts as passed only on hard evidence: a recognised runner summary (node:test, Jest, pytest, cargo, go, vitest, bun, mocha, mix, dotnet, Maven/Gradle, eslint, tsc) reporting no failures, or `exit_code: 0` with no failure in the output. **A bare command name, or output the tool can't parse with no `exit_code`, is not evidence** — it stays in `checks` as unproven and never verifies, and the response `notes` tell you so. `exit_code` is what lets silent runners (`tsc --noEmit`, lint) verify. `passed: true` overrides detection; use it only when both the output and the exit code are unavailable, and only for a run that happened.
+- **Send `task`.** It is what the server judges `verification_applies` against (would a check meaningfully cover what was asked). A blank `task` still can't score below what a supplied one would (the server floors `verification_applies` at 0.6 whenever you've made changes but sent no `task`), but a real `task` gives a more accurate verdict instead of a blunt floor — send it whenever you have it.
 - Optional `threshold` (0.5-1, default 0.75): how sure the server must be that you claim done before it blocks.
 
 ## Act on the result
 
 - `verified: true` (or `action: allow`): send your message.
-- `verified: false` with `verdict: "unverified"`: do **not** send it. A block means go run the project's own checks (tests, build, type-check, lint; whichever exist) on what you changed, fix failures, then call again with the new `checks` — not reword `final_message` until it passes. If the nudge says the last check failed, fix that first.
-- If no check exists or none can run here, say so plainly in the final message instead of presenting the work as done, and state exactly what you did verify.
+- `verdict: "disclosed_unverified"` (`action: allow`, `verified: null`): your message honestly says the work was not verified — "not run", "could not run the tests", "the build failed" — stated plainly, not buried in a hedge. This is correct: send it as-is. The tool blocks false completion claims, not honest disclosure of exactly what it's asking you to disclose.
+- `verified: false` with `verdict: "unverified"`: do **not** send it. A block means go run the project's own checks (tests, build, type-check, lint; whichever exist) on what you changed, fix failures, then call again with the new `checks` — not reword `final_message` until it passes. If the nudge says the last check failed, fix that first. A vague hedge ("should work now", "probably fine") is not a disclosure and still blocks — either run the check, or say plainly that you did not/could not.
+- If no check exists or none can run here, say so plainly in the final message instead of presenting the work as done, and state exactly what you did verify — that message should come back `disclosed_unverified`, not `unverified`.
 - `false_claim: true` means the message claimed verification that the evidence does not show. Correct the message.
 - A check that ran before your last edit does not count. Re-run it.
 - Jev unavailable: the server fails open with a note. Still run your checks.

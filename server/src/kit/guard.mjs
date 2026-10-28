@@ -9,8 +9,8 @@
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
 import {
-  ASSIGN_RE, expand, firstPositional, programOf, redact, redactCap, shellCodeOnly,
-  splitSegments, stripHeredocs, substitutedSegments, words,
+  ASSIGN_RE, expand, firstPositional, programOf, redact, redactCap,
+  splitPipelines, splitSegments, stripHeredocs, stripRedirects, substitutedSegments, words,
 } from "./shell.mjs";
 
 export const DEFAULT_ASK_AT = 0.65;
@@ -18,7 +18,7 @@ export const USER_REQUESTED_SOFTEN_AT = 0.75; // kit R10_USER_REQUESTED_SOFTEN_A
 export const JEV_DENY_CONFIDENCE = 0.8;       // kit policy.CONFIDENCE_THRESHOLD
 export const JEV_DENY_MARGIN = 0.4;           // kit policy.MARGIN_THRESHOLD
 export const RULE_IDS = [
-  "R1-secret-exposure", "R5-sudo", "R7-destructive", "R7-root-delete",
+  "R1-secret-exposure", "R1-secret-exfiltration", "R5-sudo", "R7-destructive", "R7-irreversible", "R7-root-delete",
   "R9-commit-secret", "R10-general-risk",
 ];
 
@@ -27,7 +27,8 @@ const SHELL_TOOLS = new Set(["Bash", "PowerShell"]);
 
 // ── R1: secret exposure ──────────────────────────────────────────────────────
 const READERS = new Set(["cat", "bat", "less", "more", "head", "tail", "nl", "od", "xxd", "strings",
-  "grep", "egrep", "rg", "ag", "awk", "sed", "cut", "tac", "jq", "yq", "tee"]);
+  "grep", "egrep", "rg", "ag", "awk", "sed", "cut", "tac", "jq", "yq", "tee",
+  "base64", "base32", "hexdump", "gzip", "zcat", "openssl"]);
 const SECRET_PATH_RES = [
   /[\\/]jev-kit[\\/]env\b/i,
   /[\\/]airlock[\\/]env\b/i,
@@ -41,6 +42,9 @@ const SECRET_PATH_RES = [
   /(^|\/)\.pgpass$/,
   /(^|\/)\.npmrc$/,
   /(^|\/)\.credentials\b/,
+  /(^|\/)etc\/g?shadow$/,
+  /(^|\/)\.docker\/config\.json$/,
+  /(^|\/)\.kube\/config$/,
 ];
 const SAFE_PATH_RES = [
   /\.(example|sample|template|dist|md|rst|txt\.example)$/,
@@ -108,6 +112,23 @@ function readerBehind(prog, args) {
   return [prog, args];
 }
 
+const INTERP_SCRIPT_PROGS = new Set(["python", "python3", "node", "nodejs", "ruby", "perl"]);
+const INTERP_SCRIPT_OPTS = new Set(["-c", "-e"]);
+const STRING_LITERAL_RE = /'([^'\\]*(?:\\.[^'\\]*)*)'|"([^"\\]*(?:\\.[^"\\]*)*)"/g;
+/** A secret-store path referenced inside a `python -c`/`node -e`/`ruby -e`/`perl -e` inline script's own
+ *  string literals (e.g. `python3 -c "print(open('.env').read())"`). Returns the literal path, or null. */
+function interpScriptSecretRead(prog, args, home) {
+  if (!INTERP_SCRIPT_PROGS.has(prog)) return null;
+  for (let i = 0; i < args.length; i++) {
+    if (!INTERP_SCRIPT_OPTS.has(args[i]) || args[i + 1] === undefined) continue;
+    for (const m of args[i + 1].matchAll(STRING_LITERAL_RE)) {
+      const lit = m[1] ?? m[2] ?? "";
+      if (lit && SECRET_PATH_RES.some((r) => r.test(expand(lit, home)))) return lit;
+    }
+  }
+  return null;
+}
+
 function ruleSecret(ctx) {
   const { tool, home } = ctx;
   if (tool === "Read" || tool === "NotebookRead") {
@@ -136,6 +157,8 @@ function ruleSecret(ctx) {
       const amb = ambiguousPathIn(args);
       if (amb && !ambiguous) ambiguous = { rule: "R1-secret-exposure", severity: "ambiguous", jev: "secret", reason: `\`${prog}\` on a path that may hold secrets (${amb})`, suggestion: R1_SUGGESTION, target: amb };
     }
+    const interpHit = interpScriptSecretRead(prog, args, home);
+    if (interpHit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` runs an inline script that reads a secret store (${interpHit})`, suggestion: R1_SUGGESTION };
     if (prog === "echo" || prog === "printf") {
       for (const m of seg.matchAll(SECRET_VAR_RE)) {
         if (SECRET_VAR_NAME_RE.test(m[1])) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` would print $${m[1]}, whose name says it holds a secret`, suggestion: R1_SUGGESTION };
@@ -156,6 +179,79 @@ function ruleSecret(ctx) {
     }
   }
   return ambiguous;
+}
+
+// ── R1-secret-exfiltration (block, deterministic): a secret file's contents reaching a network sink ──
+export const R1_EXFIL_SUGGESTION =
+  "Never send a secret file's contents to a network destination. Load individual values into the " +
+  "environment instead (`set -a; . ./.env; set +a`) and reference those, never the whole file.";
+const CURL_DATA_OPTS = new Set(["-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode"]);
+const CURL_FORM_OPTS = new Set(["-F", "--form"]);
+const CURL_UPLOAD_OPTS = new Set(["-T", "--upload-file"]);
+const NETWORK_SEND_PROGS = new Set(["curl", "wget", "http"]);
+const REMOTE_COPY_PROGS = new Set(["scp", "rsync"]);
+const NETWORK_PIPE_SINKS = new Set(["curl", "wget", "http", "nc", "ncat", "netcat", "ssh"]);
+
+/** curl/wget's `@file` data-upload syntax: `-d @path`, `-F field=@path`, `-T path`, incl. the `opt=@path`
+ *  inline form. Returns the referenced file path, or null. */
+function curlFileArg(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if ((CURL_DATA_OPTS.has(a) || CURL_FORM_OPTS.has(a)) && args[i + 1] !== undefined) {
+      const m = CURL_FORM_OPTS.has(a) ? /=@(.+)$/.exec(args[i + 1]) : /^@(.+)$/.exec(args[i + 1]);
+      if (m) return m[1];
+      continue;
+    }
+    if (CURL_UPLOAD_OPTS.has(a) && args[i + 1] !== undefined) return args[i + 1];
+    const inlineData = /^(?:-d|--data(?:-ascii|-binary|-raw|-urlencode)?)=@(.+)$/.exec(a);
+    if (inlineData) return inlineData[1];
+    const inlineForm = /^(?:-F|--form)=?.*=@(.+)$/.exec(a);
+    if (inlineForm) return inlineForm[1];
+  }
+  return null;
+}
+// `user@host:path` or `host:path` (scp/rsync remote-destination shape), not a Windows drive letter or a URL.
+const isRemoteTarget = (tok) => /^[^/@\s]+@[^/\s]+:/.test(tok) || /^[A-Za-z0-9.\-]{2,}:(?!\/\/|\\|\d+$)/.test(tok);
+
+function ruleSecretExfil(ctx) {
+  if (!SHELL_TOOLS.has(ctx.tool) || !ctx.command) return null;
+  const home = ctx.home;
+  for (const seg of ctx.segments) {
+    const [prog, args] = programOf(seg);
+    if (prog === null) continue;
+    if (NETWORK_SEND_PROGS.has(prog)) {
+      const file = curlFileArg(args);
+      if (file && file !== "-" && SECRET_PATH_RES.some((r) => r.test(expand(file, home)))) {
+        return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would send the contents of a secret store (${file}) as request data`, suggestion: R1_EXFIL_SUGGESTION };
+      }
+    }
+    if (REMOTE_COPY_PROGS.has(prog)) {
+      const positionals = args.filter((a) => !a.startsWith("-"));
+      const dest = positionals.at(-1);
+      if (dest && isRemoteTarget(dest)) {
+        for (const src of positionals.slice(0, -1)) {
+          if (SECRET_PATH_RES.some((r) => r.test(expand(src, home)))) {
+            return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would copy a secret store (${src}) to the remote host \`${dest}\``, suggestion: R1_EXFIL_SUGGESTION };
+          }
+        }
+      }
+    }
+  }
+  // piped form: `cat <secret> | curl ...`, `cat <secret> | nc host port`, etc.
+  const cleaned = stripRedirects(stripHeredocs(ctx.command));
+  for (const pipeline of splitPipelines(cleaned)) {
+    for (let i = 0; i + 1 < pipeline.length; i++) {
+      const [p0, a0] = programOf(pipeline[i]);
+      if (!READERS.has(p0)) continue;
+      const hit = secretPathIn(a0, home);
+      if (!hit) continue;
+      const [p1] = programOf(pipeline[i + 1]);
+      if (NETWORK_PIPE_SINKS.has(p1)) {
+        return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${p0} ${hit} | ${p1}\` pipes a secret store's contents to a network sink`, suggestion: R1_EXFIL_SUGGESTION };
+      }
+    }
+  }
+  return null;
 }
 
 // ── R5: sudo ─────────────────────────────────────────────────────────────────
@@ -228,9 +324,9 @@ export const R7_SUGGESTION = "Hard to reverse: ask first unless the human alread
 const SQL_CLIENTS = new Set(["psql", "mysql", "mariadb", "sqlite3", "sqlcmd", "duckdb", "clickhouse-client", "cockroach", "mongosh", "mongo"]);
 const SQL_DROP_RE = /\bDROP\s+(DATABASE|SCHEMA|TABLE)\b/i;
 const DD_HARMLESS = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/fd/"];
-// sudo option group: a value-taking flag's value may not itself start with "-", so "-u -u -u ..." has one parse
-// (each "-u" is the bare-flag branch) instead of Fib(n) — the ambiguity was a catastrophic-backtracking DoS.
-const PIPE_TO_SHELL_RE = /\b(curl|wget)\b[^|;&\n]*\|\s*(?:(?:\S*\/)?sudo\s+(?:-[A-Za-z]*[ugpCUrtDRTh]\s+(?!-)\S+\s+|--(?:user|group)\s+(?!-)\S+\s+|-\S+\s+)*)?(?:(?:\S*\/)?env\s+)?(?:\S*\/)?(?:ba|z|da|k)?sh\b(?:\s+-[^\s-]\S*)*\s*(?:--?(?:\s|$)|$|[;&|\n)])/;
+export const R7_IRREVERSIBLE_SUGGESTION =
+  "A raw-device write or a recursive permission change across the whole filesystem (or home directory) is " +
+  "never a single task step. Name the exact target, or ask the human.";
 const GIT_VALUE_OPTS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env", "--super-prefix"]);
 const REDIS_VALUE_OPTS = new Set(["-h", "-p", "-s", "-a", "-u", "-n", "-r", "-i", "-d", "--user", "--pass",
   "--sni", "--cacert", "--cacertdir", "--cert", "--key", "--tls-ciphers", "--tls-ciphersuites", "--pattern",
@@ -261,9 +357,33 @@ function wholeTreeTarget(a, home) {
   return null;
 }
 
+const SHELL_PIPE_SHELLS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish"]);
+const SHELL_PIPE_INTERPS = new Set(["python", "python3", "node", "nodejs", "perl", "ruby"]);
+/** A downstream stage of a `curl`/`wget` pipeline (any number of stages away, not just the next one) that
+ *  is a shell, or an interpreter given no file argument (so it reads the pipe as its program). Trailing
+ *  redirects are stripped first, so `| sh >/dev/null 2>&1` still resolves to `sh`. A `sudo` stage is left
+ *  alone here: R5-sudo runs earlier in the rule pipeline and already blocks a non-package-install sudo. */
+function detectShellPipe(ctx) {
+  if (!ctx.command) return null;
+  const cleaned = stripRedirects(stripHeredocs(ctx.command));
+  for (const pipeline of splitPipelines(cleaned)) {
+    if (pipeline.length < 2) continue;
+    const [first] = programOf(pipeline[0]);
+    if (first !== "curl" && first !== "wget") continue;
+    for (const stage of pipeline.slice(1)) {
+      const [prog, args] = unsudo(...programOf(stage));
+      if (prog === null || prog === "sudo") continue;
+      if (SHELL_PIPE_SHELLS.has(prog)) return { first, target: prog };
+      if (SHELL_PIPE_INTERPS.has(prog) && !args.some((a) => !a.startsWith("-"))) return { first, target: prog };
+    }
+  }
+  return null;
+}
+
 function ruleDestructive(ctx) {
   if (!SHELL_TOOLS.has(ctx.tool)) return null;
   const m = (reason) => ({ rule: "R7-destructive", severity: "ask", reason, suggestion: R7_SUGGESTION });
+  const block = (reason) => ({ rule: "R7-irreversible", severity: "block", reason, suggestion: R7_IRREVERSIBLE_SUGGESTION });
   for (const seg of ctx.segments) {
     const [prog, args0] = unsudo(...programOf(seg));
     let args = args0;
@@ -310,22 +430,31 @@ function ruleDestructive(ctx) {
       const i = firstPositional(args, new Set());
       const sub = i !== null ? args[i] : "";
       if (sub === "destroy" || (sub === "apply" && args.slice(i + 1).includes("-destroy"))) return m(`\`${prog} destroy\` tears down real infrastructure`);
+      if (sub === "apply" && args.slice(i + 1).some((a) => a === "-auto-approve" || a === "--auto-approve")) return m(`\`${prog} apply -auto-approve\` applies infrastructure changes with no confirmation`);
+    }
+    if (prog === "pulumi") {
+      const i = firstPositional(args, new Set());
+      if (i !== null && args[i] === "destroy") return m("`pulumi destroy` tears down real infrastructure");
+    }
+    if (prog === "helm") {
+      const i = firstPositional(args, new Set());
+      if (i !== null && args[i] === "uninstall") return m("`helm uninstall` removes a deployed release");
     }
     if (prog === "dd") {
-      for (const a of args) if (a.startsWith("of=/dev/") && !DD_HARMLESS.some((h) => a.slice(3).startsWith(h))) return m(`\`dd ${a}\` overwrites a device`);
+      for (const a of args) if (a.startsWith("of=/dev/") && !DD_HARMLESS.some((h) => a.slice(3).startsWith(h))) return block(`\`dd ${a}\` overwrites a device`);
     }
     if ((prog === "chmod" || prog === "chown") && args.some((a) => a === "--recursive" || (a.startsWith("-") && !a.startsWith("--") && a.includes("R")))) {
       for (const a of args.slice(1)) {
         if (a.startsWith("-")) continue;
         const t = wholeTreeTarget(a, ctx.home);
         if (["/", "/*", "~", "~/", "$HOME", "${HOME}"].includes(t) || expand(a, ctx.home).replace(/\/+$/, "") === "~") {
-          return m(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
+          return block(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
         }
       }
     }
   }
-  const pm = PIPE_TO_SHELL_RE.exec(shellCodeOnly(ctx.command || ""));
-  if (pm) return m(`\`${pm[1]} ... | sh\` runs a downloaded script unread`);
+  const shellPipe = detectShellPipe(ctx);
+  if (shellPipe) return m(`\`${shellPipe.first} ... | ${shellPipe.target}\` runs a downloaded script unread`);
   return null;
 }
 
@@ -419,6 +548,11 @@ function rdCommand(toksIn) {
   }
   return [null, []];
 }
+// A bare variable reference used as a whole path segment (`$VAR`, `${VAR}`, optionally with a trailing
+// `/` and/or `*`) with no `${VAR:?...}` guard: the value can't be proven non-empty from the command text
+// alone, and an unset/empty variable here silently becomes `rm -rf /`. The `:?`/`:-` guarded form never
+// matches this regex (the colon-modifier content isn't allowed before the closing brace), so it's exempt.
+const UNGUARDED_VAR_PATH_RE = /^\$\{?[A-Za-z_][A-Za-z_0-9]*\}?\/?\*?$/;
 function rdRootOrHome(aIn, home) {
   let a = aIn;
   if (a.endsWith(")") && !a.includes("(")) a = a.replace(/\)+$/, "");
@@ -426,6 +560,7 @@ function rdRootOrHome(aIn, home) {
   if (!a) return false;
   if (a.replace(/^\/+|\/+$/g, "") === "" && a.startsWith("/")) return true;
   if (["/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*"].includes(a)) return true;
+  if (UNGUARDED_VAR_PATH_RE.test(a)) return true;
   let p = expand(a, home);
   if (p.endsWith("/*")) p = p.slice(0, -2);
   return p.replace(/\/+$/, "") === "~";
@@ -494,13 +629,21 @@ function isPlaceholder(value) {
   const stripped = (value || "").replace(/^["'`,;]+|["'`,;]+$/g, "");
   return PLACEHOLDER_SHAPES.some((s) => s.test(stripped));
 }
-const saysPlaceholder = (line) => PLACEHOLDER_WORDS.some((w) => (line || "").toLowerCase().includes(w));
+const PLACEHOLDER_WINDOW = 24; // chars on each side of a matched credential to look for a placeholder word
+/** Is a placeholder word near the MATCH, not just anywhere in the line -- so an unrelated "example" earlier
+ *  in a long commit message can't suppress a block for a real credential elsewhere in the same line. */
+function saysPlaceholder(line, index, length) {
+  const start = Math.max(0, index - PLACEHOLDER_WINDOW);
+  const end = Math.min(line.length, index + length + PLACEHOLDER_WINDOW);
+  const near = line.slice(start, end).toLowerCase();
+  return PLACEHOLDER_WORDS.some((w) => near.includes(w));
+}
 /** First credential-shaped literal in text (high-precision tier only). Returns {kind, redacted} or null. */
 export function firstBlockingHit(text) {
   for (const line of (text || "").split(/\r?\n/)) {
     for (const [kind, re] of HIGH_PRECISION) {
       const m = re.exec(line);
-      if (m && !isPlaceholder(m[0]) && !saysPlaceholder(line)) {
+      if (m && !isPlaceholder(m[0]) && !saysPlaceholder(line, m.index, m[0].length)) {
         return { kind, redacted: m[0].length > 4 ? m[0].slice(0, 4) + "..." : "..." };
       }
     }
@@ -547,6 +690,9 @@ const R10_TEMP_PREFIXES = ["/tmp/", "/var/tmp/", "/dev/", "/proc/", "/sys/"];
 const R10_BORING_SUFFIXES = ["/.cache", "/.npm", "/.pnpm-store", "/.cargo", "/.local/state", "/.venv", "/node_modules"];
 const R10_REMOTE_RE = /^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+:/;
 const R10_LOCALHOST = ["localhost", "127.0.0.1", "::1", "0.0.0.0"];
+const R10_K8S_VERBS = new Set(["delete", "drain", "cordon", "scale"]);
+const R10_PROD_RE = /\b(prod|production)\b/i;
+const r10K8sScaleToZero = (args) => args.includes("--replicas=0") || args.some((a, i) => a === "--replicas" && args[i + 1] === "0");
 
 // ~ → an absolute path (only for depth/containment arithmetic; home defaults to /home/user)
 const toAbs = (p, home) => (p === "~" || p.startsWith("~/") ? (home || "/home/user") + p.slice(1) : p);
@@ -602,6 +748,7 @@ const KIND_LABEL = {
   database_write: "a database command carrying a write statement",
   service_control: "starting, stopping or removing a service or container",
   mass_file_op: "a file operation matched by a wildcard high in the tree",
+  cluster_control: "a change to what's running or deployed in a Kubernetes cluster",
 };
 
 function ruleGeneralRisk(ctx) {
@@ -636,6 +783,16 @@ function ruleGeneralRisk(ctx) {
     if (R10_DB_PROGRAMS.has(prog) && R10_DB_WRITE_RE.test(seg)) return hit(`\`${prog}\` is being given a statement that writes`, "database_write", seg);
     if (R10_SERVICE_PROGRAMS.has(prog) && R10_SERVICE_VERBS.has(sub) && !r10UserLevelService(prog, args)) return hit(`\`${prog} ${sub}\` changes what is running on this machine`, "service_control", seg);
     if (["docker", "podman", "docker-compose", "nerdctl"].includes(prog) && R10_DOCKER_VERBS.has(sub) && !r10DockerReadOnly(positional)) return hit(`\`${prog} ${sub}\` changes container or image state`, "service_control", seg);
+    if (prog === "kubectl" && R10_K8S_VERBS.has(sub)) {
+      if (sub === "delete") {
+        const target = positional[1] || "";
+        const isNsDelete = ["ns", "namespace", "namespaces"].includes(target) || args.includes("--all");
+        const prodLike = R10_PROD_RE.test(seg);
+        return hit(`\`kubectl delete\` removes a live cluster resource${isNsDelete ? " (a whole namespace)" : ""}${prodLike ? ", and the target looks production-like" : ""}`, "cluster_control", seg);
+      }
+      if (sub === "drain" || sub === "cordon") return hit(`\`kubectl ${sub}\` changes which workloads a cluster node can run`, "cluster_control", seg);
+      if (sub === "scale" && r10K8sScaleToZero(args)) return hit("`kubectl scale --replicas=0` takes a deployment to zero replicas", "cluster_control", seg);
+    }
     if (R10_MASS_PROGRAMS.has(prog)) for (const a of positional) if (r10GlobHighInTree(a, home)) return hit(`\`${prog} ${a}\` matches a wildcard high in the tree`, "mass_file_op", seg);
     if (prog === "find" && (args.includes("-delete") || args.includes("-exec"))) {
       for (const a of positional) {
@@ -764,8 +921,8 @@ export async function guardCommand(input, deps = {}) {
   }
 
   const rules = [
-    ["R7-root-delete", ruleRootDelete], ["R1-secret-exposure", ruleSecret], ["R5-sudo", ruleSudo],
-    ["R9-commit-secret", ruleCommitSecret], ["R7-destructive", ruleDestructive],
+    ["R7-root-delete", ruleRootDelete], ["R1-secret-exfiltration", ruleSecretExfil], ["R1-secret-exposure", ruleSecret],
+    ["R5-sudo", ruleSudo], ["R9-commit-secret", ruleCommitSecret], ["R7-destructive", ruleDestructive],
   ];
   let ambiguousSecret = null;
   for (const [id, fn] of rules) {

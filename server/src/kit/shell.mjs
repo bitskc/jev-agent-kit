@@ -40,14 +40,32 @@ export function splitSegments(command) {
   return segs.map((x) => x.trim()).filter(Boolean);
 }
 
-/** Whitespace tokens of a segment, matching quotes stripped off the ends. */
-export function words(segment) {
-  const out = [];
-  for (let tok of (segment || "").split(/\s+/).filter(Boolean)) {
-    if (tok.length >= 2 && tok[0] === tok[tok.length - 1] && (tok[0] === "'" || tok[0] === '"')) tok = tok.slice(1, -1);
-    out.push(tok);
+/** Remove shell quote delimiters from a token, respecting quote concatenation within the same word
+ *  (`.e''nv` -> `.env`, `".env"` -> `.env`, `'.e'nv` -> `.env`) the way bash's own word-formation does:
+ *  quotes are structural, not content, and adjacent quoted/unquoted runs join into one word. Heuristic,
+ *  not a full shell parser (it does not track nesting depth beyond one open quote at a time), and
+ *  deliberately permissive: for a security prefilter, collapsing an obfuscated path is the safer failure
+ *  mode than preserving an exotic literal quote character in a non-path argument. */
+function stripQuotes(tok) {
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < tok.length; i++) {
+    const ch = tok[i];
+    if (quote) {
+      if (ch === quote) { quote = null; continue; }
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; continue; }
+    if (ch === "\\" && i + 1 < tok.length) { out += tok[i + 1]; i++; continue; }
+    out += ch;
   }
   return out;
+}
+
+/** Whitespace tokens of a segment, with shell quote delimiters removed (including concatenation). */
+export function words(segment) {
+  return (segment || "").split(/\s+/).filter(Boolean).map(stripQuotes);
 }
 
 const SKIP_PREFIX = new Set(["nice", "time", "command", "exec", "builtin", "stdbuf", "nohup", "ionice"]);
@@ -266,3 +284,47 @@ export function redact(text) {
 
 /** Redact first, truncate second, so a secret straddling the cut is not half-leaked. */
 export const redactCap = (text, limit) => redact(text).slice(0, limit);
+
+// ── pipeline-aware segment grouping (for curl|sh and secret-exfiltration detection) ────────────
+/** Like splitSegments, but keeps segments joined by a bare `|` together as one pipeline, instead of
+ *  flattening everything the way splitSegments does. A run of `&`, `&&`, `||` or `;` starts a new
+ *  pipeline (same ambiguity as splitSegments on `2>&1`-style redirects: callers that care should run
+ *  stripRedirects() first). Each returned pipeline is a non-empty array of >=1 segment strings. */
+export function splitPipelines(command) {
+  const pipelines = [];
+  let segs = [];
+  let buf = [];
+  let quote = null;
+  const s = command || "";
+  const n = s.length;
+  let i = 0;
+  const flushSeg = () => { const t = buf.join("").trim(); if (t) segs.push(t); buf = []; };
+  const flushPipeline = () => { flushSeg(); if (segs.length) pipelines.push(segs); segs = []; };
+  while (i < n) {
+    const ch = s[i];
+    if (quote) { buf.push(ch); if (ch === quote) quote = null; i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; buf.push(ch); i++; continue; }
+    if (ch === "\\" && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
+    if (ch === ";" || ch === "\n") { flushPipeline(); i++; continue; }
+    if (ch === "&" || ch === "|") {
+      let j = i;
+      while (j < n && (s[j] === "&" || s[j] === "|")) j++;
+      const run = s.slice(i, j);
+      if (run === "|") { flushSeg(); i = j; continue; } // a single bare pipe: stay in this pipeline
+      flushPipeline(); i = j; continue; // &&, ||, & (or anything mixed): a new pipeline
+    }
+    buf.push(ch); i++;
+  }
+  flushPipeline();
+  return pipelines;
+}
+
+// a leading digit is an fd number (2>&1, 2>/dev/null); the target after >/>>/< is a single word
+const REDIRECT_RE = /\d*(?:>{1,2}&\d+|>{1,2}\S*|<{1,2}\S*)/g;
+/** Blank out shell redirects (`>out`, `>>log`, `2>&1`, `</dev/null`, ...) so a trailing redirect after a
+ *  piped command doesn't break program-name matching. Heuristic text substitution, not parsing: scoped to
+ *  callers that specifically need redirect-free text (curl|sh / secret-exfiltration detection), not applied
+ *  globally to every rule. */
+export function stripRedirects(text) {
+  return (text || "").replace(REDIRECT_RE, " ");
+}
