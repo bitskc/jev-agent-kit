@@ -172,6 +172,15 @@ ok "$http_status_test" "PASS" "guard: HTTP 4xx -> ServerRejected (ask); 5xx stay
 matcher_has_grep() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("Grep" in d["hooks"]["PreToolUse"][0]["matcher"])' "$1"; }
 ok "$(matcher_has_grep "$root/hooks/claude-plugin-hooks.json")" True "hooks/claude-plugin-hooks.json: PreToolUse matcher includes Grep"
 ok "$(matcher_has_grep "$root/config/claude-settings-hook.json")" True "config/claude-settings-hook.json: PreToolUse matcher includes Grep"
+readme_matches=$(python3 -c '
+import json, sys
+root = sys.argv[1]
+matcher = json.load(open(root + "/hooks/claude-plugin-hooks.json"))["hooks"]["PreToolUse"][0]["matcher"]
+claim = matcher.replace("|", "/")
+readme = open(root + "/README.md").read()
+print("True" if readme.count(claim) >= 2 else "False (count=%d, claim=%r)" % (readme.count(claim), claim))
+' "$root")
+ok "$readme_matches" "True" "README: guard-coverage claims (install section + Guard hook section) match the actual PreToolUse matcher"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

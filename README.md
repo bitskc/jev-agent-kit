@@ -91,7 +91,7 @@ Switch with **`/honest-jev soft|standard|strict|off`** (Claude Code and omp), or
 /plugin install jev-agent-kit@jev-agent-kit
 ```
 
-Skills, `/honest-jev`, the Honest Jev hooks (SessionStart, UserPromptSubmit, SubagentStart) and the guard hook (PreToolUse on Bash/Read) wire themselves. On first session Honest Jev offers to add its statusline badge — composed with any statusline you already have (ponytail's included), never replacing it.
+Skills, `/honest-jev`, the Honest Jev hooks (SessionStart, UserPromptSubmit, SubagentStart) and the guard hook (PreToolUse on Bash/Read/NotebookRead/Grep) wire themselves. On first session Honest Jev offers to add its statusline badge — composed with any statusline you already have (ponytail's included), never replacing it.
 
 ### omp / oh-my-pi, or Claude Code without the plugin system
 
@@ -140,7 +140,7 @@ Then `/mcp reload`, `/mcp list`, `/mcp test jev` (expect 15 tools), `/reload-plu
 
 ## Guard hook
 
-The guard hook makes `kit_guard_command` unconditional on Bash/Read/NotebookRead. `allow` is silent, `ask` becomes a permission prompt, `block` denies with the reason and the suggested safer route. It **fails open** on a 2 s timeout (`JEV_GUARD_TIMEOUT`), network/HTTP error, bad reply, or missing env; `JEV_GUARD_MODE=shadow` logs instead of blocking; `JEV_GUARD_ASK_AT` moves the ask threshold (server default 0.65). The omp port (`hooks/omp/jev-guard.ts`) swallows all errors because omp fails closed on a throwing hook; with no UI `ask` becomes a block unless `JEV_GUARD_ASK_NO_UI=allow`.
+The guard hook makes `kit_guard_command` unconditional on Bash/Read/NotebookRead/Grep (Grep only when `output_mode` is `content`; the default `files_with_matches` and `count` modes print no secret content, so they're not judged). `allow` is silent, `ask` becomes a permission prompt, `block` denies with the reason and the suggested safer route. It **fails open** on a 2 s timeout (`JEV_GUARD_TIMEOUT`), network/HTTP error, bad reply, or missing env; `JEV_GUARD_MODE=shadow` logs instead of blocking; `JEV_GUARD_ASK_AT` moves the ask threshold (server default 0.65). The omp port (`hooks/omp/jev-guard.ts`) swallows all errors because omp fails closed on a throwing hook; with no UI `ask` becomes a block unless `JEV_GUARD_ASK_NO_UI=allow`.
 
 ## Deploy your own server
 
