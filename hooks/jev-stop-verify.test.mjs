@@ -42,6 +42,12 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0],
     ["(npm test)", "  12 passing (3s)", 0],
     ["npm test &", "  12 passing (3s)", 0],
+    ["node --test test/x.test.mjs --test-name-pattern pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0],
+    ["npm test -- -t pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0],
+    ["set +o pipefail; npm test | tail -5", "  12 passing (3s)", 0],
+    ["set -eo pipefail; npm test | tail -5", "  12 passing (3s)", 0],
+    ["bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0],
+    ["set -o pipefail; bash -c 'npm test | tail -5'", "  12 passing (3s)", 0],
   ];
   for (const [command, output, exit] of cases) {
     assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);

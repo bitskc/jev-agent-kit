@@ -21,15 +21,33 @@ const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
 /**
  * Prefix elements (cd, pushd, popd, export, set, unset, source, env assignments) are transparent: the recorded
  * status is the last command's, so `cd api && npm test` reports npm test's own status. Once a real command has
- * appeared, a following `;`, `&&`, or `||` element, a subshell, command substitution, a background `&`, or a bare
- * `|` without pipefail masks the status.
+ * appeared, a following `;`, `&&`, or `||` element, a subshell, command substitution, a nested `sh -c`, a
+ * background `&`, or a bare `|` without pipefail masks the status. pipefail counts only from an exact
+ * `set -o pipefail` (also `-eo`/`-euo`) prefix element, or a leading `bash -o pipefail -c`; quoted text is ignored.
  */
 const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
 const LIST_SPLIT = /;|&&|\|\||\n/;
+const QUOTED = /'[^']*'|"[^"]*"/g;
 const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
+const NESTED_SHELL_C = /(?:^|[\s;&|])(?:ba|z|da)?sh\s+(?:-\S+\s+)*-\w*c\b/;
+const SET_PIPEFAIL_ON = /^set\s+-[A-Za-z]*o\s+pipefail$/;
+const SET_PIPEFAIL_OFF = /^set\s+\+[A-Za-z]*o\s+pipefail$/;
+const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
+function pipefailOn(unquoted) {
+  if (BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return true;
+  let on = false;
+  for (const s of unquoted.split(LIST_SPLIT).map((x) => x.trim()).filter(Boolean)) {
+    if (!PREFIX_SEGMENT.test(s)) break;
+    if (SET_PIPEFAIL_ON.test(s)) on = true;
+    else if (SET_PIPEFAIL_OFF.test(s)) on = false;
+  }
+  return on;
+}
 export function exitIsMasked(command) {
   if (UNATTRIBUTABLE.test(command)) return true;
-  if (/(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command)) return true;
+  const unquoted = command.replace(QUOTED, "''");
+  if (NESTED_SHELL_C.test(unquoted) && !BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return true;
+  if (/(?<!\|)\|(?!\|)/.test(command) && !pipefailOn(unquoted)) return true;
   const segments = command.split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
   const first = segments.findIndex((s) => !PREFIX_SEGMENT.test(s));
   if (first === -1) return true;

@@ -180,6 +180,15 @@ test("runOutcome: any chained command after the check masks its exit status (the
   assert.equal(runOutcome("npm test ; echo done", "  1 failing", 0), "fail");
   assert.equal(runOutcome("(npm test)", "  12 passing (3s)", 0), "unknown");
   assert.equal(runOutcome("npm test &", "  12 passing (3s)", 0), "unknown");
+  // pipefail counts only from an exact `set -o pipefail` prefix, or a leading `bash -o pipefail -c`.
+  assert.equal(runOutcome("node --test test/x.test.mjs --test-name-pattern pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+  assert.equal(runOutcome("npm test -- -t pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+  assert.equal(runOutcome("set +o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test -- \"set -o pipefail\" | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set -eo pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("set -o pipefail; bash -c 'npm test | tail -5'", "  12 passing (3s)", 0), "unknown");
 });
 test("classifyToolResult: a non-CHECK command's summary follows the same masking rule", () => {
   assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  12 passing (3s)"), "check-pass");
