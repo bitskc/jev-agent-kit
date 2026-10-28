@@ -1315,15 +1315,19 @@ test("round 11 P2-3: non-reader verbs that print or copy a secret block; metadat
 });
 test("round 12 P2-E: a quoted pattern, commit or PR text, find predicate, test filter or config selector is not a path; the secret reads still block", async () => {
   for (const c of [
-    "cat .env", "echo $DB_PASS", "docker compose --env-file=.env config", "cat credentials", "cat app-credentials.json",
-    "find . -name .env -exec cat {} \\;", "find . -name \"*.pem\" -print0 | xargs -0 cat", "find . -name \"*.env\" | xargs cat",
+    "cat .env", "echo $DB_PASS", "docker compose --env-file=.env config", "cat app-credentials.json",
+    "find . -name .env -exec cat {} \\;",
     "cat ~/.aws/credentials", "cat .env.production", "grep -n SECRET_KEY .env",
   ]) assert.equal((await g(c)).decision, "block", c);
+  // a bare credential word, or a secret-looking glob that feeds a reader, asks: confirm it is not a secret file
+  for (const c of ["cat credentials", "npx vitest run credentials", "find . -name \"*.pem\" -print0 | xargs -0 cat", "find . -name \"*.env\" | xargs cat"]) {
+    assert.equal((await g(c)).decision, "ask", c);
+  }
   for (const c of [
     "find . -name \"*.pem\"", "npm test -- --grep .env", "git log --grep .env --oneline", "git commit -m .env",
     "find src -name \"*credentials*\" -type f", "find . -name \"*credentials*\"",
     "grep -rn \"credentials\" src", "grep -rn credentials src/", "rg \"credentials\" src", "git log --grep credentials --oneline",
-    "git log --oneline -- src/credentials.ts", "npx vitest run credentials", "bun test tests/credentials.test.ts",
+    "git log --oneline -- src/credentials.ts", "bun test tests/credentials.test.ts",
     "pytest tests/credentials.py", "node scripts/credentials.js", "npm test -- --grep credentials",
     "gh pr create --title \"fix credentials handling\" --body \"rotate creds\"", "gh issue create --title \"Rotate the signing.key\" --body \"x\"",
     "cat src/lib/credentials.ts", "git commit -m \"fix: credentials validation\"", "git add src/credentials.ts",
