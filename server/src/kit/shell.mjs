@@ -10,9 +10,10 @@
 import { posix as posixPath } from "node:path";
 export const ASSIGN_RE = /^[A-Za-z_][A-Za-z_0-9]*=/;
 
-/** Split a command line into segments on ; && || | and newlines, respecting quotes. */
-export function splitSegments(command) {
-  const segs = [];
+/** Split a command line on ; && || | & and newlines, respecting quotes, KEEPING each separator. Returns
+ *  alternating [content, separator, content, ..., content]: even indices are content, odd are separators. */
+export function splitKeep(command) {
+  const parts = [];
   let buf = [];
   let quote = null;
   // Real bash deletes backslash-newline pairs BEFORE tokenizing (line continuation); folding them here,
@@ -20,6 +21,7 @@ export function splitSegments(command) {
   const s = (command || "").replace(/\\\r?\n/g, "");
   const n = s.length;
   let i = 0;
+  const cut = (sep) => { parts.push(buf.join(""), sep); buf = []; };
   while (i < n) {
     const ch = s[i];
     if (quote) {
@@ -34,18 +36,25 @@ export function splitSegments(command) {
     }
     if (ch === "'" || ch === '"') { quote = ch; buf.push(ch); i++; continue; }
     if (ch === "\\" && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
-    if (ch === ";" || ch === "\n") { segs.push(buf.join("")); buf = []; i++; continue; }
+    if (ch === ";" || ch === "\n") { cut(ch); i++; continue; }
     if (ch === "&" || ch === "|") {
-      segs.push(buf.join("")); buf = [];
+      const start = i;
       while (i < n && (s[i] === "&" || s[i] === "|")) i++;
+      cut(s.slice(start, i));
       continue;
     }
     buf.push(ch);
     i++;
   }
-  segs.push(buf.join(""));
-  return segs.map((x) => x.trim()).filter(Boolean);
+  parts.push(buf.join(""));
+  return parts;
 }
+
+/** Split a command line into segments on ; && || | and newlines, respecting quotes. */
+export function splitSegments(command) {
+  return splitKeep(command).filter((_, idx) => idx % 2 === 0).map((x) => x.trim()).filter(Boolean);
+}
+const RUNUSER_VALUE_OPTS = new Set(["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"]);
 
 /** Whitespace-delimited tokens of a segment, shell-quote-aware: a quoted run (even one containing spaces)
  *  stays part of the SAME token as any adjacent unquoted/quoted content, and quote delimiters/backslash
@@ -172,7 +181,7 @@ const WRAPPER_SPECS = {
   // Everything after `--` is bash -c's script, not argv -- handled by joinAfterDashDash.
   capsh: { joinAfterDashDash: true },
   // plain peels: no operand before the command; leading options skipped (listed value-opts consumed).
-  nohup: {}, exec: {}, command: {}, builtin: {}, time: {}, pkexec: { valueOpts: new Set(["-u", "--user"]) }, setsid: {}, fakeroot: {},
+  nohup: {}, exec: { valueOpts: new Set(["-a"]) }, command: {}, builtin: {}, time: {}, pkexec: { valueOpts: new Set(["-u", "--user"]) }, setsid: {}, fakeroot: {},
   eatmydata: {}, proxychains: {}, proxychains4: {}, busybox: {},
   watch: { valueOpts: new Set(["-n", "--interval"]) },
   unshare: { valueOpts: new Set(["-S", "-G", "--setuid", "--setgid", "-w", "--wd",
@@ -266,30 +275,29 @@ export function peelCommand(toksIn, opts = {}) {
     const spec = WRAPPER_SPECS[prog];
     if (!spec) return toks;
     if (spec.runuserStyle) {
-      // runuser [opts] [-] [user] cmd...: the first bare positional is the user ONLY when a command
-      // still follows it, never when it IS the command (`runuser -u root bash -c ...` already named
-      // the user via -u).
-      // runuser -c/--command: the script IS the command. Hand the whole invocation to scriptOf (suScript)
-      // so its -c text is unwrapped exactly as su -c is; peeling past -c would lose the script.
+      // runuser [opts] [-] [user] cmd...: the first bare positional is the USER only when a command still
+      // follows it and -u/--user hasn't already named one; options may sit on either side of the user
+      // (`runuser root -l -c ...`, `runuser -l root -s /bin/bash -c ...`).
+      // -c/--command: the script IS the command. Hand the whole invocation to scriptOf (suScript) so its -c
+      // text is unwrapped exactly as su -c is; peeling past -c would lose the script.
       const cmdOpt = (t) => t === "-c" || t === "--command" || t.startsWith("--command=") || (t.length > 2 && t.startsWith("-c") && !t.startsWith("--"));
       let i = 1;
       let namedUser = false;
+      let sawUser = false;
       while (i < toks.length) {
         const t = toks[i];
         if (cmdOpt(t)) return ["runuser", ...toks.slice(1)];
         if (t === "--") { i++; break; }
-        if (!t.startsWith("-") || t === "-") break;
-        if (["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"].includes(t)) {
+        if (t === "-") { i++; continue; }
+        if (t.startsWith("-")) {
           if (t === "-u" || t === "--user") namedUser = true;
-          i += 2;
+          i += RUNUSER_VALUE_OPTS.has(t) ? 2 : 1;
           continue;
         }
+        if (namedUser || sawUser || i + 1 >= toks.length) break;
+        sawUser = true;
         i++;
       }
-      if (i < toks.length && toks[i] === "-") i++;
-      // The first bare positional is the USER only when -u/--user didn't already name one and a
-      // command still follows it (`runuser bob ls` vs `runuser -u bob ls`).
-      if (!namedUser && i < toks.length && i + 1 < toks.length && !toks[i].startsWith("-")) i++;
       if (i < toks.length && cmdOpt(toks[i])) return ["runuser", ...toks.slice(1)];
       if (i < toks.length && toks[i] === "--") i++;
       toks = toks.slice(i);
@@ -376,57 +384,164 @@ export function programOf(segment) {
 }
 
 // ── command-word folding (guard's expandedSegments only) ─────────────────────────────────────────
-// A command word that a literal-printing substitution or a literal-assigned variable builds --
-// `$(echo rm) -rf /`, `` `echo rm` -rf / ``, `r$(echo m) -rf /`, `x=rm; $x -rf /` -- folds to its
-// literal text before any rule reads the segment. Only the COMMAND word (past VAR=val prefixes,
-// keywords and declaration builtins) is folded; a value not provable from literal text in the same
-// script stays opaque (disclosed limit: runtime-computed values).
-const FOLD_SUBST_RE = /\$\(\s*(?:echo(?:\s+-[neE]+)*|printf)\s+([^\s()$`'"\\;&|<>%]+)\s*\)|`\s*(?:echo(?:\s+-[neE]+)*|printf)\s+([^\s()$`'"\\;&|<>%]+)\s*`/g;
+// Literal words a command builds from its own text -- `$(echo rm) -rf /`, `` `echo rm` -rf / ``,
+// `x=rm; $x -rf /`, `x='rm -rf /'; bash -c "$x"` -- fold to the literal before any rule reads the command.
+// Only values provable from the command text fold; a value computed at runtime stays opaque (disclosed limit).
+const FOLD_SUBST_RE = /\$\(\s*(?:echo(?:\s+-[neE]+)*|printf)\s+('[^']*'|"[^"$`\\]*"|[^\s()$`'"\\;&|<>%]+)\s*\)|`\s*(?:echo(?:\s+-[neE]+)*|printf)\s+('[^']*'|"[^"$`\\]*"|[^\s()$`'"\\;&|<>%]+)\s*`/g;
 const FOLD_VAR_RE = /\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g;
 const FOLD_WORD_RE = /^(\s*[({!]*\s*)((?:\$\([^()]*\)|`[^`]*`|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|[^\s;&|()$`'"<>\\])+)/;
-const LITERAL_VALUE_RE = /^[^\s$`'"\\;&|<>()]*$/;
+// A folded value: text a shell re-reads as the same words, with no expansion, quoting or operator characters.
+const LITERAL_VALUE_RE = /^[^$`"'\\;&|<>()%\n]*$/;
 const DECL_BUILTINS = new Set(["export", "local", "readonly", "declare", "typeset"]);
 
-function foldText(text, vars) {
-  return text.split(/('[^']*')/).map((piece, idx) => {
-    if (idx % 2 === 1) return piece; // single-quoted: never expanded
-    return piece
-      .replace(FOLD_SUBST_RE, (_m, a, b) => a ?? b)
-      .replace(FOLD_VAR_RE, (m, a, b) => (vars.has(a ?? b) ? vars.get(a ?? b) : m));
-  }).join("");
+const unquoteNoSplit = (v) => v.replace(/'([^']*)'/g, "$1").replace(/"([^"]*)"/g, "$1");
+
+/** Replace literal-printing substitutions with their literal text, to a fixed point so nesting folds too.
+ *  Over-approximation: a literal inside single quotes folds as well (`'$(echo rm)'`); only ever widens the view. */
+function foldSubst(text) {
+  let cur = text;
+  for (let pass = 0; pass < 8; pass++) {
+    const next = cur.replace(FOLD_SUBST_RE, (m, a, b) => {
+      const v = unquoteNoSplit(a ?? b);
+      return LITERAL_VALUE_RE.test(v) ? v : m;
+    });
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
 }
 
-/** Fold the command word of each segment of ONE script, in order. `vars` tracks literal assignments made
- *  by earlier segments of this same script; a reassignment to a non-literal (or one followed by a quote)
- *  forgets the name. Callers fold each origin group (raw command, each unwrapped body, each heredoc) with
- *  its own call so one group's variables never leak into another. */
-export function foldCommandWords(segments) {
-  const vars = new Map();
-  return segments.map((seg) => {
-    let out = "";
-    let rest = seg;
-    for (;;) {
-      const m = FOLD_WORD_RE.exec(rest);
-      if (!m) break;
-      const [whole, prefix, word] = m;
-      const after = rest.slice(whole.length);
-      out += prefix;
-      rest = after;
-      if (KEYWORD_SKIP.has(word) || DECL_BUILTINS.has(word)) { out += word; continue; }
-      if (ASSIGN_RE.test(word)) {
-        const eq = word.indexOf("=");
-        const name = word.slice(0, eq);
-        const value = foldText(word.slice(eq + 1), vars);
-        if (LITERAL_VALUE_RE.test(value) && !/^['"\\]/.test(after)) vars.set(name, value); else vars.delete(name);
-        out += word.slice(0, eq + 1) + value;
-        continue;
-      }
-      out += foldText(word, vars);
-      break; // the first real command word is folded; nothing after it is a command word
-    }
-    return out + rest;
-  });
+/** `$name` / `${name}` replaced by its recorded literal; single-quoted runs are never expanded. */
+function foldVars(text, vars) {
+  return text.split(/('[^']*')/).map((piece, idx) => (idx % 2 === 1 ? piece
+    : piece.replace(FOLD_VAR_RE, (m, a, b) => (vars.has(a ?? b) ? vars.get(a ?? b) : m)))).join("");
 }
+
+function foldText(text, vars) {
+  let cur = text;
+  for (let pass = 0; pass < 8; pass++) {
+    const next = foldVars(foldSubst(cur), vars);
+    if (next === cur) return cur;
+    cur = next;
+  }
+  return cur;
+}
+
+/** A chunk that is a lone assignment: no whitespace left once quoted runs and substitutions are blanked. */
+const assignOnly = (body) => !/\s/.test(body.trim().replace(/'[^']*'|"[^"]*"|\$\([^()]*\)|`[^`]*`/g, ""));
+
+/** Fold ONE separator-free chunk. Keywords and declaration builtins are skipped; a lone literal assignment is
+ *  recorded in `vars` (and re-emitted as NAME='value'); a prefix assignment (`x=1 cmd`) persists nothing. */
+function foldChunk(seg, vars) {
+  let out = "";
+  let rest = seg;
+  for (;;) {
+    const m = FOLD_WORD_RE.exec(rest);
+    if (!m) break;
+    const [whole, prefix, word] = m;
+    if (KEYWORD_SKIP.has(word) || DECL_BUILTINS.has(word)) { out += prefix + word; rest = rest.slice(whole.length); continue; }
+    if (ASSIGN_RE.test(word)) {
+      const eq = word.indexOf("=");
+      const name = word.slice(0, eq);
+      const body = rest.slice(prefix.length);
+      if (assignOnly(body)) {
+        const folded = foldText(body.slice(eq + 1), vars);
+        const value = unquoteNoSplit(folded);
+        if (value !== "" && LITERAL_VALUE_RE.test(value)) { vars.set(name, value); return `${out}${prefix}${name}='${value}'`; }
+        vars.delete(name);
+        return `${out}${prefix}${name}=${folded}`;
+      }
+      out += prefix + word;
+      rest = rest.slice(whole.length);
+      continue;
+    }
+    if (word === "unset") for (const n of rest.slice(whole.length).trim().split(/\s+/)) vars.delete(n);
+    break;
+  }
+  return out + foldText(rest, vars);
+}
+
+/** The whole command with its literal words folded, separators kept. Assignments carry across the chunks of
+ *  one script; a script run separately (a bash -c body, a heredoc) is folded with its own call. */
+export function foldLiterals(command) {
+  const vars = new Map();
+  return splitKeep(command).map((part, idx) => (idx % 2 === 1 ? part : foldChunk(part, vars))).join("");
+}
+
+/** The text a literal producer prints: `echo X`, `printf 'X\n'`. null for anything whose output is not literal. */
+function literalOutput(toks) {
+  if (toks[0] === "echo") {
+    const args = toks.slice(1);
+    let k = 0;
+    while (k < args.length && /^-[neE]+$/.test(args[k])) k++;
+    return args.slice(k).join(" ") || null;
+  }
+  if (toks[0] === "printf") {
+    const fmt = toks[1];
+    if (fmt === undefined || fmt.includes("%")) return null;
+    return fmt.replace(/\\n/g, "\n");
+  }
+  return null;
+}
+
+/** `xargs -I{} cmd ...` fed a literal body: one composed command per body line, the replacement substituted. */
+function xargsComposed(toks, body) {
+  let repl = null;
+  let j = 1;
+  while (j < toks.length && toks[j].startsWith("-")) {
+    const t = toks[j];
+    if (t === "-I") { repl = toks[j + 1] ?? null; j += 2; continue; }
+    if (t.startsWith("-I")) { repl = t.slice(2); j++; continue; }
+    if (t === "-i") { repl = "{}"; j++; continue; }
+    j += XARGS_VALUE_OPTS.has(t) ? 2 : 1;
+  }
+  const cmd = toks.slice(j);
+  if (!repl || !cmd.length) return [];
+  const quote = (t) => (/^[\w@%+=:,./-]+$/.test(t) ? t : `'${t.replace(/'/g, "'\\''")}'`);
+  return body.split("\n").filter(Boolean).map((line) => cmd.map((t) => quote(t.split(repl).join(line))).join(" "));
+}
+
+/** Script text a literal producer pipes into a shell or an xargs-composed command: `echo 'rm -rf /' | sh`,
+ *  `printf 'rm -rf /\n' | bash`, `echo 'rm -rf /' | xargs -I{} sh -c '{}'`. A producer whose output is computed
+ *  at runtime stays opaque (disclosed limit). */
+export function pipeFedScripts(command) {
+  const out = [];
+  for (const pipeline of splitPipelines(stripHeredocs(command || ""))) {
+    for (let i = 0; i + 1 < pipeline.length; i++) {
+      const body = literalOutput(words(pipeline[i]));
+      if (body === null) continue;
+      const next = words(pipeline[i + 1]);
+      if (!next.length) continue;
+      if (base(next[0]) === "xargs") { out.push(...xargsComposed(next, body)); continue; }
+      const [prog, ...args] = peelCommand(next);
+      if (prog && SHELL_WRAPPER_PROGS.has(base(prog)) && args.every((a) => a.startsWith("-"))) out.push(body);
+    }
+  }
+  return out;
+}
+
+/** Bodies of process substitutions `<(…)` / `>(…)`: bash runs each body as a command whose output feeds the outer
+ *  command (`cat <(rm -rf /)`). Balanced-paren scan, quote-unaware on purpose: a body inside quotes is still text
+ *  a rule can see, so over-reporting is the safe side. Nested substitutions are found by continuing past the opener. */
+export function processSubBodies(command) {
+  const s = command || "";
+  const out = [];
+  for (let i = 0; i + 1 < s.length; i++) {
+    if ((s[i] !== "<" && s[i] !== ">") || s[i + 1] !== "(") continue;
+    let depth = 0;
+    let j = i + 1;
+    for (; j < s.length; j++) {
+      if (s[j] === "(") depth++;
+      else if (s[j] === ")" && --depth === 0) break;
+    }
+    out.push(s.slice(i + 2, j));
+  }
+  return out;
+}
+
+// `f() { cmd; }` and `function f { cmd; }`: the header segment carries the body's first command after `{`.
+const FUNC_HEADER_RE = /^\s*(?:function\s+[A-Za-z_][\w.-]*\s*(?:\(\s*\))?|[A-Za-z_][\w.-]*\s*\(\s*\))\s*\{\s*(\S.*)$/s;
+
 
 // ── wrapper unwrap: bash -c/sh -c/eval/xargs/find -exec/su/ssh/..., shared by every rule ──────────────
 export const SHELL_WRAPPER_PROGS = new Set(["sh", "bash", "dash", "zsh", "ksh", "fish", "csh", "tcsh"]);
@@ -606,6 +721,10 @@ export function unwrapScripts(segments, maxDepth = 3) {
         out.push(sp);
         walk(splitSegments(stripHeredocs(sp)), depth + 1);
       }
+      // A function header's body text is script text too: `f() { rm -rf /; }; f` splits its first command
+      // onto the header segment, where no rule would read it.
+      const fn = FUNC_HEADER_RE.exec(seg);
+      if (fn) { out.push(fn[1]); walk(splitSegments(stripHeredocs(fn[1])), depth + 1); }
       let [prog, args] = programOf(seg);
       if (prog === null) continue;
       const invoked = indirectInvokes(prog, args);
@@ -629,6 +748,8 @@ export function unwrapScripts(segments, maxDepth = 3) {
   walk(segments, 0);
   return out;
 }
+
+// Script text a literal producer feeds to a shell. See pipeFedScripts.
 
 const SUBST_LIT_TOKEN_RE = /^(?:\$\((.*)\)|`(.*)`)$/s;
 /** If a token is exactly one `$(cmd ...)`/`` `cmd ...` `` substitution whose command is a literal-
@@ -992,8 +1113,9 @@ export function splitPipelines(command) {
   return pipelines;
 }
 
-// a leading digit is an fd number (2>&1, 2>/dev/null); the target after >/>>/< is a single word
-const REDIRECT_RE = /\d*(?:>{1,2}&\d+|>{1,2}\S*|<{1,2}\S*)/g;
+// a leading digit is an fd number (2>&1, 2>/dev/null); the target after >/>>/< is a single word. A here-string
+// (`<<< 'cmd'`) blanks its whole operand: that operand is the stdin data, not a program argument.
+const REDIRECT_RE = /\d*(?:<<<\s*(?:'[^']*'|"[^"]*"|\S+)|>{1,2}&\d+|>{1,2}\S*|<{1,2}\S*)/g;
 /** Blank out shell redirects (`>out`, `>>log`, `2>&1`, `</dev/null`, ...) so a trailing redirect after a
  *  piped command doesn't break program-name matching. Heuristic text substitution, not parsing: scoped to
  *  callers that specifically need redirect-free text (curl|sh / secret-exfiltration detection), not applied

@@ -66,6 +66,8 @@ Every tool **fails open with a note** when Jev is unreachable: the deterministic
 
 Every factual claim in the skills was checked line-by-line against the server code and the live tool schemas; the skills describe what the tools do, not what we wish they did.
 
+**`jev-command-guard` honest limits.** The guard is a lexical, pattern-based prefilter with no filesystem access: an `ln -s` already on disk is not resolved, `zpool destroy <pool-name>` with no device operand is not classified, and some P3 and fail-open shapes (`find / -delete`, `systemctl stop sshd`, `rsync --delete`) are not blocked. Full list in `skills/jev-command-guard/SKILL.md`. The xargs literal-body verdict change (`echo / | xargs -I{} rm -rf {}` now blocks) needs owner sign-off.
+
 ## Honest Jev
 
 <img src="docs/honest-jev-32.png" width="32" align="left" alt=""/>
