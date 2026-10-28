@@ -273,7 +273,7 @@ function parseForHonest(lines) {
   }
   const runs = bashCalls.filter((b) => resultsById.has(b.id)).map((b) => {
     const r = resultsById.get(b.id);
-    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall) };
+    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall), check: commandRunsCheck(b.command) };
   });
   return { edits, runs };
 }
@@ -295,41 +295,86 @@ const safe = (s) => redact(String(s || '')).replace(/\s+/g, ' ').replace(/["`]/g
 const ITEM_BUDGET = 2000;
 const CLAIM_FIELD_MAX = 800;
 const capLine = (s, n) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
-// Evidence is kept newest-first within `budget`. Stale runs (before the last edit) are dropped before any run after
-// the edits, and each dropped span becomes an explicit omission line inside the block. With no budget (Infinity) the
-// output is the full evidence.
+// Evidence for jev_classify, trimmed by RELEVANCE, never by age. Keep priority, highest first:
+//   1. the most recent FAILING check run after the edits (a failure is never evicted);
+//   2. the latest run of every check command after the edits, pass AND fail (one result per check verb first, so a
+//      verb-dense overflow still keeps each verb's newest result);
+//   3. non-check commands after the edits, newest first (noise goes first);
+//   4. stale commands (before the last edit), newest first, and never as verification of the edits.
+// Trimming is strict priority: the first item that does not fit stops the fill. Dropped spans become omission lines in
+// chronological order; the edit header and the check-count line are always present.
+const cmdKey = (command) => safe(command).slice(0, 300);
+const checkVerb = (command) => {
+  const toks = safe(command).split(/\s+/).filter(Boolean);
+  return toks.slice(0, toks.length > 1 && !toks[1].startsWith('-') ? 2 : 1).join(' ');
+};
 function evidenceText({ edits, runs }, budget = Infinity) {
-  const header = capLine(edits.length ? `Files edited this turn: ${edits.map((e) => safe(e)).join(', ')}.` : 'No files were edited this turn.', 300);
+  const header = capLine(edits.length ? `Files edited this turn: ${edits.map((e) => safe(e)).join(', ')}.` : 'No files were edited this turn.', 200);
   const line = (r) => {
     const cmd = safe(r.command).slice(0, 300);
     const tail = safe(r.output).slice(-300);
     return `- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`;
   };
-  const afterLines = runs.filter((r) => !r.stale).map(line);
-  const staleLines = runs.filter((r) => r.stale).map(line);
-  const render = (aKeep, sKeep) => {
-    const parts = [header];
-    if (afterLines.length) {
-      parts.push('Commands run after the edits:');
-      if (aKeep < afterLines.length) parts.push(`… ${afterLines.length - aKeep} earlier commands omitted (oldest first)`);
-      parts.push(...afterLines.slice(afterLines.length - aKeep));
-    } else {
-      parts.push('No commands were run after the edits.');
+  const afterIdx = runs.map((_, i) => i).filter((i) => !runs[i].stale);
+  const staleIdx = runs.map((_, i) => i).filter((i) => runs[i].stale);
+  const checkIdx = afterIdx.filter((i) => runs[i].check);
+  const newestFirst = (xs) => [...xs].sort((a, b) => b - a);
+  const latestByCmd = new Map();
+  for (const i of checkIdx) latestByCmd.set(cmdKey(runs[i].command), i);
+  const latest = newestFirst(latestByCmd.values());
+  const failing = checkIdx.filter((i) => runs[i].isError);
+  const seenVerbs = new Set();
+  const perVerb = latest.filter((i) => {
+    const v = checkVerb(runs[i].command);
+    if (seenVerbs.has(v)) return false;
+    seenVerbs.add(v);
+    return true;
+  });
+  const priority = [];
+  const queued = new Set();
+  const enqueue = (xs) => { for (const i of xs) if (!queued.has(i)) { queued.add(i); priority.push(i); } };
+  if (failing.length) enqueue([failing[failing.length - 1]]);
+  enqueue(perVerb);
+  enqueue(latest);
+  enqueue(newestFirst(afterIdx.filter((i) => !runs[i].check)));
+  enqueue(newestFirst(staleIdx));
+  const checkLine = !checkIdx.length
+    ? 'No check command ran after the edits.'
+    : `Check commands after the edits, latest run of each: ${latest.length} (${latest.filter((i) => !runs[i].isError).length} ok, ${latest.filter((i) => runs[i].isError).length} failed).`;
+  // Chronological; a run of dropped indices collapses into one omission line.
+  const section = (idxs, keep) => {
+    const out = [];
+    let gap = 0;
+    for (const i of idxs) {
+      if (!keep.has(i)) { gap += 1; continue; }
+      if (gap) { out.push(`… ${gap} commands omitted`); gap = 0; }
+      out.push(line(runs[i]));
     }
-    if (staleLines.length && sKeep === 0) {
-      parts.push(`… ${staleLines.length} stale commands (run before the last edit) omitted`);
-    } else if (staleLines.length) {
-      parts.push("Commands run before the last edit (stale — do not count as verification of it):");
-      if (sKeep < staleLines.length) parts.push(`… ${staleLines.length - sKeep} earlier stale commands omitted (oldest first)`);
-      parts.push(...staleLines.slice(staleLines.length - sKeep));
+    if (gap) out.push(`… ${gap} commands omitted`);
+    return out;
+  };
+  const render = (keep) => {
+    const parts = [header];
+    if (afterIdx.length) parts.push(checkLine, 'Commands run after the edits:', ...section(afterIdx, keep));
+    else parts.push('No commands were run after the edits.');
+    if (staleIdx.length) {
+      if (staleIdx.some((i) => keep.has(i))) parts.push('Commands run before the last edit (stale — do not count as verification of the edits):', ...section(staleIdx, keep));
+      else parts.push(`… ${staleIdx.length} stale commands (run before the last edit) omitted`);
     }
     return parts.join('\n');
   };
-  let aKeep = afterLines.length;
-  let sKeep = staleLines.length;
-  while (sKeep > 0 && render(aKeep, sKeep).length > budget) sKeep -= 1;
-  while (aKeep > 0 && render(aKeep, sKeep).length > budget) aKeep -= 1;
-  return render(aKeep, sKeep);
+  const keep = new Set();
+  for (const i of priority) {
+    keep.add(i);
+    if (render(keep).length > budget) { keep.delete(i); break; }
+  }
+  return render(keep);
+}
+// Whether one Bash command runs a check in program position of any chain element (the same test as
+// sameCallCheckIsEvidence, without the write-after-check exclusion: it classifies the RUN, not its place in the turn).
+function commandRunsCheck(command) {
+  const bare = stripHeredocBodies(command).replace(/'[^']*'|"[^"]*"/g, '""');
+  return bare.split(CHAIN_SPLIT_RE).map((u) => u.trim()).filter(Boolean).some(executesCheck);
 }
 // One jev_classify item: the CLAIM line, the nonce-delimited evidence block, and its closing marker, within ITEM_BUDGET.
 function classifyItemText(claim, nonce, ev) {
@@ -337,13 +382,19 @@ function classifyItemText(claim, nonce, ev) {
   const tail = `\n[/tool-log:${nonce}]`;
   return head + evidenceText(ev, ITEM_BUDGET - head.length - tail.length) + tail;
 }
-// The claim as a one-line JSON field. A claim whose escaped form exceeds CLAIM_FIELD_MAX is cut on the raw text (never
-// mid-escape) and marked, so the field stays valid JSON and the markers after it survive.
+// The claim as a one-line JSON field. A claim over CLAIM_FIELD_MAX is cut on the raw text (never mid-escape), then moved
+// back to its last sentence end when that end keeps at least half the cut, so the cut lands on a sentence boundary
+// whenever one is in reach. The marker keeps the field valid JSON, and the markers after it survive.
 function claimField(raw) {
   const claim = redact(raw);
   if (JSON.stringify(claim).length <= CLAIM_FIELD_MAX) return JSON.stringify(claim);
   let cut = claim;
   while (JSON.stringify(`${cut} […]`).length > CLAIM_FIELD_MAX) cut = cut.slice(0, -1);
+  const ends = [...cut.matchAll(/[.!?](?=\s)/g)];
+  if (ends.length) {
+    const at = ends[ends.length - 1].index + 1;
+    if (at >= cut.length / 2) cut = cut.slice(0, at);
+  }
   return JSON.stringify(`${cut} […]`);
 }
 // Splits a final message into claim-candidate strings: a markdown table row's cells are each their own
@@ -390,10 +441,10 @@ function claimsFromSegment(rawSegment, shortOut) {
     const s = sentence.replace(/\*\*|__/g, '').trim();
     const isQuestion = s.endsWith('?') && QUESTION_START_RE.test(s);
     if (s.length < 10 || isQuestion) {
-      if (!isQuestion && /[A-Za-z0-9]/.test(s)) shortOut.push(s.slice(0, 500));
+      if (!isQuestion && /[A-Za-z0-9]/.test(s)) shortOut.push(s);
       continue;
     }
-    claims.push(s.slice(0, 500));
+    claims.push(s);
   }
   return claims;
 }
@@ -440,7 +491,7 @@ function splitClaims(message) {
   // jev_classify would be skipped and a terse false completion would pass. Fall back to those short statements,
   // joined, but only when no longer claim qualified. Questions never enter shortCandidates, so a message that is
   // only a question ("Want me to run the tests?") still produces no claims.
-  if (!claims.length && shortCandidates.length) claims.push(shortCandidates.join(' ').slice(0, 500));
+  if (!claims.length && shortCandidates.length) claims.push(shortCandidates.join(' '));
   return claims;
 }
 

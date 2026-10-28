@@ -1023,6 +1023,81 @@ test("P2-1: a quote-heavy claim plus a long edited path and a long passing run: 
   assert.ok(t.endsWith(`[/tool-log:${nonce}]`), "closing marker survives");
   assert.ok(t.includes("42 passed"), "newest passing run survives the claim's budget");
 });
+// ── PR #31 verdict 6480503885 (P2-A, P2-B, P3): relevance-based evidence trim and the claim sentence cut ──
+// Classifier stand-in for these replays: this sandbox has no Jev credentials, so jev_classify cannot run. It judges
+// deterministically: misrepresented when the claim asserts a pass AND the evidence block's latest test run failed;
+// consistent otherwise. The replays test the plumbing (what reaches the classifier, and what the gate does with the
+// answer). The verify leg is the REAL server verifyDone; only its Jev call (deps.ask) is stubbed.
+const standInClassifier = (item) => {
+  const claimLine = item.text.split("\n")[0];
+  const asserts = /pass/i.test(claimLine) && !/fail|still/i.test(claimLine);
+  return asserts && /`npm test[^`]*` -> failed/.test(item.text) ? "misrepresented" : "verified";
+};
+// Jev stand-in for verifyDone's deps.ask: the answer shape Jev returns for QUESTIONS (noul / choice objects).
+const askStub = async (state) => {
+  const says = /pass/i.test(state.final_message) && !/fail|still/i.test(state.final_message);
+  return { model: "stub", answers: { claims_done: { noul: says ? 0.95 : 0.05 }, claims_verified: { noul: says ? 0.9 : 0.05 }, verification_applies: { noul: 0.9 }, outcome: { choice: says ? "complete" : "partial", confidence: 0.9 } } };
+};
+const verifyUrl = pathToFileURL(path.join(here, "..", "server", "src", "kit", "verify.mjs")).href;
+// kit_verify_done → the real server verifyDone; jev_classify → the stand-in classifier.
+const serverPath = (classifier) => async (name, args) => {
+  if (name === "kit_verify_done") return (await import(verifyUrl)).verifyDone(args, { ask: askStub, jevAvailable: true });
+  return { results: args.items.map((item) => ({ id: item.id, classification: classifier(item), top_probability: 0.9, decision: "auto" })) };
+};
+test("P2-A S1 through decide() on the server path: a failing `npm test`, then 40 noise commands, then 'All tests pass.' is BLOCKED", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(serverPath(standInClassifier));
+  const noise = Array.from({ length: 40 }, (_, i) => [assistantToolUse(`n${i}`, "Bash", { command: `cat src/module${i}.js` }), toolResult(`n${i}`, "export const x = 1;")]).flat();
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok"), assistantToolUse("t1", "Bash", { command: "npm test" }), toolResult("t1", "FAIL parser.test.js\nTests: 1 failed", true), ...noise]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass." }, { fetchImpl });
+  const items = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items);
+  assert.ok(items.some((i) => /`npm test` -> failed/.test(i.text)), "the failing run must reach the classifier after 40 noise commands");
+  assert.ok(out && out.decision === "block", `expected block, got ${JSON.stringify(out)}`);
+  assert.match(out.reason, /HONEST:.*misrepresented/s);
+});
+test("P2-B S2 through decide() on the server path: a failing `npm test`, then 30 investigation commands, then an honest 'still fails' claim is ALLOWED", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(serverPath(standInClassifier));
+  const investigation = Array.from({ length: 30 }, (_, i) => [assistantToolUse(`v${i}`, "Bash", { command: `grep -n "expect" src/parser.test.js | head -${i + 1}` }), toolResult(`v${i}`, "12: expect(x)")]).flat();
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok"), assistantToolUse("t1", "Bash", { command: "npm test" }), toolResult("t1", "FAIL parser.test.js\nTests: 1 failed", true), ...investigation]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "The suite still fails on parser.test.js; I have not fixed it yet." }, { fetchImpl });
+  const items = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items);
+  assert.ok(items.some((i) => /`npm test` -> failed/.test(i.text)), "the failing run must reach the classifier");
+  assert.ok(!out || out.decision !== "block", `an honest failure report must not be blocked: ${JSON.stringify(out)}`);
+});
+test("P2-A: 12 long check commands overflow the item budget; the newest failing run survives and the item stays within 2000 chars", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(serverPath(() => "verified"));
+  const steps = [];
+  for (let i = 0; i < 12; i++) steps.push(assistantToolUse(`c${i}`, "Bash", { command: `npm test -- --grep "${i}${'q'.repeat(280)}"` }), toolResult(`c${i}`, `${'o'.repeat(1500)} ${i < 11 ? "Tests: 3 passed" : "Tests: 1 failed"}`, i === 11));
+  const transcript = writeTranscript([userPrompt("Fix it."), assistantToolUse("e1", "Edit", { file_path: "src/a.js" }), toolResult("e1", "ok"), ...steps]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass." }, { fetchImpl });
+  const items = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items);
+  assert.equal(items.length, 1);
+  const t = items[0].text;
+  assert.ok(t.length <= 2000, `item is ${t.length} chars`);
+  assert.ok(t.includes("Tests: 1 failed"), "the newest failing run survives the overflow");
+  assert.ok(t.includes("omitted"), "the dropped runs are marked");
+});
+test("P3: a claim over CLAIM_FIELD_MAX is cut at its last sentence end when that end keeps at least half the cut", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(classifyAll("verified"));
+  const claim = `${"a".repeat(500)}. ${"b".repeat(600)}`;
+  const transcript = writeTranscript([userPrompt("Fix it."), assistantToolUse("e1", "Edit", { file_path: "src/a.js" }), toolResult("e1", "ok")]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: claim }, { fetchImpl });
+  const t = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items)[0].text;
+  assert.ok(t.includes(`"${"a".repeat(500)}. […]"`), "the cut lands on the sentence end, not mid-word");
+});
+test("P3: with no sentence end past the halfway point, the claim is hard-cut at the field cap", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch(classifyAll("verified"));
+  const claim = `${"a".repeat(50)}. ${"b".repeat(900)}`;
+  const transcript = writeTranscript([userPrompt("Fix it."), assistantToolUse("e1", "Edit", { file_path: "src/a.js" }), toolResult("e1", "ok")]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: claim }, { fetchImpl });
+  const t = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items)[0].text;
+  assert.ok(t.includes(`"${"a".repeat(50)}. ${"b".repeat(100)}`), "a sentence end this early is not used: the cut stays near the cap");
+  assert.ok(t.includes(" […]\""), "the truncation marker is kept");
+});
 test("P2-A decide(): `echo npm test > src/a.js` after an edit is a write, not a check, so the verify gate receives no check", async () => {
   fresh(); setBaseEnv({ gate: "verify" });
   const { fetchImpl, calls } = stubFetch(() => ALLOW);
