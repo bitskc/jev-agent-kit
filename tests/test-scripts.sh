@@ -80,6 +80,42 @@ big=$(python3 -c 'import json;print(json.dumps({"tool_name":"Bash","tool_input":
 ok "$(printf '%s' "$big" | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" ask "guard: oversized command -> ask, no call"
 ok "$(ev Bash '{"command":"cat .env"}' | JEV_MCP_TOKEN=t JEV_MCP_URL=http://127.0.0.1:9/mcp bash "$hook" 2>/dev/null | dec)" none "guard: http:// URL -> fail open, token never sent"
 ok "$(ev Bash '{"command":"ls"}' | JEV_MCP_TOKEN=t JEV_MCP_URL=https://127.0.0.1:9/mcp JEV_GUARD_TIMEOUT=0.3 bash "$hook" 2>/dev/null | dec)" none "guard: unreachable server -> fail open"
+redirect_test=$(python3 - "$root" <<'PYEOF'
+import sys, io, json, importlib.util, os
+root = sys.argv[1]
+os.environ["JEV_MCP_URL"] = "https://example.invalid/mcp"
+os.environ["JEV_MCP_TOKEN"] = "t"
+spec = importlib.util.spec_from_file_location("jev_guard_hook", os.path.join(root, "hooks/jev_guard_hook.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# The redirect handler must raise a distinguishable exception, not a bare network-class error.
+exc = None
+try:
+    mod._NoRedirect().redirect_request(None, None, 302, "Found", {}, "http://evil.example/steal")
+except Exception as e:
+    exc = e
+assert exc is not None, "redirect_request did not raise"
+assert isinstance(exc, mod.RedirectRefused), "redirect must raise RedirectRefused, got %s" % type(exc).__name__
+
+# main()'s exception routing must treat a redirect refusal as ask, never a silent fail-open allow.
+mod.call_guard = lambda args: (_ for _ in ()).throw(mod.RedirectRefused("redirect refused (302 -> http://evil.example/steal)"))
+sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}, "cwd": "/tmp"}))
+out = io.StringIO()
+sys.stdout = out
+try:
+    mod.main()
+except SystemExit:
+    pass
+sys.stdout = sys.__stdout__
+printed = out.getvalue().strip()
+assert printed, "redirect refusal produced no output (fail-open regression)"
+decision = json.loads(printed)["hookSpecificOutput"]["permissionDecision"]
+assert decision == "ask", "redirect refusal must ask, got %r" % decision
+print("PASS")
+PYEOF
+)
+ok "$redirect_test" "PASS" "guard: redirect refusal -> ask, never silent allow"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

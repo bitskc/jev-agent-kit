@@ -46,10 +46,15 @@ def _alarm(_signum, _frame):
     raise TimeoutError("hard timeout")
 
 
+class RedirectRefused(Exception):
+    """The endpoint tried to redirect the call: the server answered (just not sanely), so this is not an
+    outage to fail open on — same class as ServerRejected, never a silent allow."""
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     # A redirect would re-send the bearer to whatever host/scheme the 3xx names. Never follow one.
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise ValueError("redirect refused (%s -> %s)" % (code, newurl[:80]))
+        raise RedirectRefused("redirect refused (%s -> %s)" % (code, newurl[:80]))
 
 
 _opener = urllib.request.build_opener(_NoRedirect)
@@ -156,7 +161,7 @@ def main():
         signal.signal(signal.SIGALRM, _alarm)
         signal.setitimer(signal.ITIMER_REAL, TIMEOUT + 0.5)
         r = call_guard(args)
-    except ServerRejected as e:  # server reachable but refused the call: ask, never allow silently
+    except (ServerRejected, RedirectRefused) as e:  # server reachable but refused/redirected the call: ask, never allow silently
         if MODE == "shadow":
             sys.stderr.write("jev-guard (shadow): would ask: server rejected call: %s\n" % str(e)[:200])
             sys.exit(0)

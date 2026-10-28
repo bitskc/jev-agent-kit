@@ -56,7 +56,18 @@ async function guard(args: Record<string, unknown>): Promise<GuardResult> {
       if (typeof text !== "string") return { kind: "unavailable" };
       return { kind: "reply", reply: JSON.parse(text) as GuardReply };
     }
-  } catch {
+  } catch (e) {
+    let msg = "";
+    if (e instanceof Error) {
+      msg = e.message.toLowerCase();
+      if (e.cause instanceof Error) msg += ` ${e.cause.message.toLowerCase()}`;
+      if ("code" in e && typeof e.code === "string") msg += ` ${e.code.toLowerCase()}`;
+    }
+    if (msg.includes("redirect")) {
+      // A 3xx would re-send the bearer wherever it points; the endpoint answered, so this is a refusal to
+      // judge, not an outage — same class as a JSON-RPC error, never a silent allow.
+      return { kind: "rejected", detail: "redirect refused" };
+    }
     /* timeout, network, parse: fail open */
   }
   return { kind: "unavailable" };
