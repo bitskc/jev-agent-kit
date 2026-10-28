@@ -15,18 +15,17 @@ Tool: `kit_size_dispatch` on the `jev` MCP server (Claude Code: `mcp__jev__kit_s
 {
   "description": "Find where FOO_TIMEOUT is read",
   "prompt": "<the full brief you are about to send>",
-  "model": "opus",
-  "ladder": [["haiku", "small", "fast"], ["sonnet", "medium"], ["opus", "large"]]
+  "model": "opus"
 }
 ```
 - `description` and `model` are required. Passing the full `prompt` makes the judgement more accurate.
-- **Pass `ladder`** with the model names you really have, cheapest rung first, each rung a list of equivalent names (the first name is the one you should dispatch). Without it the server uses a built-in ladder (`scout-find, scout, workerS, workerO, director, fable`), and unknown names are treated as a high rung.
+- **Omit `ladder`** unless the tool's built-in ladder genuinely doesn't fit your fleet. The tool only recognises its own tier names (`scout-find, scout, workerS, workerO, director, fable`) plus bare model names like `haiku`/`sonnet`/`opus`; a *custom* ladder can't be ranked and the check returns `verdict:"unknown"` — it stops protecting you. Full model IDs like `claude-fable-5-1` resolve as unrecognised (`chosen.recognised: false`) and are treated as the director tier, so pass the tier name itself when checking. Translate tier → your model: scout-find/scout → cheapest (haiku-class), workerS/workerO → mid (sonnet-class), director → large (opus-class), fable → top tier.
 
 ## Act on the result
 
-Fields: `task_kind` (lookup, mechanical_edit, scoped_implementation, hard_problem, unclear), `recommended_model`, `mismatch`, `verdict` (`over_tiered` / `under_tiered` / ok), `action`, `reason`.
+Fields: `task_kind` (lookup, mechanical_edit, scoped_implementation, judgement, hard_problem, unclear), `recommended_model`, `mismatch`, `verdict` (`over_tiered` / `under_tiered` / `unknown` / ok), `action` (`block` / `warn` / `allow`), `reason`. `block` = the tool is confident enough to stop you (e.g. fable-tier dispatch with no justification); `warn` = borderline, proceed but note it.
 
-- `mismatch: false`: dispatch as planned.
+- `mismatch: false`: dispatch as planned. `verdict:"unknown"` means Jev was unavailable, gave an unusable answer, or you passed a custom ladder — it does NOT mean the tier is fine, and it is different from an unrecognised model (which is silently treated as director-tier).
 - `over_tiered`: re-dispatch with `recommended_model` (cheaper). Only keep the bigger model if you can state a concrete reason the classifier could not see.
 - `under_tiered`: use the larger `recommended_model`, or do the thinking yourself and delegate only the mechanical part.
 - It only judges when Jev is confident (>= 0.8 with a clear margin). If the answer is unclear, or Jev is unavailable, it returns no mismatch (fails open): proceed with your own judgement.
