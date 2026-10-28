@@ -9,9 +9,19 @@
 // fresh install never engages this hook until the user opts in.
 //
 //   verify: kit_verify_done on {task, final_message, file_changes, checks} — the same shape
-//           jev-verify-before-done/SKILL.md asks the model to send by hand. Blocks when verdict is
-//           "unverified". Always called (and its block signal always reported), whenever EITHER gate is
-//           engaged — not only when JEV_STOP_GATE itself says "verify"/"both" — see "honest" below for why.
+//           jev-verify-before-done/SKILL.md asks the model to send by hand. Always called (and its block
+//           signal always reported), whenever EITHER gate is engaged — not only when JEV_STOP_GATE itself
+//           says "verify"/"both" — see "honest" below for why. On a server that has shipped PR #30
+//           (reports `discloses_unverified` in `answers`), blocks on any `verdict === "unverified"`. On an
+//           OLDER server (no disclosure field) that alone is NOT safe to block on: the server's own
+//           pre-#30 "done without a fresh check" judgement has no concept of an honest disclosure at all,
+//           so ANY message presenting edited work as finished — including "edited, not run, as instructed"
+//           — reads as `unverified` there (measured: 10/13, 77%, false-blocked on real honest-disclosure
+//           transcripts, see hooks/fixtures/e2e-honest-disclosures/). The one old-server signal that IS
+//           safe to block on unconditionally is `false_claim` (the message explicitly claims checks were
+//           run and passed, and none were) — that doesn't depend on disclosure detection, since claiming
+//           verified when nothing ran is wrong regardless of what else the message also discloses. So on
+//           an older server, only `false_claim === true` blocks; a bare `unverified` verdict alone does not.
 //   honest: jev_classify on the final message's own claims, each paired with evidence BUILT FROM THE
 //           TRANSCRIPT's real tool calls since the user's last prompt — not the agent's own self-written
 //           EVIDENCE text, which is the self-attestation weakness Honest Jev's skill-only form can't close.
@@ -146,56 +156,75 @@ function parseForVerify(lines) {
 
 // ── honest-gate evidence: every tool call since the user's LAST prompt (not since the last edit — a
 // disclosure like "I did not run X" needs the full since-prompt picture, not just the post-edit tail).
-// Includes sidechain tool calls, for the same reason parseForVerify now does. ──────────────────────────
+// Includes sidechain tool calls, for the same reason parseForVerify now does. Each run is tagged `stale`
+// when its own call sequence number is before the last edit's (same ordering rule as parseForVerify's own
+// `checks`, via the same callSeq/lastEditCall pattern): a check that ran BEFORE the edit it's being asked
+// to corroborate is not evidence the edit works, and evidenceText below must never present it as if it
+// were. ──────────────────────────────────────────────────────────────────────────────────────────────
 function parseForHonest(lines) {
   let lastPromptIdx = -1;
   lines.forEach((d, i) => { if (isRealUserPrompt(d)) lastPromptIdx = i; });
   const since = lines.slice(lastPromptIdx + 1);
   const pending = new Map();
   const edits = [];
-  const runs = [];
+  const bashCalls = [];
+  const resultsById = new Map();
+  let callSeq = -1;
+  let lastEditCall = -1;
   for (const d of since) {
     const content = d.message && d.message.content;
     if (d.type === 'assistant' && Array.isArray(content)) {
       for (const c of content) {
         if (!c || c.type !== 'tool_use') continue;
+        callSeq += 1;
         pending.set(c.id, c);
         if (c.name === 'Edit' || c.name === 'Write' || c.name === 'NotebookEdit') {
           edits.push((c.input && (c.input.file_path || c.input.notebook_path)) || '(unknown file)');
+          lastEditCall = callSeq;
         }
+        if (c.name === 'Bash') bashCalls.push({ seq: callSeq, id: c.id, command: (c.input && c.input.command) || '' });
       }
     }
     if (d.type === 'user' && Array.isArray(content)) {
       for (const c of content) {
-        if (!c || c.type !== 'tool_result' || !c.tool_use_id) continue;
-        const call = pending.get(c.tool_use_id);
-        if (call && call.name === 'Bash') {
-          runs.push({ command: (call.input && call.input.command) || '', isError: !!c.is_error, output: resultTextOf(c.content).slice(-1500) });
-        }
+        if (c && c.type === 'tool_result' && c.tool_use_id) resultsById.set(c.tool_use_id, { text: resultTextOf(c.content), isError: !!c.is_error });
       }
     }
   }
+  const runs = bashCalls.filter((b) => resultsById.has(b.id)).map((b) => {
+    const r = resultsById.get(b.id);
+    return { command: b.command, isError: r.isError, output: r.text.slice(-1500), stale: b.seq <= lastEditCall };
+  });
   return { edits, runs };
 }
 // Redacted before anything reaches jev_classify (an untouched upstream tool with no server-side
 // redaction layer of its own, unlike kit_guard_command/kit_verify_done which redact server-side) — a
 // Bash command or its output legitimately touching a credential (curl with an Authorization header, a
-// fixture that echoes a key) must never be forwarded to a third-party model API unscrubbed.
+// fixture that echoes a key) must never be forwarded to a third-party model API unscrubbed. Pre-edit
+// (`stale`) runs are shown in their own, honestly-labeled section — never folded into "after the edits",
+// which previously let a passing check that ran BEFORE the edit it's being asked about read as if it
+// corroborated a claim about the edit (a false "tests pass" claim about untested code looked verified).
 function evidenceText({ edits, runs }) {
   const parts = [edits.length ? `Files edited this turn: ${edits.map((e) => redact(e)).join(', ')}.` : 'No files were edited this turn.'];
-  if (runs.length) {
+  const line = (r) => {
+    const cmd = redact(r.command);
+    const tail = redact(r.output).replace(/\s+/g, ' ').trim().slice(-300);
+    return `- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`;
+  };
+  const after = runs.filter((r) => !r.stale);
+  const stale = runs.filter((r) => r.stale);
+  if (after.length) {
     parts.push('Commands run after the edits:');
-    for (const r of runs) {
-      const cmd = redact(r.command);
-      const tail = redact(r.output).replace(/\s+/g, ' ').trim().slice(-300);
-      parts.push(`- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`);
-    }
+    for (const r of after) parts.push(line(r));
   } else {
     parts.push('No commands were run after the edits.');
   }
+  if (stale.length) {
+    parts.push("Commands run before the last edit (stale — do not count as verification of it):");
+    for (const r of stale) parts.push(line(r));
+  }
   return parts.join('\n');
 }
-
 // Splits a final message into claim-candidate strings: a markdown table row's cells are each their own
 // candidate; a bullet/checklist item or heading has its marker stripped but its TEXT IS STILL CLASSIFIED,
 // never discarded ("## Done: all tests pass" is a heading AND a false claim — dropping the whole line let
@@ -236,11 +265,13 @@ function claimsFromSegment(rawSegment) {
 }
 function splitClaims(message) {
   const claims = [];
+  const nonFenceLines = [];
   let inFence = false;
   for (const rawLine of String(message || '').split('\n')) {
     let line = rawLine.trim();
     if (/^```/.test(line)) { inFence = !inFence; continue; }
     if (inFence || !line) continue;
+    nonFenceLines.push(line);
 
     // blockquote: strip one or more leading "> " before anything else.
     line = line.replace(/^(?:>\s*)+/, '').trim();
@@ -255,6 +286,16 @@ function splitClaims(message) {
     }
 
     claims.push(...claimsFromSegment(line));
+  }
+  // A message that is ALL short fragments (every segment under the 10-char claim floor -- a terse "Done."
+  // or "Fixed it.") would otherwise produce zero claims and skip jev_classify entirely: a short false
+  // completion claim had a measurably better chance of passing than a longer, equally false one, purely
+  // because of its length. Fall back to the whole non-fenced text as one claim candidate -- only the
+  // non-fenced text, so a message that's purely a code block still correctly produces no claims (code is
+  // never a claim, the one thing this fallback must not override).
+  if (!claims.length) {
+    const whole = nonFenceLines.join(' ').trim();
+    if (whole) claims.push(whole.slice(0, 500));
   }
   return claims.slice(0, 64); // jev_classify's own item cap
 }
@@ -372,6 +413,12 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // The transcript file is not guaranteed to be flushed through the final assistant text block yet at the
   // instant Stop fires; Claude Code hands that text to the hook directly, so prefer it.
   const finalMessage = hook.last_assistant_message || vp.finalMessage;
+  // Deliberate scope boundary, not an oversight: a turn with zero edits is never read for claims at all,
+  // so a no-edit turn that re-asserts an EARLIER turn's "done, all tests pass" is not caught here. This
+  // mirrors kit_verify_done's own pre-existing "no changes = not applicable" convention (the same question
+  // this hook already defers to for the verify leg) rather than inventing a different boundary for the
+  // honest leg -- a conscious choice, not silence: catching a no-edit false re-assertion would need
+  // tracking claims across turns, out of scope for a per-Stop-event hook that only ever sees one turn.
   if (!finalMessage || vp.fileChanges === 0) { note('skip: no final message or no file changes'); return null; }
 
   // kit_verify_done is always called when either gate wants it, not only gate=verify/both: the honest gate
@@ -398,12 +445,22 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
   const [verdict, classifyResult] = await Promise.all([verifyPromise, classifyPromise]);
   note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
-  const verifyBlocked = !!(verdict && (verdict.verified === false || verdict.verdict === 'unverified'));
   // A server that has shipped jev-agent-kit PR #30 puts `discloses_unverified` inside `answers` whenever it
   // actually ran the Jev judgement (absent only on an early-return fail-open path, same as an older server).
   // Without this field there is no way to tell "this message is an honest disclosure" from "this message is
-  // unverifiable and maybe suspicious" from the server side at all.
+  // unverifiable and maybe suspicious" from the server side at all -- compute this FIRST, verifyBlocked below
+  // depends on it.
   const serverHasDisclosure = !!(verdict && verdict.answers && Object.prototype.hasOwnProperty.call(verdict.answers, 'discloses_unverified'));
+  // On a server WITH disclosure support, a bare `unverified` verdict is already safe to block on (a real
+  // disclosure gets its own "disclosed_unverified" verdict instead, see alreadyDisclosed below -- it never
+  // reaches plain `unverified`). On an OLDER server, `unverified` alone is NOT safe: that server's pre-#30
+  // judgement has no disclosure concept at all, so ANY message presenting edited work as finished reads as
+  // `unverified` there regardless of how plainly it discloses non-verification (measured 10/13, 77%, false
+  // blocks on real honest-disclosure transcripts -- see hooks/fixtures/e2e-honest-disclosures/). The one
+  // old-server signal that IS safe to block on unconditionally is `false_claim` (claims checks passed with
+  // none run) -- that doesn't depend on disclosure detection, since claiming verified when nothing ran is
+  // wrong no matter what else the message also discloses.
+  const verifyBlocked = !!(verdict && (serverHasDisclosure ? (verdict.verified === false || verdict.verdict === 'unverified') : verdict.false_claim === true));
 
   const reasons = [];
 
@@ -436,7 +493,7 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
         });
         if (offending.length) {
           const review = classifyResult.results.filter((r) => r.decision === 'review' && !offending.includes(r));
-          const byId = Object.fromEntries(claims.map((c, i) => ['c' + i, c]));
+          const byId = Object.fromEntries(claims.map((c, i) => ['c' + i, redact(c)])); // redacted: this text is quoted back into the block `reason`, which re-enters the transcript
           const offendingLines = offending.map((r) => `- "${byId[r.id]}" — classified ${r.classification} (${Math.round((r.top_probability || 0) * 100)}%)`);
           let text = `HONEST: ${offending.length} claim${offending.length === 1 ? '' : 's'} in your message ${offending.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
             offendingLines.join('\n') + `\n\nWhat the tool log actually shows:\n${evidence}` +

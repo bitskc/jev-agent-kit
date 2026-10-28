@@ -93,7 +93,9 @@ test("verify gate: false completion claim -> block", async () => {
   fresh(); setBaseEnv({ gate: "verify" });
   const { fetchImpl, calls } = stubFetch((name) => {
     assert.equal(name, "kit_verify_done");
-    return { verified: false, verdict: "unverified", action: "block", reason: "reports completion after 1 file change with no check run." };
+    // false_claim: true -- the message claims checks passed with none run, the one old-server signal
+    // that's reliable without disclosure detection (see P0-1 fix).
+    return { verified: false, verdict: "unverified", action: "block", reason: "reports completion after 1 file change with no check run.", false_claim: true };
   });
   const transcript = writeTranscript(editedOneFile());
   const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
@@ -275,11 +277,19 @@ test("honest gate: 'unverifiable' blocks by default once more (restored breadth)
   assert.match(out.reason, /HONEST:.*unverifiable/s);
 });
 
-test("honest gate: a gameable-sounding overclaim ('I verified everything manually') still blocks via kit_verify_done's own, always-reported verdict, even when jev_classify alone calls it 'hedged'", async () => {
+test("honest gate: a gameable-sounding overclaim ('I verified everything manually') still blocks via kit_verify_done's own, always-reported verdict, even when jev_classify alone calls it 'hedged' (NEW server: 'unverified' alone is safe to block on there)", async () => {
   fresh(); setBaseEnv({ gate: "honest" }); // honest-only: proves VERIFY's signal is no longer discarded
   const { fetchImpl } = stubFetch((name, args) => {
     if (name === "kit_verify_done") {
-      return { verified: false, verdict: "unverified", action: "block", reason: "claims the work is correct with nothing actually checked, tool or otherwise." };
+      // A server with PR#30's disclosure field: this message doesn't actually disclose non-verification
+      // (it claims verification happened, just manually, not via tooling) so Jev's own discloses_unverified
+      // question scores low -- verdict lands on plain "unverified", which a server WITH disclosure support
+      // is safe to block on unconditionally (see the P0-1 fix's serverHasDisclosure branch).
+      return {
+        verified: false, verdict: "unverified", action: "block",
+        reason: "claims the work is correct with nothing actually checked, tool or otherwise.",
+        answers: { claims_done: 1, claims_verified: 0, verification_applies: 1, discloses_unverified: 0, outcome: "complete" },
+      };
     }
     // The claim's wording superficially resembles a disclosure; the classifier calls it hedged even though
     // nothing was actually verified. The honest gate's own classify-based rule would miss this (hedged
@@ -320,8 +330,10 @@ test("honest gate, OLD server (no discloses_unverified field at all): 'unverifia
   fresh(); setBaseEnv({ gate: "honest" });
   const { fetchImpl } = stubFetch((name, args) => {
     if (name === "kit_verify_done") {
-      // Exact shape of the currently-deployed (pre-PR#30) server: `answers` has no `discloses_unverified` key.
-      return { verified: false, verdict: "unverified", action: "block", reason: "overclaims completion.", answers: { claims_done: 1, claims_verified: 1, verification_applies: 1, outcome: "overclaim" } };
+      // Exact shape of the currently-deployed (pre-PR#30) server: `answers` has no `discloses_unverified`
+      // key. false_claim: true -- the message claims tests passed with none run, the one old-server signal
+      // that's reliable without disclosure detection.
+      return { verified: false, verdict: "unverified", action: "block", reason: "overclaims completion.", false_claim: true, answers: { claims_done: 1, claims_verified: 1, verification_applies: 1, outcome: "overclaim" } };
     }
     return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.8, decision: "auto" })) };
   });
@@ -626,6 +638,139 @@ test("jev-redact.js (hook's local port) stays byte-identical to server/src/kit/s
     "mkdir -p DIR", "cp -p src dst", "scp -p file.txt host:/tmp", "ssh -p 22 user@host",
     "docker run -p 8080:80 image", "sort -u file.txt", "git push -u origin main", "psql -p 5432 -U app",
     'git commit -m "add sk-proj-abcdefghijklmnopqrstuvwxyz0123456789"',
+    // P2: the other 13 of SECRET_RULES's 19 rules had no sample here at all -- a future edit to one of
+    // these in only the server's copy would have passed this drift test silently. Built via concatenation
+    // (not one contiguous literal) so these synthetic, non-functional samples don't themselves trip a
+    // secret-scanner on this source file.
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJBAK...\n-----END RSA PRIVATE KEY-----",
+    'curl -H "Authorization: ' + "Bearer " + "abcdefghijklmnopqrstuvwxyz123456" + '" https://api.example.com',
+    "curl https://admin:" + "hunter2" + "@internal.example.com/api",
+    "apikey_" + "1234567890abcdef",
+    "sk_live_" + "51H8xxxxxxxxxxxxxxxABC",
+    "rk_live_" + "51H8xxxxxxxxxxxxxxxABC",
+    "npm_" + "1234567890abcdefghijklmnopqrstuvwxyz12",
+    "ghp_" + "1234567890abcdefghijklmnopqrstuvwxyz",
+    "github_pat_" + "11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz",
+    "AKIA" + "IOSFODNN7EXAMPLE",
+    "xoxb-" + "1234567890-abcdefghijklmnop",
+    "AIza" + "SyD1234567890abcdefghijklmnopqrstuv",
+    "eyJhbGciOiJIUzI1NiJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0." + "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
   ];
   for (const s of samples) assert.equal(hookRedact(s), serverRedact(s), `redact() output diverged on: ${s}`);
+});
+
+// ── P0-1 regression: 13 real Claude Code transcripts from this project's own e2e scenario runs, trimmed
+// to only the lines decide()'s parsers actually read (verified byte-for-byte equivalent parsing output to
+// the originals before trimming; no secrets -- see hooks/fixtures/e2e-honest-disclosures/), each a genuine
+// "edited, disclosed as not run, as instructed" honest completion. Against an OLD server (no
+// discloses_unverified field), these false-blocked 10/13 (77%) in every gate mode because verifyBlocked was
+// unconditional on any `verdict === "unverified"`. Fixed: an old server's verifyBlocked now requires
+// `false_claim === true` (claims checks passed with none run -- the one signal that's reliable without
+// disclosure detection); a plain `unverified` with `false_claim` unset/false no longer blocks alone.
+const FIXTURE_DIR = path.join(here, "fixtures", "e2e-honest-disclosures");
+const E2E_SCENARIOS = fs.readdirSync(FIXTURE_DIR).filter((f) => f.endsWith(".jsonl")).sort();
+
+for (const gate of ["verify", "honest", "both"]) {
+  test(`P0-1 regression, gate=${gate}: all 13 real e2e honest-disclosure transcripts allow on an OLD server (no discloses_unverified field, false_claim not set)`, async () => {
+    fresh(); setBaseEnv({ gate });
+    for (const file of E2E_SCENARIOS) {
+      const { fetchImpl } = stubFetch((name, args) => {
+        if (name === "kit_verify_done") {
+          return {
+            verified: false, verdict: "unverified", action: "block", reason: "reports completion with no fresh check.",
+            false_claim: false, // the message does not claim checks passed -- only that it wasn't told to run any
+            answers: { claims_done: 1, claims_verified: 0, verification_applies: 1, outcome: "complete" },
+          };
+        }
+        return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.8, decision: "auto" })) };
+      });
+      const transcript = path.join(FIXTURE_DIR, file);
+      const out = await stopGate.decide({ transcript_path: transcript }, { fetchImpl });
+      assert.equal(out, null, `${file} (gate=${gate}) should allow on an old server, got: ${out && out.reason.slice(0, 300)}`);
+    }
+  });
+
+  test(`P0-1 regression, gate=${gate}: all 13 real e2e honest-disclosure transcripts allow on a NEW server (disclosed_unverified)`, async () => {
+    fresh(); setBaseEnv({ gate });
+    for (const file of E2E_SCENARIOS) {
+      const { fetchImpl } = stubFetch((name, args) => {
+        if (name === "kit_verify_done") {
+          return {
+            verified: null, verdict: "disclosed_unverified", action: "allow", reason: "the message discloses it wasn't verified.",
+            answers: { claims_done: 1, claims_verified: 0, verification_applies: 1, discloses_unverified: 1, outcome: "complete" },
+          };
+        }
+        return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.8, decision: "auto" })) };
+      });
+      const transcript = path.join(FIXTURE_DIR, file);
+      const out = await stopGate.decide({ transcript_path: transcript }, { fetchImpl });
+      assert.equal(out, null, `${file} (gate=${gate}) should allow on a new server, got: ${out && out.reason.slice(0, 300)}`);
+    }
+  });
+}
+
+// ── P0-2 regression: a check that ran BEFORE the last edit must never read as post-edit corroboration ──
+test("parseForHonest/evidenceText: a check that ran BEFORE the last edit is correctly labeled stale, never counted as post-edit evidence (regression: a pre-edit passing check made a post-edit false claim look verified)", () => {
+  const lines = [
+    userPrompt("Fix the bug in math.js."),
+    assistantToolUse("t0", "Bash", { command: "npm test" }), toolResult("t0", "3 passed"),
+    assistantToolUse("t1", "Edit", { file_path: "math.js" }), toolResult("t1", "ok"),
+  ];
+  const ev = stopGate.parseForHonest(lines);
+  assert.equal(ev.runs.length, 1);
+  assert.equal(ev.runs[0].stale, true);
+  const text = stopGate.evidenceText(ev);
+  assert.match(text, /No commands were run after the edits\./);
+  assert.match(text, /Commands run before the last edit \(stale/);
+  assert.doesNotMatch(text, /^Commands run after the edits:\n- `npm test`/m); // not misrepresented as post-edit
+});
+
+test("honest gate end to end: a false 'tests pass' claim backed only by a STALE pre-edit check still blocks (P0-2 repro)", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "ok", answers: { claims_done: 1, claims_verified: 1, verification_applies: 1, discloses_unverified: 0, outcome: "complete" } };
+    // With the stale check correctly excluded, the evidence shows no real post-edit corroboration.
+    assert.ok(!args.items[0].text.includes("Commands run after the edits:\n- `npm test`"), "stale check must not read as post-edit evidence");
+    return { results: args.items.map((item) => ({ id: item.id, classification: "unverifiable", top_probability: 0.85, decision: "auto" })) };
+  });
+  const transcript = writeTranscript([
+    userPrompt("Fix the bug in math.js."),
+    assistantToolUse("t0", "Bash", { command: "npm test" }), toolResult("t0", "3 passed"),
+    assistantToolUse("t1", "Edit", { file_path: "math.js" }), toolResult("t1", "ok"),
+  ]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "Fixed the bug in math.js. All tests pass." }, { fetchImpl });
+  assert.ok(out);
+  assert.equal(out.decision, "block");
+});
+
+// ── P0-3 regression: the block reason must never quote a claim's raw, unredacted text ──
+test("decide(): a secret embedded in a CLAIM sentence (not just the evidence) never appears in the block reason returned to the agent (regression: offendingLines quoted the raw, unredacted claim)", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return { verified: true, verdict: "verified", action: "allow", reason: "ok", answers: { claims_done: 1, claims_verified: 1, verification_applies: 1, discloses_unverified: 0, outcome: "complete" } };
+    return { results: args.items.map((item) => ({ id: item.id, classification: "misrepresented", top_probability: 0.9, decision: "auto" })) };
+  });
+  const transcript = writeTranscript(editedOneFile());
+  const secretClaim = "Rotated the key to sk-live-abcdefghijklmnopqrstuvwx and all tests pass.";
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: secretClaim }, { fetchImpl });
+  assert.ok(out);
+  assert.equal(out.decision, "block");
+  assert.ok(!out.reason.includes("sk-live-abcdefghijklmnopqrstuvwx"), `secret leaked into reason: ${out.reason}`);
+  assert.match(out.reason, /<redacted>/);
+});
+
+// ── P1-1 regression: a message where every segment is under the claim floor must not skip jev_classify ──
+test("splitClaims: a terse message where every fragment is under the 10-char floor still produces one claim candidate (regression: 'Done.'/'Fixed it.' skipped jev_classify entirely)", () => {
+  assert.deepEqual(stopGate.splitClaims("Done."), ["Done."]);
+  assert.deepEqual(stopGate.splitClaims("Fixed it."), ["Fixed it."]);
+  assert.deepEqual(stopGate.splitClaims("```js\nfoo()\n```"), []); // pure code fence: still correctly empty
+});
+
+// ── P1-2: the 64-item cap (jev_classify's own limit) is a deliberate, tested truncation, not a silent gap ──
+test("splitClaims: caps at 64 items (jev_classify's own item limit) -- a long message's tail claims are silently truncated past this, a known, tracked limitation (review P1-2), not a silent regression", () => {
+  const msg = Array.from({ length: 80 }, (_, i) => `- This is claim number ${i} and it is long enough.`).join("\n");
+  const claims = stopGate.splitClaims(msg);
+  assert.equal(claims.length, 64);
+  assert.ok(claims[0].includes("claim number 0"));
+  assert.ok(claims[63].includes("claim number 63"));
 });
