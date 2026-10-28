@@ -191,10 +191,11 @@ export async function verifyDone(input, deps = {}) {
       const command = c.command || "check";
       const call = redact(command).slice(0, 200);
       if (typeof c.passed === "boolean") return { call, passed: c.passed };
+      const isCheck = CHECK_COMMAND.test(command);
       const summary = checkSummary(c.output || "");
-      if (typeof c.exit_code === "number") return { call, passed: c.exit_code === 0 && summary !== "fail" };
-      if (summary) return { call, passed: summary === "pass" };
-      if (!CHECK_COMMAND.test(command)) return null;
+      if (typeof c.exit_code === "number") return isCheck ? { call, passed: c.exit_code === 0 && summary !== "fail" } : null;
+      if (summary) return isCheck ? { call, passed: summary === "pass" } : null;
+      if (!isCheck) return null;
       // A check command with no recognised runner summary and no exit code is unproven, never a pass.
       notes.push(`Check '${call}' had no recognised pass/fail summary and no exit_code, so it is not counted as passing. Send exit_code or paste the runner's summary lines.`);
       return { call, passed: false, unproven: true };

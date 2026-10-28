@@ -161,6 +161,20 @@ test("verify_done supplied checks: unproven check never passes; exit_code and re
   r = await verifyDone({ file_changes: 2, final_message: "done", checks: [{ command: "ls -la" }] }, j);
   assert.equal(r.evidence.fresh_checks.length, 0);
 });
+test("verify_done supplied checks: a non-check command never verifies, even with exit_code 0 or a fabricated pass summary", async () => {
+  // P0: exit_code/summary branches must require CHECK_COMMAND, or any command can claim victory by attaching exit_code: 0.
+  let r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "cd /tmp", exit_code: 0 }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "cd /tmp", output: "12 passing" }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "ls -la", exit_code: 0 }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  // a real check command still verifies on its own merits
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 0 }] });
+  assert.equal(r.verified, true);
+  r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 1 }] });
+  assert.notEqual(r.verified, true);
+});
 test("rungFor: claude-* ids resolve to their own family, not the generic director alias", async () => {
   assert.equal((await sizeDispatch({ description: "x", model: "claude-fable-5-1" }, noJev)).chosen.tier, "fable");
   assert.equal((await sizeDispatch({ description: "x", model: "claude-haiku-4-5" }, noJev)).chosen.tier, "scout");
