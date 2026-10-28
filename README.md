@@ -3,7 +3,7 @@
 Give your coding agents (omp / oh-my-pi, Claude Code and compatible agents) a hosted **Jev** toolbox over MCP, plus the skills and hook that make them use it:
 
 - **`server/`**: a Cloudflare Worker serving MCP over streamable HTTP, bearer-protected. 15 tools: the 12 upstream `jev_*` tools from [jkudish/jev-mcp](https://github.com/jkudish/jev-mcp) plus three ported from [jev-kit](https://github.com/jonathanavis96/jev-kit): `kit_guard_command` (is this shell command safe?), `kit_size_dispatch` (is this sub-agent model the right size for the task?), `kit_verify_done` (did the agent verify before saying "done"?).
-- **`skills/`**: five agent skills (`SKILL.md`): `jev-command-guard`, `jev-dispatch-sizing`, `jev-verify-before-done`, `fast-file-search`, `jev-classify`.
+- **`skills/`**: seven agent skills (`SKILL.md`): `jev-command-guard`, `jev-dispatch-sizing`, `jev-verify-before-done`, `jev-pr-merge-triage` (are open review threads handled?), `jev-issue-triage` (bulk backlog sweep — classify-then-verify), `fast-file-search`, `jev-classify`.
 - **`hooks/`**: a Claude Code `PreToolUse` hook (`jev-guard-hook.sh` + `jev_guard_hook.py`) and an omp TypeScript port (`hooks/omp/jev-guard.ts`). Fails open.
 - **`scripts/jev-call.sh`**: `jev-call <tool> '<json>'` for agents with no MCP client.
 
@@ -16,9 +16,21 @@ git clone https://github.com/bitskc/jev-agent-kit && ./jev-agent-kit/install.sh 
 ```
 or, without git: `curl -fsSL https://github.com/bitskc/jev-agent-kit/archive/refs/heads/main.tar.gz | tar xz && ./jev-agent-kit-main/install.sh --omp`
 
-`install.sh` copies the skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/` (`--project DIR` for project scope), the hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` to `~/.local/bin/`. It never edits your config files and never touches a token. It then prints the remaining steps (below).
+`install.sh` copies the skills to `~/.omp/agent/skills/` and/or `~/.claude/skills/` (`--project DIR` for project scope), the hooks to `~/.local/share/jev-agent-skills/hooks/`, and `jev-call` + `jev-update` to `~/.local/bin/`. It never edits your config files and never touches a token. It then prints the remaining steps (below).
 
 You need a deployed server first: see [Deploy your own server](#deploy-your-own-server).
+
+## Updating / fleet sync
+
+`install.sh` also drops `jev-update` into `~/.local/bin`. Re-pull skills from GitHub without a checkout:
+
+```sh
+jev-update            # re-sync skills → both agent dirs
+jev-update --omp      # or --claude | --project DIR
+jev-update --timer    # also installs jev-skill-sync.timer — weekly systemd user timer
+```
+
+There is no server-side push (skills are client files); the `--timer` weekly timer is the fleet-sync mechanism. Run `jev-update` after each merge for same-day sync, or leave the timer for weekly.
 
 ## Configure the client
 
