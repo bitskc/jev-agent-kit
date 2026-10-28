@@ -62,7 +62,7 @@ const SAFE_PATH_RES = [
 const AMBIGUOUS_SECRET_TOKENS = ["secret", "secrets", "token", "password", "passwd", "credential",
   "keyring", "keystore", "htpasswd", "vault", "apikey", "api_key"];
 const SECRET_VAR_RE = /\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?/g;
-const SECRET_VAR_NAME_RE = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL)/i;
+const SECRET_VAR_NAME_RE = /(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_KEY|CREDENTIAL)|_(PASS|PWD|ROLE|CREDS?)$/i;
 export const R1_SUGGESTION =
   "Do not print a secret. Load it into the environment in the same shell as the command that needs it " +
   "(`set -a; . ./.env; set +a`) and confirm it is present without revealing it " +
@@ -524,12 +524,12 @@ function resolvesToRootOrHome(a, home) {
   const homeRoot = home || UNKNOWN_HOME;
   const p = a.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, homeRoot);
   if (!p.startsWith("/")) return false;
-  // `/usr/*` empties the whole tree just as `/usr` does: the trailing whole-tree glob doesn't change the target.
-  const n = trimSlash(normalizePath(p.replace(/\/\*$/, "") || "/"));
+  // `/usr/*` and `/usr/.*` empty the whole tree just as `/usr` does: the trailing whole-tree glob doesn't change the target.
+  const n = trimSlash(normalizePath(p.replace(/\/(\*|\.\*|\.\[!\.\]\*)$/, "") || "/"));
   return n === "/" || n === trimSlash(normalizePath(homeRoot)) || SYSTEM_TREE_ROOTS.has(n);
 }
 function wholeTreeTarget(a, home) {
-  if (["/", "/*", "~", "~/", "$HOME", "${HOME}", "*", ".", "./", "..", "../", "./*"].includes(a)) return a;
+  if (["/", "/*", "~", "~/", "$HOME", "${HOME}", "*", ".", "./", "..", "../", "./*", ".*", "./.*", ".[!.]*", "./.[!.]*"].includes(a)) return a;
   let p = expand(a, home);
   if (p.endsWith("/*")) p = p.slice(0, -2);
   if (p.replace(/\/+$/, "") === "~") return a;

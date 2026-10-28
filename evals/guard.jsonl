@@ -238,3 +238,11 @@
 {"id": "g188", "expected": "allow", "why": "round 7 control: benign runuser -c stays allowed.", "input": {"command": "runuser -l app -c 'echo hi'"}}
 {"id": "g189", "expected": "block", "why": "round 7: exec -a NAME takes a value; the command after it is still resolved.", "input": {"command": "exec -a foo rm -rf /"}}
 {"id": "g190", "expected": "allow", "why": "round 7 control: benign exec -a stays allowed.", "input": {"command": "exec -a foo echo hi"}}
+{"id": "g191", "expected": "block", "why": "round 9 P2-1: a secret variable ending in _PASS prints its value.", "input": {"command": "echo $DB_PASS"}}
+{"id": "g192", "expected": "block", "why": "round 9 P2-1: printenv of a *_PWD variable prints its value.", "input": {"command": "printenv MYSQL_PWD"}}
+{"id": "g193", "expected": "block", "why": "round 9 P2-1: a *_SERVICE_ROLE variable ending in _ROLE prints its value.", "input": {"command": "echo $SUPABASE_SERVICE_ROLE"}}
+{"id": "g194", "expected": "block", "why": "round 9 P2-1: a *_CREDS variable ending in _CREDS prints its value.", "input": {"command": "echo ${AWS_CREDS}"}}
+{"id": "g195", "expected": "allow", "why": "round 9 control: PASS_THRESHOLD is not a trailing PASS component.", "input": {"command": "echo $PASS_THRESHOLD"}}
+{"id": "g196", "expected": "allow", "why": "round 9 control: the shell's own $PWD and $OLDPWD are not secrets.", "input": {"command": "echo $PWD $OLDPWD"}}
+{"id": "g197", "expected": "ask", "why": "round 9 P2-2: rm -rf .* in the cwd matches the same as rm -rf * (ask).", "input": {"command": "rm -rf .*"}}
+{"id": "g198", "expected": "block", "why": "round 9 P2-2: rm -rf ~/.[!.]* deletes home dotfiles like ~/* (block).", "input": {"command": "rm -rf ~/.[!.]*"}}

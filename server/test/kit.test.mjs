@@ -1201,6 +1201,31 @@ test("round 8 controls: the same wrappers and substitutions on benign commands s
     assert.equal((await g(c)).decision, "allow", c);
   }
 });
+test("round 9 P2-1: secret-named variables with a trailing PASS/PWD/ROLE/CRED(S) component block like other secrets; PWD, ROLE and PASS_* names stay allowed", async () => {
+  for (const c of ["echo $DB_PASS", "printenv DB_PASS", "echo ${DB_PASS}", "echo $MYSQL_PWD", "echo $SUPABASE_SERVICE_ROLE", "echo $AWS_CRED", "echo $DB_CREDS"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R1-secret-exposure", c);
+  }
+  for (const c of ["echo $PASS_THRESHOLD", "echo $PWD", "echo $OLDPWD", "echo $ROLE", "echo $PASSENGERS"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
+test("round 9 P2-2: cwd dotfile globs ask like rm -rf *; home and root dotfile globs block like ~/*; ./build subtrees stay allowed", async () => {
+  for (const c of ["rm -rf .*", "rm -rf .[!.]*", "rm -rf ./.*", "rm -rf ./.[!.]*"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "ask", c);
+    assert.equal(r.rule, "R7-destructive", c);
+  }
+  for (const c of ["rm -rf ~/.*", "rm -rf ~/.[!.]*", "rm -rf $HOME/.*", "rm -rf /.*", "rm -rf /usr/.*"]) {
+    const r = await g(c);
+    assert.equal(r.decision, "block", c);
+    assert.equal(r.rule, "R7-root-delete", c);
+  }
+  for (const c of ["rm -rf ./build/.*", "rm -rf ./build/*", "rm -rf ~/.cache/x", "rm -rf ~/projects/.cache"]) {
+    assert.equal((await g(c)).decision, "allow", c);
+  }
+});
 
 test("upstream resolution: gateway wins, then typesafe, then none; overrides", () => {
   assert.equal(resolveUpstream({}), null);

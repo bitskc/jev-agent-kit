@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-Guard corpus grown to 240 cases (`evals/guard.jsonl`) across five independent adversarial review rounds on
+Guard corpus grown to 248 cases (`evals/guard.jsonl`) across five independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
@@ -39,9 +39,19 @@ repros plus allow controls). g178 covers `zpool create <device>`. Disclosed limi
 no device operand is not classified; symlinks are resolved only when created in the same command (the guard does no
 fs access); the P3 items and R10 fail-open items listed in `skills/jev-command-guard/SKILL.md`.
 
+Round 9 (PR #30 review comment 6479022096, reviewed at `6a7889a`) fixed two P2 items. P2-1: a secret-named variable
+with a trailing `_PASS`, `_PWD`, `_ROLE`, `_CRED`/`_CREDS` component now blocks as R1-secret-exposure
+(`echo $DB_PASS`, `printenv MYSQL_PWD`, `echo $SUPABASE_SERVICE_ROLE`). Bare `PWD`, `OLDPWD`, `ROLE`, and names such
+as `PASS_THRESHOLD` stay allowed; the existing substring terms are unchanged. P2-2: cwd `rm -rf .*` and
+`rm -rf .[!.]*` now ask like `rm -rf *`; `~/.*`, `~/.[!.]*`, and `/.*` block like `~/*` and `/*`; `./build/.*` stays
+allowed. The corpus gains g191–g198. Each of the four mechanisms, reverted alone, fails its round-9 test. A
+99-command benign sweep against HEAD `6a7889a` changes no verdict. Disclosed: the substring rule still matches
+`PASSWORD` inside longer names such as `PASSWORDLESS_MODE` (pre-existing, unchanged); the guard stays lexical, so
+dotfile globs through symlinks already on disk are not resolved.
+
 | corpus | n | accuracy | catch-recall | catch-precision | false-alarm-rate |
 |---|---|---|---|---|---|
-| guard | 240 | 98.3% | 96.9% | 100.0% | **0.0%** |
+| guard | 248 | 98.4% | 97.1% | 100.0% | **0.0%** |
 | verify_done | 62 | 54.8%\* | 0.0%\* | n/a | 0.0% |
 
 \*`verify_done`'s score is an artifact of this sandbox having no Jev credentials: every case needing Jev's
