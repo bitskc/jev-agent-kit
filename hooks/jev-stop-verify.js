@@ -288,26 +288,63 @@ function parseForHonest(lines) {
 // start a new line and forge block structure), and quote/backtick characters swapped so they cannot break the
 // quoted or code-spanned rendering around them.
 const safe = (s) => redact(String(s || '')).replace(/\s+/g, ' ').replace(/["`]/g, "'").trim();
-function evidenceText({ edits, runs }) {
-  const parts = [edits.length ? `Files edited this turn: ${edits.map((e) => safe(e)).join(', ')}.` : 'No files were edited this turn.'];
+// Each jev_classify item is capped at MAX_ITEM_CHARS = 2000 by the upstream server (jev-mcp src/lib.ts), which keeps
+// the HEAD and appends a marker. An over-cap item therefore loses its closing [/tool-log] marker and the newest runs,
+// which are the passing verification. Each item is built here to fit ITEM_BUDGET instead, with the CLAIM and both
+// markers always intact.
+const ITEM_BUDGET = 2000;
+const CLAIM_FIELD_MAX = 800;
+const capLine = (s, n) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
+// Evidence is kept newest-first within `budget`. Stale runs (before the last edit) are dropped before any run after
+// the edits, and each dropped span becomes an explicit omission line inside the block. With no budget (Infinity) the
+// output is the full evidence.
+function evidenceText({ edits, runs }, budget = Infinity) {
+  const header = capLine(edits.length ? `Files edited this turn: ${edits.map((e) => safe(e)).join(', ')}.` : 'No files were edited this turn.', 300);
   const line = (r) => {
     const cmd = safe(r.command).slice(0, 300);
     const tail = safe(r.output).slice(-300);
     return `- \`${cmd}\` -> ${r.isError ? 'failed' : 'ok'}${tail ? `, output tail: "${tail}"` : ''}`;
   };
-  const after = runs.filter((r) => !r.stale);
-  const stale = runs.filter((r) => r.stale);
-  if (after.length) {
-    parts.push('Commands run after the edits:');
-    for (const r of after) parts.push(line(r));
-  } else {
-    parts.push('No commands were run after the edits.');
-  }
-  if (stale.length) {
-    parts.push("Commands run before the last edit (stale — do not count as verification of it):");
-    for (const r of stale) parts.push(line(r));
-  }
-  return parts.join('\n');
+  const afterLines = runs.filter((r) => !r.stale).map(line);
+  const staleLines = runs.filter((r) => r.stale).map(line);
+  const render = (aKeep, sKeep) => {
+    const parts = [header];
+    if (afterLines.length) {
+      parts.push('Commands run after the edits:');
+      if (aKeep < afterLines.length) parts.push(`… ${afterLines.length - aKeep} earlier commands omitted (oldest first)`);
+      parts.push(...afterLines.slice(afterLines.length - aKeep));
+    } else {
+      parts.push('No commands were run after the edits.');
+    }
+    if (staleLines.length && sKeep === 0) {
+      parts.push(`… ${staleLines.length} stale commands (run before the last edit) omitted`);
+    } else if (staleLines.length) {
+      parts.push("Commands run before the last edit (stale — do not count as verification of it):");
+      if (sKeep < staleLines.length) parts.push(`… ${staleLines.length - sKeep} earlier stale commands omitted (oldest first)`);
+      parts.push(...staleLines.slice(staleLines.length - sKeep));
+    }
+    return parts.join('\n');
+  };
+  let aKeep = afterLines.length;
+  let sKeep = staleLines.length;
+  while (sKeep > 0 && render(aKeep, sKeep).length > budget) sKeep -= 1;
+  while (aKeep > 0 && render(aKeep, sKeep).length > budget) aKeep -= 1;
+  return render(aKeep, sKeep);
+}
+// One jev_classify item: the CLAIM line, the nonce-delimited evidence block, and its closing marker, within ITEM_BUDGET.
+function classifyItemText(claim, nonce, ev) {
+  const head = `CLAIM: ${claimField(claim)}\n[tool-log:${nonce}]\n`;
+  const tail = `\n[/tool-log:${nonce}]`;
+  return head + evidenceText(ev, ITEM_BUDGET - head.length - tail.length) + tail;
+}
+// The claim as a one-line JSON field. A claim whose escaped form exceeds CLAIM_FIELD_MAX is cut on the raw text (never
+// mid-escape) and marked, so the field stays valid JSON and the markers after it survive.
+function claimField(raw) {
+  const claim = redact(raw);
+  if (JSON.stringify(claim).length <= CLAIM_FIELD_MAX) return JSON.stringify(claim);
+  let cut = claim;
+  while (JSON.stringify(`${cut} […]`).length > CLAIM_FIELD_MAX) cut = cut.slice(0, -1);
+  return JSON.stringify(`${cut} […]`);
 }
 // Splits a final message into claim-candidate strings: a markdown table row's cells are each their own
 // candidate; a bullet/checklist item or heading has its marker stripped but its TEXT IS STILL CLASSIFIED,
@@ -578,15 +615,12 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // its own block verdict -- a plain Jev-judged overclaim that the claim classifier alone might miss.
   const needsVerify = wantsVerify || wantsHonest;
   const claims = wantsHonest ? splitClaims(finalMessage) : [];
-  let evidence = '';
-
   const verifyPromise = needsVerify
     ? mcpCall('kit_verify_done', { task: vp.task, final_message: finalMessage, file_changes: vp.fileChanges, checks: vp.checks }, fetchImpl)
     : Promise.resolve(null);
 
   let classifyPromise = Promise.resolve([]);
   if (wantsHonest && claims.length) {
-    evidence = evidenceText(ev);
     const { classes } = classifyClasses();
     const nonce = crypto.randomBytes(8).toString('hex');
     // jev_classify takes at most CLAIM_CAP items per call, so every claim is judged in CLAIM_CAP-sized chunks.
@@ -595,7 +629,7 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
     for (let i = 0; i < claims.length; i += CLAIM_CAP) chunks.push(claims.slice(i, i + CLAIM_CAP));
     if (chunks.length > 1) process.stderr.write(`jev-stop-verify: ${claims.length} claims judged in ${chunks.length} parallel jev_classify calls (chunks of ${CLAIM_CAP})\n`);
     classifyPromise = Promise.all(chunks.map((chunk, k) => {
-      const items = chunk.map((c, j) => ({ id: 'c' + (k * CLAIM_CAP + j), text: `CLAIM: ${JSON.stringify(redact(c))}\n[tool-log:${nonce}]\n${evidence}\n[/tool-log:${nonce}]` }));
+      const items = chunk.map((c, j) => ({ id: 'c' + (k * CLAIM_CAP + j), text: classifyItemText(c, nonce, ev) }));
       return mcpCall('jev_classify', { purpose: honestGatePurpose(nonce), items, classes }, fetchImpl);
     }));
   }
@@ -605,6 +639,7 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
   const [verdict, classifyChunks] = await Promise.all([verifyPromise, classifyPromise]);
   const classifyResult = { results: classifyChunks.flatMap((r) => (r && Array.isArray(r.results) ? r.results : [])) };
+  const evidence = evidenceText(ev);
   note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
   // A server that has shipped jev-agent-kit PR #30 puts `discloses_unverified` inside `answers` whenever it
   // actually ran the Jev judgement (absent only on an early-return fail-open path, same as an older server).

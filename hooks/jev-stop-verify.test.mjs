@@ -971,6 +971,67 @@ test("P2-B: a FALSE claim at index 0 of a 70-claim message is judged: claims go 
   assert.ok(classify[0].arguments.items.some((i) => i.id === "c0" && i.text.includes("ready to ship")), "the head claim is judged");
   assert.equal(out && out.decision, "block");
 });
+test("P2-1: 6 failing runs then a passing run past 2000 chars of evidence: the passing run survives the item cap, the claim is not misrepresented", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  // jev_classify head-keeps any item over 2000 chars upstream, so the stub judges only the visible prefix, as the server does.
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return ALLOW;
+    return { results: args.items.map((item) => {
+      const visible = item.text.slice(0, 2000);
+      const ok = /42 passed/.test(visible) && visible.includes("[/tool-log:");
+      return { id: item.id, classification: ok ? "verified" : "misrepresented", top_probability: 0.9, decision: "auto" };
+    }) };
+  });
+  const runs = [];
+  for (let i = 0; i < 6; i++) {
+    runs.push(assistantToolUse(`f${i}`, "Bash", { command: `npx vitest run suite-${i} --reporter=verbose` }), toolResult(`f${i}`, `FAIL suite-${i} expected 1 got 2 `.repeat(40), true));
+  }
+  runs.push(assistantToolUse("p1", "Bash", { command: "npm test" }), toolResult("p1", "Test Files 4 passed\n42 passed (42)"));
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"), ...runs]);
+  const out = await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All 42 tests pass." }, { fetchImpl });
+  const items = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items);
+  assert.ok(items.length >= 1, "claim reaches jev_classify");
+  for (const i of items) {
+    assert.ok(i.text.length <= 2000, `item is ${i.text.length} chars`);
+    assert.match(i.text, /\[\/tool-log:[0-9a-f]+\]$/, "closing marker survives");
+    assert.ok(i.text.includes("42 passed"), "newest passing run survives");
+    assert.ok(i.text.includes("omitted"), "dropped runs are marked, not silently cut");
+  }
+  assert.equal(out, null);
+});
+test("P2-1: a quote-heavy claim plus a long edited path and a long passing run: the claim is capped so the newest run still fits inside the 2000-char item", async () => {
+  fresh(); setBaseEnv({ gate: "honest" });
+  const { fetchImpl, calls } = stubFetch((name, args) => {
+    if (name === "kit_verify_done") return ALLOW;
+    return { results: args.items.map((item) => {
+      const visible = item.text.slice(0, 2000);
+      const ok = /42 passed/.test(visible) && visible.includes("[/tool-log:");
+      return { id: item.id, classification: ok ? "verified" : "misrepresented", top_probability: 0.9, decision: "auto" };
+    }) };
+  });
+  const claim = `All tests pass ${'"'.repeat(480)} and it is ready to ship.`;
+  const longPath = `src/${'a'.repeat(280)}.js`;
+  const longCmd = `npm test -- --testNamePattern="${'x'.repeat(300)}"`;
+  const longOut = `${'z'.repeat(400)} Test Files 4 passed 42 passed (42)`;
+  const transcript = writeTranscript([userPrompt("Fix it."), assistantToolUse("t1", "Edit", { file_path: longPath }), toolResult("t1", "ok"), assistantToolUse("t2", "Bash", { command: longCmd }), toolResult("t2", longOut)]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: claim }, { fetchImpl });
+  const items = calls.filter((c) => c.name === "jev_classify").flatMap((c) => c.arguments.items);
+  assert.equal(items.length, 1);
+  const t = items[0].text;
+  assert.ok(t.length <= 2000, `item is ${t.length} chars`);
+  const nonce = /\[tool-log:([0-9a-f]+)\]/.exec(t)[1];
+  assert.ok(t.endsWith(`[/tool-log:${nonce}]`), "closing marker survives");
+  assert.ok(t.includes("42 passed"), "newest passing run survives the claim's budget");
+});
+test("P2-A decide(): `echo npm test > src/a.js` after an edit is a write, not a check, so the verify gate receives no check", async () => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch(() => ALLOW);
+  const transcript = writeTranscript([userPrompt("Fix the parser."), assistantToolUse("t1", "Edit", { file_path: "src/a.js" }), toolResult("t1", "ok"), assistantToolUse("t2", "Bash", { command: "echo npm test > src/a.js" }), toolResult("t2", "")]);
+  await stopGate.decide({ transcript_path: transcript, last_assistant_message: "All tests pass." }, { fetchImpl });
+  const verify = calls.find((c) => c.name === "kit_verify_done");
+  assert.ok(verify, "verify gate ran");
+  assert.deepEqual(verify.arguments.checks, []);
+});
 
 // ── PR #31 review (6476843173) regressions: NEW-1..NEW-7 ──
 const ALLOW = { verified: true, verdict: "verified", action: "allow", reason: "ok", answers: { claims_done: 1, claims_verified: 1, verification_applies: 1, discloses_unverified: 0, outcome: "complete" } };
