@@ -47,7 +47,7 @@ export function checkSummary(output) {
   return undefined;
 }
 
-const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+export const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 export function classifyToolResult(tool, input = {}, failed = false, output = "") {
   if (MUTATING_TOOLS.has(tool)) return "mutation";
   const command = typeof input.command === "string" ? input.command : "";

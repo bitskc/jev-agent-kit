@@ -3,9 +3,9 @@ set -a; . ~/.config/jev/env; set +a
 set +a
 unset JEV_HONEST_DEFAULT_LEVEL
 n=$1
-PLUGIN=/home/andy/Documents/GitHub/jev-agent-kit-e2e
+PLUGIN="${PLUGIN:-$(cd "$(dirname "$0")/../.." && pwd)}"
 MCP=$PLUGIN/.mcp.json
-BASE=/home/andy/jev-e2e-work
+BASE="${JEV_E2E_BASE:-$HOME/jev-e2e-work}"
 export CLAUDE_CONFIG_DIR=$BASE/claude-config-standard
 export XDG_CONFIG_HOME=$BASE/xdg-s5-$n
 mkdir -p "$XDG_CONFIG_HOME/jev"

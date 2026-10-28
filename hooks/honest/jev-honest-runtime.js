@@ -256,15 +256,20 @@ function normalizeStopGate(v) {
   const n = v.trim().toLowerCase();
   return STOP_GATES.includes(n) ? n : null;
 }
-function resolveStopGate() {
+function explicitStopGate() {
   const env = normalizeStopGate(process.env.JEV_STOP_GATE);
   if (env) return env;
   try {
     const cfg = JSON.parse(fs.readFileSync(configPath(), 'utf8').replace(/^\uFEFF/, ''));
-    return normalizeStopGate(cfg.stopGate) || 'off';
+    return normalizeStopGate(cfg.stopGate);
   } catch {
-    return 'off';
+    return null;
   }
+}
+// The effective gate: an explicit setting (env, then config), else 'off'. Explicit 'off' is distinguishable
+// from unset via explicitStopGate(), so an operator's 'off' can override the strict-level auto-engage.
+function resolveStopGate() {
+  return explicitStopGate() || 'off';
 }
 
 // Claude Code: SessionStart and UserPromptSubmit take raw stdout as context; SubagentStart needs the JSON form.
@@ -281,5 +286,5 @@ module.exports = {
   LEVELS, DEFAULT_LEVEL, claudeDir, statePath, normalizeLevel, defaultLevel, readLevel, setLevel, clearLevel,
   parseCommand, filterSkillBody, instructions, emit,
   rules, parseRuleCommand, applyRuleCommand, slugify, defaultRulesPath, userRulesPath, repoRulesPath,
-  userConfigDir, configPath, resolveStopGate,
+  userConfigDir, configPath, resolveStopGate, explicitStopGate,
 };
