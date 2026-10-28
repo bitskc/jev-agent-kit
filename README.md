@@ -47,6 +47,8 @@ Every kit tool **fails open**: Jev unavailable → deterministic rules still dec
 | `jev-classify` | Any "sort these items into buckets" task |
 | `fast-file-search` | Repo-wide file discovery without `fd`/`rg` guesswork |
 
+`jev-honest` has ponytail-style intensity levels — write `soft`/`standard`/`strict` to `~/.claude/.jev-honest-active` and wire `hooks/jev-honest-statusline.sh` as your Claude Code `statusLine` for a `[HONEST:*]` badge under the input box while it's armed.
+
 ## What it looks like
 
 ```sh

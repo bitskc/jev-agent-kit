@@ -1,11 +1,24 @@
 ---
 name: jev-honest
-description: The honesty layer ("Honest Jev" 🎩). Before claiming something is done, working, verified, safe, or "should be fine" — batch-classify your own claims with jev-mcp jev_classify into verified / hedged / unverifiable / misrepresented, and don't send what you can't show. Also runs an on-demand audit of recent claims ("be honest with me") or a deep pass on a draft reply.
+description: The honesty layer ("Honest Jev" 🧔). Before claiming something is done, working, verified, safe, or "should be fine" — batch-classify your own claims with jev-mcp jev_classify into verified / hedged / unverifiable / misrepresented, and don't send what you can't show. Levels off/soft/standard/strict via a flag file + statusline badge; also runs an on-demand audit of recent claims ("be honest with me") or a deep pass on a draft reply.
 ---
 
 # jev-honest — Honest Jev 🎩
 
 The honest-agent check: **claims vs. evidence**, not intent. It catches the failure modes `kit_verify_done` doesn't — not just "said done without a check," but hedging presented as fact, scope quietly narrowed, a symptom fix described as a root cause, a passing subset reported as the full run.
+
+## Intensity levels + the badge
+
+Honest Jev runs at a level you set; the level decides how hard the claim-check bites. Set it by writing `~/.claude/.jev-honest-active` (Claude Code) or `~/.omp/agent/.jev-honest-active` (omp) with the mode name — same mechanism as ponytail's flag file:
+
+| Level | Flag value | Behavior |
+|---|---|---|
+| **off** | `off` (or delete the file) | Skill dormant — badge hidden, no checks |
+| **soft** | `soft` | Only `verified`-vs-everything-else: flags `unverifiable`/`misrepresented` claims; `hedged` is allowed to pass as long as the hedge stays in the text |
+| **standard** | `standard` | Mode 1 before any done/works/fixed claim; hedged claims must keep the hedge visible |
+| **strict** | `strict` | Mode 1 on every substantive reply + Mode 2 audit on request; `hedged` also flagged — if you can't show it, don't assert it |
+
+Default with no file = **off** (opt-in). The statusline badge (`hooks/jev-honest-statusline.sh`) prints `[HONEST]` / `[HONEST:SOFT]` / `[HONEST:STRICT]` under the input box while armed — the beard mark tells you the honesty police is on duty.
 
 Two modes, both `jev_classify`-backed:
 
