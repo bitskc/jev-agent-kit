@@ -7,6 +7,7 @@
 // Redactor adapted from valentynkit/jev-belay belay.mjs (MIT, Copyright (c) 2026 Valentyn Kit).
 // See NOTICE-jev-kit.md. Everything here is pure string work: no I/O, never throws.
 
+import { posix as posixPath } from "node:path";
 export const ASSIGN_RE = /^[A-Za-z_][A-Za-z_0-9]*=/;
 
 /** Split a command line into segments on ; && || | and newlines, respecting quotes. */
@@ -40,32 +41,42 @@ export function splitSegments(command) {
   return segs.map((x) => x.trim()).filter(Boolean);
 }
 
-/** Remove shell quote delimiters from a token, respecting quote concatenation within the same word
- *  (`.e''nv` -> `.env`, `".env"` -> `.env`, `'.e'nv` -> `.env`) the way bash's own word-formation does:
- *  quotes are structural, not content, and adjacent quoted/unquoted runs join into one word. Heuristic,
- *  not a full shell parser (it does not track nesting depth beyond one open quote at a time), and
- *  deliberately permissive: for a security prefilter, collapsing an obfuscated path is the safer failure
- *  mode than preserving an exotic literal quote character in a non-path argument. */
-function stripQuotes(tok) {
-  let out = "";
+/** Whitespace-delimited tokens of a segment, shell-quote-aware: a quoted run (even one containing spaces)
+ *  stays part of the SAME token as any adjacent unquoted/quoted content, and quote delimiters/backslash
+ *  escapes are removed in the same pass -- not as a separate split-then-strip step. That separate-step
+ *  order used to be the bug: splitting on raw whitespace BEFORE stripping quotes shredded a quoted
+ *  multi-word argument into several tokens (`-c "x = 1; print(open('.env').read())"` -> five ordinary-
+ *  looking tokens instead of one script string), so a caller that only ever inspects `args[i+1]` (the
+ *  single token right after a flag) silently stopped seeing almost any real `-c`/`-e` one-liner. Now a
+ *  fully-quoted run with internal spaces becomes exactly one token, matching real bash word-formation
+ *  (`"a b"c` -> one token `a bc`; `.e''nv` -> `.env`). Heuristic, not a full shell parser: a single open
+ *  quote is tracked at a time (no nesting), and deliberately permissive about an obfuscated quote char
+ *  landing inside a word -- for a security prefilter, collapsing is the safer failure mode than preserving
+ *  an exotic literal. */
+export function words(segment) {
+  const out = [];
+  let buf = "";
   let quote = null;
-  for (let i = 0; i < tok.length; i++) {
-    const ch = tok[i];
+  let inWord = false;
+  const s = segment || "";
+  const n = s.length;
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
     if (quote) {
       if (ch === quote) { quote = null; continue; }
-      out += ch;
+      buf += ch; inWord = true;
       continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === "\\" && i + 1 < tok.length) { out += tok[i + 1]; i++; continue; }
-    out += ch;
+    if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
+    if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
+    if (/\s/.test(ch)) {
+      if (inWord) { out.push(buf); buf = ""; inWord = false; }
+      continue;
+    }
+    buf += ch; inWord = true;
   }
+  if (inWord) out.push(buf);
   return out;
-}
-
-/** Whitespace tokens of a segment, with shell quote delimiters removed (including concatenation). */
-export function words(segment) {
-  return (segment || "").split(/\s+/).filter(Boolean).map(stripQuotes);
 }
 
 const SKIP_PREFIX = new Set(["nice", "time", "command", "exec", "builtin", "stdbuf", "nohup", "ionice"]);
@@ -116,6 +127,77 @@ export function programOf(segment) {
   }
   if (!toks.length) return [null, []];
   return [base(toks[0]), toks.slice(1)];
+}
+
+// ── wrapper unwrap: bash -c/sh -c/eval/xargs, one shared implementation every rule routes through ───────
+export const SHELL_WRAPPER_PROGS = new Set(["sh", "bash", "dash", "zsh", "ksh"]);
+const SHELL_WRAPPER_VALUE_OPTS = new Set(["-o", "+o", "-O", "+O", "--rcfile", "--init-file"]);
+const XARGS_VALUE_OPTS = new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s",
+  "--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars", "--process-slot-var"]);
+/** For a shell invoked with -c ('bash -c', 'sh -c', 'zsh -c', ...), the wrapped script text as a single
+ *  trimmed, outer-quote-stripped string; null if `args` isn't a -c invocation. Handles a combined short
+ *  flag group (`-xc`) and -o/-O's own value. The one shared -c detector: both expandWrappedSegments below
+ *  and R7-root-delete's own recursive rdHit (which needs the identical detection, just reached through its
+ *  own stricter tokenizer upstream) call this same function, so there is one implementation of "does this
+ *  shell invocation carry an inline script, and what is it" rather than two independently-maintained ones. */
+export function shellDashCScript(args) {
+  let hasC = false;
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i];
+    if (a === "--") { i++; break; }
+    if (SHELL_WRAPPER_VALUE_OPTS.has(a)) { i += 2; continue; }
+    if (a.startsWith("-") && !a.startsWith("--") && a.length > 1) {
+      hasC = hasC || a.slice(1).includes("c");
+      i += "oO".includes(a[a.length - 1]) ? 2 : 1;
+      continue;
+    }
+    if (a.startsWith("--") || (a.startsWith("+") && a.length > 1)) { i++; continue; }
+    break;
+  }
+  if (!hasC) return null;
+  return args.slice(i).join(" ").trim().replace(/^['"]+|['"]+$/g, "");
+}
+/** The real [program, args] a `xargs ...` invocation runs, same unwrap readerBehind() in guard.mjs already
+ *  does for secret-read detection, duplicated here (guard.mjs can't be imported from shell.mjs) so the
+ *  wrapper-expansion below also sees through `xargs -I{} bash -c 'rm -rf {}'`-style indirection. */
+function xargsInvokes(prog, args) {
+  if (prog !== "xargs") return null;
+  const i = firstPositional(args, XARGS_VALUE_OPTS);
+  return i === null ? null : [base(args[i]), args.slice(i + 1)];
+}
+/** Every shell-script body reachable by peeling off a `bash -c`/`sh -c`/`eval`/`xargs ... <real command>`
+ *  wrapper around any of `segments`, recursively, up to `maxDepth` levels -- raw, unsplit text, so a caller
+ *  needing pipeline structure (splitPipelines) or per-segment matching (splitSegments) parses it whichever
+ *  way it needs. `programOf` already strips env/timeout/nice/nohup/command/builtin/stdbuf/sudo-less prefix
+ *  wrappers on its own, so only an actual -c body or an `eval`/`xargs` layer needs handling here. Returns
+ *  only the NEWLY found script bodies, not the original segments (callers already have those). */
+export function unwrapScripts(segments, maxDepth = 3) {
+  const out = [];
+  const walk = (segs, depth) => {
+    if (depth >= maxDepth) return;
+    for (const seg of segs) {
+      let [prog, args] = programOf(seg);
+      if (prog === null) continue;
+      const invoked = xargsInvokes(prog, args);
+      if (invoked) [prog, args] = invoked;
+      const script = prog === "eval" ? (args.length ? args.join(" ") : null)
+        : SHELL_WRAPPER_PROGS.has(prog) ? shellDashCScript(args) : null;
+      if (!script) continue;
+      out.push(script);
+      walk(splitSegments(stripHeredocs(script)), depth + 1);
+    }
+  };
+  walk(segments, 0);
+  return out;
+}
+
+// ── path normalization (lexical only, no fs access) ──────────────────────────
+/** Resolve `.`/`..` segments and duplicate slashes in a path, string-level only -- `path.posix.normalize`
+ *  canonicalizes to `/` and `/dev/./sda` / `//dev/sda` to `/dev/sda` before any root/home/device-literal
+ *  comparison runs, instead of a literal-string check that a dot-segment or doubled slash trivially dodges. */
+export function normalizePath(p) {
+  return p ? posixPath.normalize(p) : p;
 }
 
 // ── heredocs and comments ────────────────────────────────────────────────────
