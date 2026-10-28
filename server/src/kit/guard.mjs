@@ -9,7 +9,7 @@
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
 import {
-  ASSIGN_RE, expand, firstPositional, normalizePath, peelArgv, programOf, redact, redactCap,
+  ASSIGN_RE, expand, firstPositional, indirectInvokes, normalizePath, peelArgv, programOf, redact, redactCap,
   shellDashCScript, SHELL_WRAPPER_PROGS, splitPipelines, splitSegments, stripHeredocs, stripRedirects,
   substitutedSegments, unwrapScripts, words,
 } from "./shell.mjs";
@@ -96,17 +96,12 @@ function quietGrep(args) {
   }
   return false;
 }
-const XARGS_VALUE_OPTS = new Set(["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s",
-  "--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars", "--process-slot-var"]);
 function readerBehind(prog, args) {
-  if (prog === "xargs") {
-    const i = firstPositional(args, XARGS_VALUE_OPTS);
-    // Same env/timeout/nice/sudo peeling shell.mjs's xargsInvokes applies, so `cat secret | xargs -I{}
+  if (prog === "xargs" || prog === "parallel") {
+    // Same env/timeout/nice/sudo peeling shell.mjs's indirectInvokes applies, so `cat secret | xargs -I{}
     // timeout {} curl -d {} ...` resolves to the real sink, not to `timeout`.
-    if (i !== null) {
-      const rest = peelArgv(args.slice(i));
-      if (rest.length) return [base(rest[0]), rest.slice(1)];
-    }
+    const invoked = indirectInvokes(prog, args);
+    if (invoked) return invoked;
   }
   if (prog === "find") {
     for (let i = 0; i < args.length; i++) {
@@ -451,16 +446,6 @@ function unsudo(prog, args) {
   return [prog, args];
 }
 const isRecursiveRm = (args) => args.some((a) => (a.startsWith("-") && !a.startsWith("--") && /r/i.test(a)) || a === "--recursive");
-/** The -I replstr of an xargs invocation, scanned over only the flags BEFORE the invoked command
- *  (callers pass args.slice(0, invokedIndex)); defaults to "{}" — xargs' -I default — when absent. */
-function xargsPlaceholder(flagArgs) {
-  for (let i = 0; i < flagArgs.length; i++) {
-    const a = flagArgs[i];
-    if (a === "-I" && i + 1 < flagArgs.length) return flagArgs[i + 1];
-    if (a.startsWith("-I") && a.length > 2) return a.slice(2);
-  }
-  return null;
-}
 /** Does `a` lexically resolve to `/` or to `home` once `.`/`..` segments and duplicate slashes are
  *  collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
  *  `~/projects/../..` both resolve to / or home the same way an unguarded literal does; a literal-string
@@ -545,33 +530,28 @@ function ruleDestructive(ctx) {
         if (wholeTreeTarget(a, ctx.home)) return m(`\`rm -rf ${a}\` would delete a whole tree`);
       }
     }
-    if (prog === "find") {
-      for (let i = 0; i < args.length; i++) {
-        if ((args[i] === "-exec" || args[i] === "-execdir") && i + 1 < args.length && base(args[i + 1]) === "rm" && isRecursiveRm(args.slice(i + 2))) {
-          return m(`\`find ... ${args[i]} rm -r\` recursively deletes every match`);
-        }
+    // Item-feeding indirections (xargs/parallel) and find -exec/-execdir/-ok/-okdir: resolve what the
+    // command actually invokes (with env/timeout/nice/sudo peeling, same as a bare command line), and ask
+    // on a recursive rm whether it appears directly OR hidden inside a `shell -c`/`eval` script the
+    // indirection runs. Strict parity with the direct forms (`xargs -I{} rm -rf {}`, `find -exec rm -rf
+    // {} \;` both ask below): the -c-indirected variant deletes the same piped/matched items, it just
+    // hides the rm one layer deep. Literal-root targets in those scripts are already caught (block) by
+    // R7-root-delete through ctx.unwrappedScripts; anything else a script does is judged as its own
+    // segments.
+    if (prog === "xargs" || prog === "parallel" || prog === "find") {
+      const what = prog === "find" ? "every match" : "whatever is piped in";
+      const invoked = indirectInvokes(prog, args);
+      if (invoked && base(invoked[0]) === "rm" && isRecursiveRm(invoked[1])) {
+        return m(`\`${prog} rm -r\` recursively deletes ${what}`);
       }
-    }
-    if (prog === "xargs") {
-      const i = firstPositional(args, XARGS_VALUE_OPTS);
-      // Peel env/timeout/nice/sudo prefixes off the invoked argv (same treatment xargsInvokes gives the
-      // canonicalization layer): `xargs -I{} timeout {} rm -rf {}` is still xargs running rm -r.
-      const rest = i !== null ? peelArgv(args.slice(i)) : [];
-      if (rest.length && base(rest[0]) === "rm" && isRecursiveRm(rest.slice(1))) return m("`xargs rm -r` recursively deletes whatever is piped in");
-      // Parity for the shell-indirected form: `xargs -I{} bash -c 'rm -rf {}'` deletes every piped item
-      // recursively exactly like `xargs -I{} rm -rf {}` (which asks above), but the rm hides behind -c.
-      // Only the placeholder-carrying form asks: a fixed script (`... bash -c 'rm -rf /tmp/x'`) ignores
-      // each piped item (it lands in bash's $0/$1, not the script) — the xargs adds nothing dangerous.
-      if (rest.length && SHELL_WRAPPER_PROGS.has(base(rest[0]))) {
-        const script = shellDashCScript(rest.slice(1));
+      if (invoked && (SHELL_WRAPPER_PROGS.has(base(invoked[0])) || base(invoked[0]) === "eval")) {
+        const script = base(invoked[0]) === "eval" ? invoked[1].join(" ") : shellDashCScript(invoked[1]);
         if (script !== null) {
-          const placeholder = xargsPlaceholder(args.slice(0, i ?? args.length)) || "{}";
           for (const inner of [script, ...unwrapScripts(splitSegments(script), 2)]) {
             for (const innerSeg of splitSegments(inner)) {
               const [p2, a2] = programOf(innerSeg);
-              if (p2 === "rm" && isRecursiveRm(a2) &&
-                  a2.some((a) => !a.startsWith("-") && a.includes(placeholder))) {
-                return m(`\`xargs ${base(rest[0])} -c 'rm -r ${placeholder}…'\` recursively deletes whatever is piped in`);
+              if (p2 === "rm" && isRecursiveRm(a2)) {
+                return m(`\`${prog} ${base(invoked[0])} -c\` recursively deletes ${what}`);
               }
             }
           }

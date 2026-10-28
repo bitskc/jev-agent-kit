@@ -195,6 +195,22 @@ export function peelArgv(toksIn) {
       toks = rest;
       continue;
     }
+    if (head === "runuser") {
+      // runuser [opts] [-] [user] cmd...: -u/-s/-g/-G take values; a lone `-` means "login shell, user
+      // follows"; the first positional is the user only when a command still follows it (-- ends opts).
+      let i = 1;
+      while (i < toks.length) {
+        const t = toks[i];
+        if (t === "--") { i++; break; }
+        if (!t.startsWith("-") || t === "-") break;
+        i += ["-u", "--user", "-s", "--shell", "-g", "--group", "-G", "--supp-group"].includes(t) ? 2 : 1;
+      }
+      if (i < toks.length && toks[i] === "-") i++;
+      if (i < toks.length && i + 1 < toks.length && !toks[i].startsWith("-")) i++; // user operand
+      if (i < toks.length && toks[i] === "--") i++;
+      toks = toks.slice(i);
+      continue;
+    }
     if (head === "sudo" || head === "doas") {
       let i = 1;
       while (i < toks.length) {
@@ -225,18 +241,49 @@ export function peelArgv(toksIn) {
     return toks;
   }
 }
-/** The real [program, args] a `xargs ...` invocation runs, same unwrap readerBehind() in guard.mjs already
- *  does for secret-read detection, duplicated here (guard.mjs can't be imported from shell.mjs) so the
- *  wrapper-expansion below also sees through `xargs -I{} bash -c 'rm -rf {}'`-style indirection. The
- *  invoked argv gets the SAME prefix peeling a bare command line would (env/nice/timeout/sudo/...):
+const PARALLEL_VALUE_OPTS = new Set(["-a", "--arg-file", "-A", "-j", "--jobs", "-N", "-n", "--max-lines",
+  "-L", "-l", "-s", "--colsep", "--delay", "--retries", "-S", "--trc", "-W", "--workdir", "-P",
+  "--max-procs", "-I", "--replace", "-B", "--slot-replace", "--timeout"]);
+/** The real [program, args] an item-feeding or shell-indirection command runs: `xargs`'/`parallel`'s
+ *  invoked argv, `find ... -exec cmd \;`'s argv, or — for su/ssh — the inline script itself.
+ *  The invoked argv gets the SAME prefix peeling a bare command line would (env/nice/timeout/sudo/...):
  *  without it `xargs -I{} timeout {} bash -c 'rm -rf /'` resolved to `timeout` — not a shell wrapper —
- *  and the -c script was never unwrapped. */
-function xargsInvokes(prog, args) {
-  if (prog !== "xargs") return null;
-  const i = firstPositional(args, XARGS_VALUE_OPTS);
-  if (i === null) return null;
-  const rest = peelArgv(args.slice(i));
-  return rest.length ? [base(rest[0]), rest.slice(1)] : null;
+ *  and the -c script was never unwrapped. Returns [program, args], or null when prog isn't one of the
+ *  known indirections / has no invoked command. */
+export function indirectInvokes(prog, args) {
+  if (prog === "xargs" || prog === "parallel") {
+    const i = firstPositional(args, prog === "xargs" ? XARGS_VALUE_OPTS : PARALLEL_VALUE_OPTS);
+    if (i === null) return null;
+    const rest = peelArgv(args.slice(i));
+    return rest.length ? [base(rest[0]), rest.slice(1)] : null;
+  }
+  if (prog === "find") {
+    for (let i = 0; i < args.length; i++) {
+      if (!["-exec", "-execdir", "-ok", "-okdir"].includes(args[i])) continue;
+      const rest = [];
+      for (let j = i + 1; j < args.length && args[j] !== ";" && args[j] !== "+"; j++) rest.push(args[j]);
+      const peeled = peelArgv(rest);
+      if (peeled.length) return [base(peeled[0]), peeled.slice(1)];
+    }
+  }
+  return null;
+}
+const SSH_VALUE_OPTS = new Set(["-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O",
+  "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]);
+/** `su [-] [user] -c 'script'` / `runuser ... -c 'script'`: the -c operand is a full shell script, same
+ *  indirection class as `bash -c`. */
+function suScript(args) {
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === "-c" || args[i] === "--command") && i + 1 < args.length) return args[i + 1];
+    if (args[i].startsWith("--command=")) return args[i].slice("--command=".length);
+  }
+  return null;
+}
+/** `ssh [opts] dest 'remote script'`: first non-option operand is the destination, everything after it is
+ *  one remote command line — re-tokenizable script text for our purposes. */
+function sshScript(args) {
+  const i = firstPositional(args, SSH_VALUE_OPTS);
+  return i !== null && i + 1 < args.length ? args.slice(i + 1).join(" ") : null;
 }
 /** Every shell-script body reachable by peeling off a `bash -c`/`sh -c`/`eval`/`xargs ... <real command>`
  *  wrapper around any of `segments`, recursively, up to `maxDepth` levels -- raw, unsplit text, so a caller
@@ -251,10 +298,12 @@ export function unwrapScripts(segments, maxDepth = 3) {
     for (const seg of segs) {
       let [prog, args] = programOf(seg);
       if (prog === null) continue;
-      const invoked = xargsInvokes(prog, args);
+      const invoked = indirectInvokes(prog, args);
       if (invoked) [prog, args] = invoked;
       const script = prog === "eval" ? (args.length ? args.join(" ") : null)
-        : SHELL_WRAPPER_PROGS.has(prog) ? shellDashCScript(args) : null;
+        : SHELL_WRAPPER_PROGS.has(prog) ? shellDashCScript(args)
+        : (prog === "su" || prog === "runuser") ? suScript(args)
+        : prog === "ssh" ? sshScript(args) : null;
       if (!script) continue;
       out.push(script);
       walk(splitSegments(stripHeredocs(script)), depth + 1);
