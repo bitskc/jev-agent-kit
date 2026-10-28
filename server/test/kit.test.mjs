@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { sizeDispatch } from "../src/kit/tier.mjs";
-import { verifyDone, checkSummary } from "../src/kit/verify.mjs";
+import { verifyDone, checkSummary, runOutcome, classifyToolResult } from "../src/kit/verify.mjs";
 import { resolveUpstream, askUpstream, GATEWAY_BASE, TYPESAFE_BASE } from "../src/kit/jev.mjs";
 
 const noJev = { ask: null, jevAvailable: false };
@@ -141,6 +141,99 @@ test("checkSummary: a fail signal after an early 'passing' line still reports fa
   assert.equal(checkSummary("12 passing (3s)\nnpm ERR! code ELIFECYCLE\nnpm ERR! Test failed."), "fail");
   // a combined build+test command: tests passed, the build step after them did not.
   assert.equal(checkSummary("5 passing (1s)\nsrc/foo.ts(10,5): error TS2345: argument of type"), "fail");
+});
+test("runOutcome: failure text beats a clean exit status through a pipe (the masked-failure regression)", () => {
+  // `npx mocha | tail -3` exits 0 while the runner printed "1 failing".
+  assert.equal(runOutcome("npx mocha | tail -3", "  1 failing\n  11 passing", 0), "fail");
+  // Other runners' failure text behind a masked exit 0 must also be a fail (FAILURE_MARKER is not mocha-only).
+  assert.equal(runOutcome("go test ./... | tail -3", "--- FAIL: TestAdd (0.00s)\nFAIL\texample/pkg\t0.01s", 0), "fail");
+  assert.equal(runOutcome("python -m unittest | tail -3", "Ran 3 tests\nFAILED (failures=1)", 0), "fail");
+  assert.equal(runOutcome("npx jest | tail -3", "Tests:       1 failed, 4 passed, 5 total", 0), "fail");
+  assert.equal(checkSummary("  0 failing\n  12 passing (3s)"), "pass");
+});
+test("runOutcome: a masked exit passes on a pass summary only when the sole mask is one bare pipe into tail/head (#91)", () => {
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test || true", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test && echo done", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  // a masked status is not a pass on its own: failure text beats the summary, and no summary is unknown.
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)\n  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 1), "fail");
+  assert.equal(runOutcome("npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test | tail -5", "", 0), "unknown");
+});
+test("runOutcome: a masked pass summary is trusted only through the structural tail/head rule; forgeries and redirects stay unknown", () => {
+  // a trailing segment could print a summary the check did not produce, so only one bare pipe into tail/head counts
+  assert.equal(runOutcome("npm test 2>&1 | tail -20; printf 'a\\nb\\n  12 passing\\n'", "a\nb\n  12 passing\n", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | grep -v failing | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20 || echo hi", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >log 2>&1; tail log", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >/dev/null 2>&1; echo '  12 passing'", "  12 passing", 0), "unknown");
+  assert.equal(runOutcome("echo pipefail; npm test | tail -20", "  12 passing (3s)", 0), "unknown");
+  // the honest shapes still pass: one bare pipe into tail or head, stderr merged, prefix elements before the check
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test 2>&1 | head -n 5", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("cd api && npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  // the checks that are load-bearing on the left side of a single pipe: a `||`, a redirect, or a file argument to tail
+  assert.equal(runOutcome("cd api || npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >log | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20 forged.log", "  12 passing (3s)", 0), "unknown");
+});
+test("runOutcome: pipefail decides whether a masked status is trusted, shown on output with no summary", () => {
+  // Under pipefail the piped check's own status is the exit code, so exit 0 with no failure text passes.
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set +o pipefail; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -eo pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("set +o pipefail -e; set -o pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail -e; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("npm test -- \"set -o pipefail\" | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; bash -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; /bin/bash -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; ksh -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test' | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("/bin/bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  // pipefail counts only from an exact `set -o pipefail` prefix, or a leading `bash -o pipefail -c`.
+  assert.equal(runOutcome("node --test test/x.test.mjs --test-name-pattern pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+  assert.equal(runOutcome("npm test -- -t pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+});
+test("runOutcome: a chained command masks the exit status; failure text fails, a pass summary is unknown, bare exit 0 is unknown", () => {
+  assert.equal(runOutcome("npm test ; echo done", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test ; echo done", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test ; echo done", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "boom", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test || echo hi'", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("cd api && npm test", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("cd api && npm test", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("cd api && npm test ; echo done", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("(npm test)", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test &", "Error: boom", 0), "unknown");
+});
+test("classifyToolResult: a non-CHECK command's summary follows the same masking rule", () => {
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh | tail -3" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh ; echo done" }, false, "Error: boom"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  1 failing"), "check-fail");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "all good"), "unknown");
+});
+test("verify_done: an honest piped run with a pass summary is a proven check (#91)", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npm test 2>&1 | tail -20", output: "  12 passing (3s)", exit_code: 0 }] });
+  assert.equal(r.evidence.fresh_checks[0].passed, true);
+});
+test("verify_done: a clean-looking check followed by a chained command is not a pass", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npm test ; echo done", output: "Error: boom", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.equal(r.evidence.fresh_checks[0].passed, false);
+});
+test("verify_done: a failing run hidden behind a pipe is a fail, not an unproven check", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx mocha | tail -3", output: "  1 failing", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.ok(r.evidence.fresh_checks.some((c) => c.passed === false && !c.unproven));
 });
 test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
   const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },

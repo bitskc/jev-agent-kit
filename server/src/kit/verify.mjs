@@ -14,10 +14,84 @@ const MESSAGE_CAP = 2000;
 
 export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
 
+// Failure text a runner prints. Matched before any pass signal and regardless of exit status: `npx mocha | tail -3`
+// exits 0 while printing "1 failing". "0 failing" does not match (the count must be 1 or more).
+const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
+const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
+/**
+ * Prefix elements (cd, pushd, popd, export, set, unset, source, env assignments) are transparent: the recorded
+ * status is the last command's, so `cd api && npm test` reports npm test's own status. Once a real command has
+ * appeared, a following `;`, `&&`, or `||` element, a subshell, command substitution, a nested `sh -c` (also
+ * path-qualified, ksh, zsh, dash), a background `&`, or a bare `|` without pipefail masks the status. pipefail is
+ * on when the last `set -o`/`set +o pipefail` prefix element sets it (`-eo`/`-euo` too). A leading
+ * `bash -o pipefail -c` carries it into the body only when no pipe sits outside it. Quoted text is ignored.
+ */
+const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
+const LIST_SPLIT = /;|&&|\|\||\n/;
+const QUOTED = /'[^']*'|"[^"]*"/g;
+const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
+const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-\w*c\b/;
+const SET_PIPEFAIL_OP = /(?:^|\s)([-+])[A-Za-z]*o\s+pipefail(?=\s|$)/g;
+const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
+function pipefailOn(unquoted) {
+  // A bash wrapper carries pipefail into its -c body; a pipe outside the wrapper is not covered by it.
+  if (BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return !/(?<!\|)\|(?!\|)/.test(unquoted);
+  let on = false;
+  for (const s of unquoted.split(LIST_SPLIT).map((x) => x.trim()).filter(Boolean)) {
+    if (!PREFIX_SEGMENT.test(s)) break;
+    if (/^set(?=\s|$)/.test(s)) for (const m of s.matchAll(SET_PIPEFAIL_OP)) on = m[1] === "-";
+  }
+  return on;
+}
+export function exitIsMasked(command) {
+  if (UNATTRIBUTABLE.test(command)) return true;
+  const unquoted = command.replace(QUOTED, "''");
+  if (NESTED_SHELL_C.test(unquoted) && !BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return true;
+  if (/(?<!\|)\|(?!\|)/.test(command) && !pipefailOn(unquoted)) return true;
+  const segments = command.split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
+  const first = segments.findIndex((s) => !PREFIX_SEGMENT.test(s));
+  if (first === -1) return true;
+  return first < segments.length - 1;
+}
+const TAIL_HEAD_ARGS = /^\s*(?:tail|head)(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
+const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
+/**
+ * A pass summary may stand in for a masked exit only when the sole mask is one bare pipe into `tail` or `head`:
+ * the check's own stdout is not redirected, no `||` appears, nothing follows the pipe, and the left side is the
+ * check command preceded only by prefix elements. Any other mask (a trailing segment, a redirect, a second pipe,
+ * a filter) could print a summary the check did not produce, so it stays unknown.
+ */
+function maskedByTailPipeOnly(command) {
+  if (UNATTRIBUTABLE.test(command)) return false;
+  const unquoted = command.replace(QUOTED, "''");
+  if (unquoted.includes("||") || />/.test(unquoted.replace(FD_MERGE_STDERR, ""))) return false;
+  if (NESTED_SHELL_C.test(unquoted)) return false;
+  const parts = unquoted.split(/(?<!\|)\|(?!\|)/);
+  if (parts.length !== 2 || !TAIL_HEAD_ARGS.test(parts[1])) return false;
+  const segs = parts[0].split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
+  if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
+  return segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s));
+}
+/**
+ * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says.
+ * A masked exit status is not evidence on its own: with no failure text, the runner's own pass summary (`12 passing`
+ * piped through tail) counts as a pass, and anything else is unknown. An unmasked exit 0 with no failure text passes.
+ */
+export function runOutcome(command, output, exitCode) {
+  if (typeof exitCode === "number" && exitCode !== 0) return "fail";
+  const summary = checkSummary(output);
+  if (summary === "fail") return "fail";
+  if (exitIsMasked(command)) return summary === "pass" && maskedByTailPipeOnly(command) ? "pass" : "unknown";
+  if (summary === "pass") return "pass";
+  if (exitCode === 0) return "pass";
+  return "unknown";
+}
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 export function checkSummary(output) {
   if (typeof output !== "string" || !output) return undefined;
   const tail = output.slice(-6000);
+  // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER).
+  if (FAILURE_MARKER.test(tail) || EXIT_MENTION.test(tail)) return "fail";
   const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
   if (nodeTest) return Number(nodeTest[1]) > 0 ? "fail" : "pass";
   const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
@@ -44,17 +118,18 @@ export function checkSummary(output) {
   // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
   if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return "fail";
   if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
+  if (/^\s*(?:all tests pass(?:ed)?\b|tests? passed\b|\d+ (?:tests? )?passed\b)/im.test(tail)) return "pass";
   return undefined;
 }
 
-const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+export const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 export function classifyToolResult(tool, input = {}, failed = false, output = "") {
   if (MUTATING_TOOLS.has(tool)) return "mutation";
   const command = typeof input.command === "string" ? input.command : "";
-  const summary = checkSummary(output);
-  if (tool === "Bash" && CHECK_COMMAND.test(command)) return failed || summary === "fail" ? "check-fail" : "check-pass";
-  if (summary) return summary === "fail" || failed ? "check-fail" : "check-pass";
-  return "unknown";
+  const isCheck = tool === "Bash" && CHECK_COMMAND.test(command);
+  if (!isCheck && !checkSummary(output)) return "unknown";
+  const outcome = runOutcome(command, output, failed ? 1 : 0);
+  return outcome === "fail" ? "check-fail" : outcome === "pass" ? "check-pass" : "unknown";
 }
 
 function textOf(content) {
@@ -161,7 +236,7 @@ export function nudge(verdict, evidence) {
   const failed = freshChecks(evidence).filter((c) => !c.passed);
   const last = failed.at(-1);
   const next = !last ? "Run the project's tests, build, or lint (whatever exists) on what you changed."
-    : last.unproven ? `The last check (\`${last.call}\`) could not be proven: no recognised pass/fail summary and no exit_code. Send exit_code or paste the runner's summary lines.`
+    : last.unproven ? `The last check (\`${last.call}\`) could not be proven: no trustworthy pass/fail result (no recognised summary and no exit_code, or its exit status is masked). Send exit_code or paste the runner's summary lines.`
     : `The last check that ran failed: ${last.call}. Fix that first.`;
   return `${verdict.reasons.join("; ")}. ${next} Then report the actual result. If no check exists or can run, say so plainly instead of presenting the work as done.`;
 }
@@ -194,13 +269,11 @@ export async function verifyDone(input, deps = {}) {
       const command = c.command || "check";
       const call = redact(command).slice(0, 200);
       if (typeof c.passed === "boolean") return { call, passed: c.passed };
-      const isCheck = CHECK_COMMAND.test(command);
-      const summary = checkSummary(c.output || "");
-      if (typeof c.exit_code === "number") return isCheck ? { call, passed: c.exit_code === 0 && summary !== "fail" } : null;
-      if (summary) return isCheck ? { call, passed: summary === "pass" } : null;
-      if (!isCheck) return null;
-      // A check command with no recognised runner summary and no exit code is unproven, never a pass.
-      notes.push(`Check '${call}' had no recognised pass/fail summary and no exit_code, so it is not counted as passing. Send exit_code or paste the runner's summary lines.`);
+      if (!CHECK_COMMAND.test(command)) return null;
+      const outcome = runOutcome(command, c.output || "", typeof c.exit_code === "number" ? c.exit_code : undefined);
+      if (outcome !== "unknown") return { call, passed: outcome === "pass" };
+      // No trustworthy result (no recognised summary and no exit_code, or a masked exit status): never a pass.
+      notes.push(`Check '${call}' has no trustworthy pass/fail result (no recognised summary and no exit_code, or its exit status is masked by || true or a pipe). Send exit_code or paste the runner's summary lines.`);
       return { call, passed: false, unproven: true };
     }).filter(Boolean);
     // supplied checks are assumed to have run after the supplied changes
