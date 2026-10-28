@@ -53,6 +53,25 @@ export function exitIsMasked(command) {
   if (first === -1) return true;
   return first < segments.length - 1;
 }
+const TAIL_HEAD_ARGS = /^\s*(?:tail|head)(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
+const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
+/**
+ * A pass summary may stand in for a masked exit only when the sole mask is one bare pipe into `tail` or `head`:
+ * the check's own stdout is not redirected, no `||` appears, nothing follows the pipe, and the left side is the
+ * check command preceded only by prefix elements. Any other mask (a trailing segment, a redirect, a second pipe,
+ * a filter) could print a summary the check did not produce, so it stays unknown.
+ */
+function maskedByTailPipeOnly(command) {
+  if (UNATTRIBUTABLE.test(command)) return false;
+  const unquoted = command.replace(QUOTED, "''");
+  if (unquoted.includes("||") || />/.test(unquoted.replace(FD_MERGE_STDERR, ""))) return false;
+  if (NESTED_SHELL_C.test(unquoted)) return false;
+  const parts = unquoted.split(/(?<!\|)\|(?!\|)/);
+  if (parts.length !== 2 || !TAIL_HEAD_ARGS.test(parts[1])) return false;
+  const segs = parts[0].split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
+  if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
+  return segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s));
+}
 /**
  * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says.
  * A masked exit status is not evidence on its own: with no failure text, the runner's own pass summary (`12 passing`
@@ -62,7 +81,7 @@ export function runOutcome(command, output, exitCode) {
   if (typeof exitCode === "number" && exitCode !== 0) return "fail";
   const summary = checkSummary(output);
   if (summary === "fail") return "fail";
-  if (exitIsMasked(command)) return summary === "pass" ? "pass" : "unknown";
+  if (exitIsMasked(command)) return summary === "pass" && maskedByTailPipeOnly(command) ? "pass" : "unknown";
   if (summary === "pass") return "pass";
   if (exitCode === 0) return "pass";
   return "unknown";

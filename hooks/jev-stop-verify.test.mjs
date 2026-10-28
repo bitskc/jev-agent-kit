@@ -54,6 +54,18 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["set -o pipefail; ksh -c 'npm test | tail -5'", "  12 passing (3s)", 0],
     ["bash -o pipefail -c 'npm test' | tail -5", "  12 passing (3s)", 0],
     ["/bin/bash -o pipefail -c 'npm test | tail -5'", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | tail -20; printf 'a\\nb\\n  12 passing\\n'", "a\nb\n  12 passing\n", 0],
+    ["npm test 2>&1 | grep -v failing | tail -20", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | tail -20 || echo hi", "  12 passing (3s)", 0],
+    ["npm test >log 2>&1; tail log", "  12 passing (3s)", 0],
+    ["npm test >/dev/null 2>&1; echo '  12 passing'", "  12 passing", 0],
+    ["echo pipefail; npm test | tail -20", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | tail -20", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | head -n 5", "  12 passing (3s)", 0],
+    ["cd api && npm test 2>&1 | tail -20", "  12 passing (3s)", 0],
+    ["cd api || npm test 2>&1 | tail -20", "  12 passing (3s)", 0],
+    ["npm test >log | tail -5", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | tail -20 forged.log", "  12 passing (3s)", 0],
   ];
   for (const [command, output, exit] of cases) {
     assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);
@@ -1359,6 +1371,31 @@ test("#44: a JSON-RPC error from kit_verify_done blocks with the server's messag
   assert.ok(out && out.decision === "block", "expected a block");
   assert.match(out.reason, /VERIFY GATE ERROR/);
   assert.match(out.reason, /Invalid params/);
+});
+
+test("#44/P2-1: only 400/413/422 from kit_verify_done block; auth, routing and transient statuses fail open", async () => {
+  for (const status of [401, 403, 404, 408, 429, 500, 503, 504]) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const fetchImpl = async () => ({ ok: false, status, text: async () => "upstream says no" });
+    const out = await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+    assert.equal(out, null, `HTTP ${status} must fail open`);
+  }
+  for (const status of [400, 413, 422]) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const fetchImpl = async () => ({ ok: false, status, text: async () => "payload rejected" });
+    const out = await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+    assert.ok(out && out.decision === "block", `HTTP ${status} expected a block`);
+    assert.match(out.reason, new RegExp("HTTP " + status));
+  }
+});
+
+test("#44/P2-1: a JSON-RPC error other than -32602 (internal, method-not-found) fails open", async () => {
+  for (const code of [-32603, -32601]) {
+    fresh(); setBaseEnv({ gate: "verify" });
+    const fetchImpl = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code, message: "server side" } }) });
+    const out = await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "Fixed, all tests pass." }, { fetchImpl });
+    assert.equal(out, null, `JSON-RPC ${code} must fail open`);
+  }
 });
 
 test("#44: file_changes above the schema's 100000 cap is clamped, not sent over-cap", () => {
