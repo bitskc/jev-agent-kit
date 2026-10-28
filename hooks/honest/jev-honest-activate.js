@@ -10,7 +10,7 @@ const path = require('path');
 const rt = require('./jev-honest-runtime');
 
 const level = rt.readLevel() || rt.defaultLevel();
-if (level === 'off') { rt.clearLevel(); process.exit(0); }
+if (level === 'off') { process.exit(0); } // leave the flag as-is: an explicit off must survive resume/clear/compact
 
 try { rt.setLevel(level); } catch { /* flag is best-effort */ }
 

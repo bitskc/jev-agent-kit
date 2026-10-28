@@ -20,11 +20,32 @@ function normalize(v: unknown): Level | null {
   if (n === "lite") return "soft";
   return (LEVELS as readonly string[]).includes(n) ? (n as Level) : null;
 }
+// Default level: JEV_HONEST_DEFAULT_LEVEL env > ~/.config/jev/config.json {"honestLevel": ...} > off (same 3-step
+// resolution as the Claude Code hooks, so the README's "same levels/semantics" promise actually holds for omp).
+function configPath(): string {
+  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
+  return path.join(base, "jev", "config.json");
+}
+function defaultLevel(): Level {
+  const env = normalize(process.env.JEV_HONEST_DEFAULT_LEVEL);
+  if (env) return env;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(configPath(), "utf8").replace(/^\uFEFF/, ""));
+    return normalize(cfg.honestLevel) ?? "off";
+  } catch {
+    return "off";
+  }
+}
 function readLevel(): Level {
-  try { return normalize(fs.readFileSync(FLAG, "utf8")) ?? "off"; } catch { return "off"; }
+  try {
+    const fromFlag = normalize(fs.readFileSync(FLAG, "utf8"));
+    if (fromFlag) return fromFlag;
+  } catch { /* flag absent: fall through to the configured default */ }
+  return defaultLevel();
 }
 function writeLevel(level: Level): void {
-  if (level === "off") { try { fs.unlinkSync(FLAG); } catch { /* absent */ } return; }
+  // "off" is written explicitly, never unlinked: an absent flag falls through to defaultLevel(), so deleting
+  // the flag on an explicit /honest-jev off would silently re-arm a configured non-off default next session.
   fs.mkdirSync(path.dirname(FLAG), { recursive: true });
   fs.writeFileSync(FLAG, level + "\n");
 }

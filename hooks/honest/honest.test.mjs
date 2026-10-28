@@ -54,7 +54,7 @@ test("defaultLevel: env beats config file beats off", () => {
   assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false);
 });
 
-test("hooks end to end: fresh install is silent; prompt switch writes flag and injects; subagent mirrors; off clears", () => {
+test("hooks end to end: fresh install is silent; prompt switch writes flag and injects; subagent mirrors; off persists", () => {
   const d = fresh(); delete process.env.JEV_HONEST_DEFAULT_LEVEL;
   assert.equal(run("jev-honest-activate.js"), "");
   assert.equal(run("jev-honest-subagent.js"), "");
@@ -67,8 +67,25 @@ test("hooks end to end: fresh install is silent; prompt switch writes flag and i
   assert.match(sub.hookSpecificOutput.additionalContext, /level: strict/);
   assert.equal(run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "talk about honest-jev strict mode" })), "");
   assert.match(run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "honest-jev off" })), /^HONEST JEV OFF/);
-  assert.equal(fs.existsSync(path.join(d, ".jev-honest-active")), false);
+  assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "off\n");
   assert.equal(run("jev-honest-mode-tracker.js", "not json"), "");
+});
+test("off persists across resume even with a configured default: activate never re-arms a turned-off flag", () => {
+  // P2: clearLevel() instead of writing "off" let an absent flag fall through to defaultLevel() on the
+  // very next SessionStart, silently re-arming a configured non-off default one or two activations later.
+  const d = fresh();
+  const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-"));
+  process.env.XDG_CONFIG_HOME = xdg; delete process.env.JEV_HONEST_DEFAULT_LEVEL;
+  fs.mkdirSync(path.join(xdg, "jev")); fs.writeFileSync(path.join(xdg, "jev", "config.json"), '{"honestLevel":"strict"}');
+  assert.match(run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "/honest-jev off" })), /^HONEST JEV OFF/);
+  assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "off\n");
+  // first activate (e.g. resume): must stay silent and must not touch the flag
+  assert.equal(run("jev-honest-activate.js"), "");
+  assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "off\n");
+  // second activate (e.g. a later compact/resume): still silent, still off, despite the configured default
+  assert.equal(run("jev-honest-activate.js"), "");
+  assert.equal(fs.readFileSync(path.join(d, ".jev-honest-active"), "utf8"), "off\n");
+  delete process.env.XDG_CONFIG_HOME;
 });
 
 test("activate: statusline nudge composes with an existing command and is skipped once wired", () => {

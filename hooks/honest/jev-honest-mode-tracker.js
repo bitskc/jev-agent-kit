@@ -11,7 +11,8 @@ process.stdin.on('end', () => {
     const level = rt.parseCommand(data.prompt);
     if (level === null) return;
     if (level === 'off') {
-      rt.clearLevel();
+      rt.setLevel('off'); // explicit off, never cleared: an absent flag would fall through to the configured
+      // default (JEV_HONEST_DEFAULT_LEVEL / config.json honestLevel) and silently re-arm on the next session
       rt.emit('UserPromptSubmit', 'HONEST JEV OFF — the claims-vs-evidence check is no longer required. Confirm in one line.');
       return;
     }
