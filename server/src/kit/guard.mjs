@@ -37,22 +37,27 @@ const SECRET_PATH_RES = [
   /[\\/]airlock[\\/]env\b/i,
   /\.credentials\.json\b/,
   /\bcredentials(\.json|\.yml|\.yaml|\.ini)?\b(?!\.example)/,
-  /(^|\/)\.env(\.[A-Za-z0-9_-]+)?$/,
-  /(^|\/)\.env(\.[A-Za-z0-9_-]+)?(\s|$)/,
-  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/,
+  // dotenv family: `.env` plus any suffix chain (.env.local, .env.production.local, .env.a.b)
+  /(^|\/)\.env(\.[A-Za-z0-9_.-]+)*$/,
+  /(^|\/)\.env(\.[A-Za-z0-9_.-]+)*(\s|$)/,
+  /(^|\/)\.envrc$/,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(_[A-Za-z0-9_-]+)?$/,
   /\.(pem|key|p12|pfx|jks)$/,
   /(^|\/)\.netrc$/,
   /(^|\/)\.pgpass$/,
   /(^|\/)\.npmrc$/,
+  /(^|\/)\.pypirc$/,
+  /(^|\/)\.dev\.vars(\.[A-Za-z0-9_.-]+)?$/,
+  /(^|\/)service[-_]account[^\/]*\.json$/,
+  /\.tfstate(\.backup)?$/,
   /(^|\/)\.credentials\b/,
   /(^|\/)etc\/g?shadow$/,
   /(^|\/)\.docker\/config\.json$/,
   /(^|\/)\.kube\/config$/,
+  // secret directories: every path under them is a secret, read or exfiltrated (.pub keys stay safe)
+  /(^|\/)\.(ssh|aws|gnupg)(\/|$)/,
+  /(^|\/)\.config\/gh(\/|$)/,
 ];
-// Directory-form secret stores. Only the exfil paths (archive/copy sources) use these, so a plain read of
-// ~/.ssh/config keeps its current behavior; a tar/scp/rsync/dd of the whole directory is what leaks them.
-const SECRET_DIR_RES = [/(^|\/)\.(ssh|aws|gnupg)(\/|$)/];
-const SECRET_EXFIL_RES = [...SECRET_PATH_RES, ...SECRET_DIR_RES];
 const SAFE_PATH_RES = [
   /\.(example|sample|template|dist|md|rst|txt\.example)$/,
   /\.env\.(example|sample|template)\b/,
@@ -79,6 +84,8 @@ export const R1_SUGGESTION =
 
 const isSafePath = (tok) => SAFE_PATH_RES.some((r) => r.test(tok));
 const REDIR_SPLIT_RE = /\d*[<>]+&?/;
+// `--opt=value` carries a path as its value: `docker compose --env-file=.env config`.
+const OPT_VALUE_RE = /^--?[A-Za-z][\w-]*=(.+)$/;
 function* pathParts(tokens) {
   for (const tok of tokens) {
     yield tok;
@@ -90,13 +97,45 @@ function* pathParts(tokens) {
     // proven from text (substLiteral returns null) and stay opaque.
     const lit = substLiteral(tok);
     if (lit !== null && lit !== tok) yield lit;
+    const opt = OPT_VALUE_RE.exec(tok);
+    if (opt) yield opt[1];
   }
+}
+// A glob token is tested through the concrete names it can expand to (approximate, not a glob engine):
+// `*` as nothing, `x` or `.x`; `?` and `[...]` as one member character. Catches `.env*`, `.env.*`,
+// `~/.ssh/*`, `~/.aws/cred*` without writing out each spelling.
+const GLOB_CHAR_RE = /[*?[]/;
+const GLOB_UNIT_RE = /\[!?[^\]]*\]|\*|\?|[^*?[]+|\[/g;
+function bracketChars(body) {
+  const out = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i + 1] === "-" && i + 2 < body.length) {
+      for (let c = body.charCodeAt(i); c <= body.charCodeAt(i + 2); c++) out.push(String.fromCharCode(c));
+      i += 2;
+    } else out.push(body[i]);
+  }
+  return out.length ? out : ["x"];
+}
+function globSamples(p) {
+  let cands = [""];
+  for (const u of p.match(GLOB_UNIT_RE) ?? []) {
+    let alts;
+    if (u === "*") alts = ["", "x", ".x"];
+    else if (u === "?") alts = ["x"];
+    else if (u.length > 1 && u.startsWith("[")) alts = u.startsWith("[!") ? ["x"] : bracketChars(u.slice(1, -1));
+    else alts = [u];
+    cands = cands.flatMap((c) => alts.map((a) => c + a)).slice(0, 2048);
+  }
+  return cands;
+}
+function secretMatch(p, res) {
+  if (res.some((r) => r.test(p))) return true;
+  return GLOB_CHAR_RE.test(p) && globSamples(p).some((s) => res.some((r) => r.test(s)));
 }
 function secretPathIn(tokens, home, res = SECRET_PATH_RES) {
   for (const tok of pathParts(tokens)) {
     if (tok.startsWith("-") || isSafePath(tok)) continue;
-    const p = expand(tok, home);
-    if (res.some((r) => r.test(p))) return tok;
+    if (secretMatch(expand(tok, home), res)) return tok;
   }
   return null;
 }
@@ -108,6 +147,45 @@ function ambiguousPathIn(tokens) {
     if (AMBIGUOUS_SECRET_TOKENS.some((t) => low.includes(t))) return tok;
   }
   return null;
+}
+// Programs whose stdout never carries a file operand's bytes: metadata, file mutation, sourcing, and echoing
+// their arguments. Every other program is treated as able to print its operands (the secret-read tier).
+const NON_CONTENT_PROGS = new Set(["ls", "stat", "file", "test", "[", "[[", "basename", "dirname",
+  "realpath", "readlink", "wc", "du", "touch", "rm", "rmdir", "unlink", "mv", "cp", "ln", "chmod", "chown",
+  "chgrp", "mkdir", "install", "shred", "truncate", "cd", "pushd", "popd", "echo", "printf", "true", "false",
+  "which", "type", "command", ".", "source"]);
+// Credential consumers take a key or config path as input and print only their own status output.
+// kubectl stays out: `--from-env-file ... -o yaml` prints the operand back.
+const CREDENTIAL_CONSUMER_PROGS = new Set(["scp", "ssh-add", "ssh-keygen"]);
+const SSH_VALUE_OPTS = new Set(["-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]);
+// ssh's local option values (-i key, -o/-F config, -p port) are read by the client, never printed. Only the
+// remote command after the host is an output operand, because the remote side can print any path it names.
+function sshRemoteOperands(args) {
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) i += SSH_VALUE_OPTS.has(args[i]) ? 2 : 1;
+  return args.slice(i + 1); // args[i] is the host
+}
+const GIT_NON_CONTENT_SUBS = new Set(["add", "rm", "mv", "restore", "checkout", "reset", "update-index",
+  "ls-files", "status", "check-ignore", "clean", "commit", "switch"]);
+const GIT_VALUE_GLOBALS = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+function gitSubIndex(args) {
+  for (let i = 0; i < args.length; i++) {
+    if (GIT_VALUE_GLOBALS.has(args[i])) { i++; continue; }
+    if (!args[i].startsWith("-")) return i;
+  }
+  return -1;
+}
+/** The operand tokens `prog` could print the bytes of, or null when it cannot print an operand's content. */
+function outputOperands(prog, args) {
+  if (prog === "ssh") return sshRemoteOperands(args);
+  if (NON_CONTENT_PROGS.has(prog) || CREDENTIAL_CONSUMER_PROGS.has(prog)) return null;
+  if (prog === "git") {
+    const i = gitSubIndex(args);
+    if (i < 0 || GIT_NON_CONTENT_SUBS.has(args[i])) return null;
+    // `<rev>:<path>` refspecs (`HEAD:.env`, `:.env`) name a path on their right-hand side.
+    return args.slice(i + 1).flatMap((a) => (a.includes(":") ? [a, a.slice(a.indexOf(":") + 1)] : [a]));
+  }
+  return args;
 }
 function quietGrep(args) {
   for (const a of args) {
@@ -205,16 +283,25 @@ function ruleSecret(ctx) {
   if (!SHELL_TOOLS.has(tool) || !ctx.command) return null;
   let ambiguous = null;
   for (const seg of [...ctx.expandedSegments, ...substitutedSegments(ctx.command)]) {
+    // resolveCommand swaps a `find` segment for its -exec argv (`cat {}`), dropping the -name/path operands.
+    // find prints names only, but `-exec cat {}` and `find ... | xargs cat` hand the matched files to a content
+    // program, so find's own operands are checked on the bare segment.
+    const [bareProg, bareArgs] = programOf(seg);
+    if (bareProg === "find") {
+      const hit = secretPathIn(bareArgs, home);
+      if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`find\` on a secret store (${hit}) would list it or hand it to a reader`, suggestion: R1_SUGGESTION };
+    }
     const [prog, args] = resolveCommand(seg);
     if (prog === null) continue;
+    if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
+    // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)
+    // or `-out -` (openssl's own convention for "write to stdout", not a file literally named "-") both
+    // still print to the transcript.
+    if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1] && args[i + 1] !== "-")) continue;
+    const operands = outputOperands(prog, args);
+    const hit = operands && secretPathIn(operands, home);
+    if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${hit}) would print its contents`, suggestion: R1_SUGGESTION };
     if (READERS.has(prog)) {
-      if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
-      // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)
-      // or `-out -` (openssl's own convention for "write to stdout", not a file literally named "-") both
-      // still print to the transcript.
-      if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1] && args[i + 1] !== "-")) continue;
-      const hit = secretPathIn(args, home);
-      if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${hit}) would print its contents`, suggestion: R1_SUGGESTION };
       const amb = ambiguousPathIn(args);
       if (amb && !ambiguous) ambiguous = { rule: "R1-secret-exposure", severity: "ambiguous", jev: "secret", reason: `\`${prog}\` on a path that may hold secrets (${amb})`, suggestion: R1_SUGGESTION, target: amb };
     }
@@ -403,7 +490,7 @@ function ruleSecretExfil(ctx) {
       const positionals = args.filter((a) => !a.startsWith("-"));
       const dest = positionals.at(-1);
       if (dest && isRemoteTarget(dest)) {
-        const hit = secretPathIn(positionals.slice(0, -1), home, SECRET_EXFIL_RES);
+        const hit = secretPathIn(positionals.slice(0, -1), home);
         if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`${prog}\` would copy a secret store (${hit}) to the remote host \`${dest}\``, suggestion: R1_EXFIL_SUGGESTION };
       }
     }
@@ -421,7 +508,7 @@ function ruleSecretExfil(ctx) {
       if (prog === "socat") {
         const files = args.filter((a) => /^(FILE|OPEN):/i.test(a)).map((a) => a.replace(/^(FILE|OPEN):/i, "").split(",")[0]);
         const netAddr = args.some((a) => /^(TCP|UDP|SSL|OPENSSL|SOCKS)\d*:/i.test(a));
-        const hit = netAddr && files.length ? secretPathIn(files, home, SECRET_EXFIL_RES) : null;
+        const hit = netAddr && files.length ? secretPathIn(files, home) : null;
         if (hit) return { rule: "R1-secret-exfiltration", severity: "block", reason: `\`socat\` would relay a secret store (${hit}) to a network address`, suggestion: R1_EXFIL_SUGGESTION };
       }
   }
@@ -436,7 +523,7 @@ function ruleSecretExfil(ctx) {
         const srcArgs = p0 === "dd" ? a0.filter((a) => a.startsWith("if=")).map((a) => a.slice(3))
           : READERS.has(p0) || archiveToStdout(p0, a0) ? a0 : null;
         if (!srcArgs) continue;
-        const hit = secretPathIn(srcArgs, home, SECRET_EXFIL_RES);
+        const hit = secretPathIn(srcArgs, home);
         if (!hit) continue;
         const [p1] = resolveCommand(pipeline[i + 1]); // xargs/parallel/find -exec resolve to the sink they invoke
         if (NETWORK_PIPE_SINKS.has(p1)) {
