@@ -126,12 +126,21 @@ function executesCheck(unit) {
 const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
 const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
 /**
- * An exit status that cannot be attributed to the check: a `||` fallback, a `;`/`&&`/newline chain (the recorded
- * status is the last command's, not the check's), or a pipe whose last stage sets the status without pipefail.
+ * Prefix elements (cd, pushd, popd, export, set, unset, source, env assignments) are transparent: the recorded
+ * status is the last command's, so `cd api && npm test` reports npm test's own status. Once a real command has
+ * appeared, a following `;`, `&&`, or `||` element, a subshell, command substitution, a background `&`, or a bare
+ * `|` without pipefail masks the status.
  */
+const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
+const LIST_SPLIT = /;|&&|\|\||\n/;
+const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
 function exitIsMasked(command) {
-  if (/\|\||;|&&|\n/.test(command)) return true;
-  return /\|/.test(command) && !/\bpipefail\b/.test(command);
+  if (UNATTRIBUTABLE.test(command)) return true;
+  if (/(?<!\|)\|(?!\|)/.test(command) && !/\bpipefail\b/.test(command)) return true;
+  const segments = command.split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
+  const first = segments.findIndex((s) => !PREFIX_SEGMENT.test(s));
+  if (first === -1) return true;
+  return first < segments.length - 1;
 }
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 function checkSummary(output) {
