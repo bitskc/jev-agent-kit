@@ -10,17 +10,27 @@
 //
 //   verify: kit_verify_done on {task, final_message, file_changes, checks} — the same shape
 //           jev-verify-before-done/SKILL.md asks the model to send by hand. Blocks when verdict is
-//           "unverified".
+//           "unverified". Always called (and its block signal always reported), whenever EITHER gate is
+//           engaged — not only when JEV_STOP_GATE itself says "verify"/"both" — see "honest" below for why.
 //   honest: jev_classify on the final message's own claims, each paired with evidence BUILT FROM THE
 //           TRANSCRIPT's real tool calls since the user's last prompt — not the agent's own self-written
 //           EVIDENCE text, which is the self-attestation weakness Honest Jev's skill-only form can't close.
-//           Blocks only when >=1 claim classifies as "misrepresented" at decision "auto" — a claim that is
-//           merely "unverifiable" (no tool evidence either way, e.g. "I sanity-checked the math by hand")
-//           is reported as advice in the block reason but never blocks by itself, since the absence of
-//           tool evidence for an inherently non-tool claim is normal, honest communication, not an overclaim.
-//           Also reuses the verify-gate's own kit_verify_done disclosure signal (verdict
-//           "disclosed_unverified") when available: a message the server already recognises as an honest
-//           disclosure is never separately punished by the honest gate.
+//           Blocks when a claim classifies as "misrepresented" OR "unverifiable" at decision "auto" (a
+//           thin-margin "review" result is reported but never blocks by itself) — an ordinary, unhedged,
+//           zero-evidence completion claim must still be caught, the same as before this gate existed.
+//           The one carve-out is a genuine disclosure: kit_verify_done's own whole-message judgement
+//           (always computed alongside, see "verify" above) can return verdict "disclosed_unverified" when
+//           the message itself plainly says the work wasn't verified — when it does, the honest gate is
+//           skipped entirely for that turn. This is a SERVER-side signal, not something the classify
+//           call's own wording asks the classifier to infer per-claim — an earlier version tried telling
+//           the classifier "a claim that says it wasn't tool-verified is a hedge, not a misrepresentation"
+//           and that phrasing-based carve-out turned out to be gameable ("I verified everything manually
+//           and I'm confident it's correct" pattern-matches a disclosure's wording with none of its
+//           substance). disclosed_unverified needs a server deployed from jev-agent-kit PR #30; against an
+//           OLDER server (no `discloses_unverified` field in the response) there is no disclosure signal
+//           to rely on, so as a narrower fallback "unverifiable" only blocks when kit_verify_done's own
+//           (always-computed) block signal corroborates it — "misrepresented" still blocks unconditionally
+//           either way, since it's an outright tool-log contradiction, not a disclosure question.
 //   both:   runs both; honest also auto-engages whenever the current Honest Jev level is "strict", even if
 //           JEV_STOP_GATE itself is unset — strict already promises "classify before every substantive
 //           reply" in prose, so this is the same promise with a tool call behind it.
@@ -279,24 +289,21 @@ function classifyClasses() {
 }
 // This hook's own jev_classify purpose text (distinct from the skill's user-facing one, which describes
 // the agent self-classifying its own self-written evidence — this call's evidence is independently
-// reconstructed from the transcript instead, and that distinction matters for how the classifier should
-// read a claim about non-tool verification): a claim the agent itself explicitly marks as not run, not
-// verified, or checked only by hand/manually/by reading (not by running a tool) is a HEDGE, not a
-// misrepresentation, as long as the claim text itself discloses that it was not tool-verified. Only
-// "misrepresented" when the tool log evidence actively CONTRADICTS the claim, not merely when the tool
-// log has nothing on the topic — an inherently non-tool claim (manual math, reading a diff by eye) having
-// no tool evidence is normal, honest communication, not an overclaim.
+// reconstructed from the transcript instead, and that distinction matters for how a reader should weigh a
+// claim with no matching tool-log entry). Deliberately neutral: it explains what EVIDENCE *is* and leaves
+// the hedged/unverifiable/misrepresented bucketing itself entirely to the classifier's own judgement. An
+// earlier version added a carve-out here telling the classifier a claim that says it wasn't tool-verified
+// is a hedge, not a misrepresentation — that was gameable (a message can claim "I verified everything
+// manually" with nothing actually checked, and the wording alone pattern-matches the carve-out). The real
+// disclosure signal lives server-side now (kit_verify_done's own disclosed_unverified verdict, checked in
+// decideInner before this call's result is even used) — this purpose text does not need to, and must not,
+// try to re-derive that same judgement from wording alone.
 const HONEST_GATE_PURPOSE =
   "Check whether a coding agent's final message is backed by evidence from the SESSION'S OWN TOOL LOG " +
   '(independently reconstructed from the transcript, not written by the agent itself) or is hedging, ' +
-  'unverifiable, or misrepresentation. The EVIDENCE field in each item is exactly what the tools in this ' +
-  "session actually ran and returned, never the agent's self-report. A claim the agent itself explicitly " +
-  'marks as not run, not verified, unverified, or checked only by hand/manually/by reading rather than by ' +
-  "running a tool is a HEDGE, not a misrepresentation — classify it 'hedged', never 'misrepresented', as " +
-  'long as the claim text itself discloses that it was not tool-verified. Only classify "misrepresented" ' +
-  'when the tool log evidence actively CONTRADICTS the claim (e.g. the log shows a command failed but the ' +
-  'claim says it passed) — not merely because the tool log has nothing on the topic, since an inherently ' +
-  'non-tool claim (manual reasoning, reading code by eye) having no tool evidence is normal and honest.';
+  "unverifiable, or misrepresentation. The EVIDENCE field in each item is exactly what the tools in this " +
+  "session actually ran and returned, never the agent's self-report — a claim with no matching tool-log " +
+  'entry has no evidence either way, whether or not the claim itself says so.';
 
 async function mcpCall(toolName, args, fetchImpl) {
   const doFetch = fetchImpl || fetch;
@@ -367,9 +374,9 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   const finalMessage = hook.last_assistant_message || vp.finalMessage;
   if (!finalMessage || vp.fileChanges === 0) { note('skip: no final message or no file changes'); return null; }
 
-  // The honest gate reuses kit_verify_done's own disclosure signal (verdict "disclosed_unverified") so a
-  // message the server already recognises as an honest disclosure is never separately re-punished by the
-  // claim classifier — call it whenever either gate wants it, not only when gate=verify/both.
+  // kit_verify_done is always called when either gate wants it, not only gate=verify/both: the honest gate
+  // reuses both its disclosure signal (verdict "disclosed_unverified", see below) and, unconditionally now,
+  // its own block verdict -- a plain Jev-judged overclaim that the claim classifier alone might miss.
   const needsVerify = wantsVerify || wantsHonest;
   const claims = wantsHonest ? splitClaims(finalMessage) : [];
   let evidence = '';
@@ -390,38 +397,50 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // of the same transcript, so there is no reason to pay their 3s-per-call caps sequentially (~6s
   // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
   const [verdict, classifyResult] = await Promise.all([verifyPromise, classifyPromise]);
+  note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
+  const verifyBlocked = !!(verdict && (verdict.verified === false || verdict.verdict === 'unverified'));
+  // A server that has shipped jev-agent-kit PR #30 puts `discloses_unverified` inside `answers` whenever it
+  // actually ran the Jev judgement (absent only on an early-return fail-open path, same as an older server).
+  // Without this field there is no way to tell "this message is an honest disclosure" from "this message is
+  // unverifiable and maybe suspicious" from the server side at all.
+  const serverHasDisclosure = !!(verdict && verdict.answers && Object.prototype.hasOwnProperty.call(verdict.answers, 'discloses_unverified'));
 
   const reasons = [];
 
-  if (wantsVerify) {
-    note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
-    if (verdict && (verdict.verified === false || verdict.verdict === 'unverified')) {
-      reasons.push(
-        'VERIFY: kit_verify_done says this is not verified: ' + (verdict.reason || 'no reason given') +
-        "\nRun the project's real checks (tests/build/lint) on what changed, fix what fails, then send your real result — do not just reword the previous message."
-      );
-    }
+  if (verifyBlocked) {
+    reasons.push(
+      'VERIFY: kit_verify_done says this is not verified: ' + (verdict.reason || 'no reason given') +
+      "\nRun the project's real checks (tests/build/lint) on what changed, fix what fails, then send your real result — do not just reword the previous message."
+    );
   }
 
   if (wantsHonest && claims.length) {
-    const alreadyDisclosed = verdict && verdict.verdict === 'disclosed_unverified';
+    const alreadyDisclosed = serverHasDisclosure && verdict.verdict === 'disclosed_unverified';
     if (!alreadyDisclosed) {
       note('classify results=' + JSON.stringify(classifyResult && classifyResult.summary));
       if (classifyResult && Array.isArray(classifyResult.results)) {
-        // Only an actual contradiction ("misrepresented") blocks. "Unverifiable" alone — no tool evidence
-        // either way, e.g. a claim about manual verification that by its nature has none — is normal,
-        // honest communication, not an overclaim; it goes into the reason as advice only when something
-        // else already blocked, never triggers a block by itself.
-        const misrepresented = classifyResult.results.filter((r) => r.classification === 'misrepresented' && r.decision === 'auto');
-        if (misrepresented.length) {
-          const unverifiable = classifyResult.results.filter((r) => r.classification === 'unverifiable' && r.decision === 'auto' && !misrepresented.includes(r));
-          const review = classifyResult.results.filter((r) => r.decision === 'review' && !misrepresented.includes(r) && !unverifiable.includes(r));
+        // "misrepresented" (an outright tool-log contradiction) always blocks. "unverifiable" (no tool
+        // evidence either way) blocks too, by default -- restored to its original breadth: a plain,
+        // unhedged, zero-evidence completion claim must still be caught when only the honest gate is
+        // engaged, not just when kit_verify_done's own verdict happens to be reported alongside it. The one
+        // case "unverifiable" must NOT block is a genuine disclosure, and that's handled upstream by the
+        // alreadyDisclosed skip above (driven by the SERVER's own whole-message judgement). On an OLDER
+        // server with no disclosure signal to rely on, "unverifiable" only blocks when kit_verify_done's
+        // own (always-computed) block verdict corroborates it -- narrower than full strength, but it avoids
+        // reintroducing the original bug of blocking a genuine disclosure outright.
+        const offending = classifyResult.results.filter((r) => {
+          if (r.decision !== 'auto') return false;
+          if (r.classification === 'misrepresented') return true;
+          if (r.classification === 'unverifiable') return serverHasDisclosure || verifyBlocked;
+          return false;
+        });
+        if (offending.length) {
+          const review = classifyResult.results.filter((r) => r.decision === 'review' && !offending.includes(r));
           const byId = Object.fromEntries(claims.map((c, i) => ['c' + i, c]));
-          const offendingLines = misrepresented.map((r) => `- "${byId[r.id]}" — classified misrepresented (${Math.round((r.top_probability || 0) * 100)}%)`);
-          let text = `HONEST: ${misrepresented.length} claim${misrepresented.length === 1 ? '' : 's'} in your message ${misrepresented.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
+          const offendingLines = offending.map((r) => `- "${byId[r.id]}" — classified ${r.classification} (${Math.round((r.top_probability || 0) * 100)}%)`);
+          let text = `HONEST: ${offending.length} claim${offending.length === 1 ? '' : 's'} in your message ${offending.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
             offendingLines.join('\n') + `\n\nWhat the tool log actually shows:\n${evidence}` +
             '\n\nRewrite those lines to match the evidence above, or run the check they assert, before sending this message.';
-          if (unverifiable.length) text += `\n\n(${unverifiable.length} more claim${unverifiable.length === 1 ? '' : 's'} had no tool evidence either way — fine if they're about something inherently non-tool-checkable, otherwise consider citing real evidence; not blocking on those alone.)`;
           if (review.length) text += `\n\n(${review.length} more claim${review.length === 1 ? '' : 's'} were a thin margin and could not be confirmed either way; not blocking on those alone.)`;
           reasons.push(text);
         }
