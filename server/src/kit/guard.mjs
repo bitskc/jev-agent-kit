@@ -152,9 +152,10 @@ function ruleSecret(ctx) {
     const [prog, args] = readerBehind(prog0, args0);
     if (READERS.has(prog)) {
       if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
-      // openssl writes to -out/-outform's file when given one, not to stdout; only a bare invocation
-      // (no -out) actually prints to the transcript.
-      if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1])) continue;
+      // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)
+      // or `-out -` (openssl's own convention for "write to stdout", not a file literally named "-") both
+      // still print to the transcript.
+      if (prog === "openssl" && args.some((a, i) => a === "-out" && args[i + 1] && args[i + 1] !== "-")) continue;
       const hit = secretPathIn(args, home);
       if (hit) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${hit}) would print its contents`, suggestion: R1_SUGGESTION };
       const amb = ambiguousPathIn(args);
@@ -221,11 +222,35 @@ const isRemoteTarget = (tok) =>
   REMOTE_COPY_URI_RE.test(tok) || REMOTE_COPY_IPV6_RE.test(tok) ||
   /^[^/@\s]+@[^/\s]+:/.test(tok) || /^[A-Za-z0-9.\-]{2,}:(?!\/\/|\\|\d+$)/.test(tok);
 
+// Global value-taking flags per CLI, so a flag's value (e.g. "prod" in `--profile prod`) is never mistaken
+// for the next positional (the subcommand/verb/path) and desyncs the index-based lookup below. Scoped to
+// GLOBAL flags that can appear before the subcommand; a subcommand-specific flag appearing after the
+// subcommand/verb tokens (e.g. az's `--file`) doesn't need to be in this set, since by then the tokens
+// this function actually reads (positionals[0..2]) have already been consumed in order.
+const CLOUD_VALUE_OPTS = {
+  aws: new Set(["--profile", "--region", "--endpoint-url", "--output", "--query", "--color", "--cli-read-timeout", "--cli-connect-timeout"]),
+  gsutil: new Set(["-o", "-h", "-u", "--impersonate-service-account"]),
+  rclone: new Set(["--config", "--log-level", "--log-file", "--transfers", "--checkers", "--bwlimit"]),
+  az: new Set(["--output", "-o", "--query", "--subscription"]),
+};
+/** All non-flag positional tokens of `args`, skipping each flag in `valueOpts` AND its following value
+ *  (same walk shell.mjs's firstPositional does to find the first one; this collects every one). */
+function cleanPositionals(args, valueOpts) {
+  const out = [];
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i];
+    if (a.startsWith("-")) { i += valueOpts.has(a) ? 2 : 1; continue; }
+    out.push(a);
+    i++;
+  }
+  return out;
+}
 /** The local source path of a cloud-storage upload command (`aws s3 cp`/`mv`, `gsutil cp`/`mv`, `rclone
  *  copy`/`copyto`/`move`/`moveto`/`sync`, `az storage blob upload --file`), or null. Destination is assumed
  *  remote (these commands' whole purpose), unlike the generic scp/rsync case which checks it explicitly. */
 function cloudCopySource(prog, args) {
-  const positionals = args.filter((a) => !a.startsWith("-"));
+  const positionals = cleanPositionals(args, CLOUD_VALUE_OPTS[prog] || new Set());
   if (prog === "aws" && positionals[0] === "s3" && ["cp", "mv", "sync"].includes(positionals[1])) return positionals[2];
   if (prog === "gsutil" && ["cp", "mv", "rsync"].includes(positionals[0])) return positionals[1];
   if (prog === "rclone" && ["copy", "copyto", "move", "moveto", "sync"].includes(positionals[0])) return positionals[1];
@@ -352,7 +377,7 @@ const SQL_DROP_RE = /\bDROP\s+(DATABASE|SCHEMA|TABLE)\b/i;
 const DD_HARMLESS = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty", "/dev/fd/"];
 // Only a real block-device node is catastrophic to overwrite; /dev/shm, /dev/mqueue, /dev/pts and similar
 // are RAM-backed or non-storage pseudo-filesystems under /dev, not devices, and are common scratch targets.
-const DD_BLOCK_DEVICE_RE = /^\/dev\/(?:sd|hd|xvd|vd|nvme|loop|disk|mapper|rdisk)/;
+const DD_BLOCK_DEVICE_RE = /^\/dev\/(?:sd|hd|xvd|vd|nvme|loop|disk|mapper|rdisk|dm|md|zvol|nbd|mmcblk)/;
 export const R7_IRREVERSIBLE_SUGGESTION =
   "A raw-device write or a recursive permission change across the whole filesystem (or home directory) is " +
   "never a single task step. Name the exact target, or ask the human.";
@@ -591,15 +616,22 @@ function isRootOrHomeLiteral(a, home) {
   if (p.endsWith("/*")) p = p.slice(0, -2);
   return p.replace(/\/+$/, "") === "~";
 }
-/** Does ANY of `segments` assign `name` a literal, non-empty, non-root/home value this same command —
- *  as its own `VAR=value`/`export VAR=value` segment, or as a leading prefix assignment on a segment that
- *  also runs the command using it (`VAR=/tmp/x rm -rf $VAR`)? The value sits right there in the text being
- *  judged, unlike an inherited/environment variable whose value this guard can never see. An assignment
- *  whose own value is itself a variable reference (`VAR=$OTHER`) or is itself root/home-shaped does not
- *  count: the opacity (or the danger) just moved one hop, it didn't go away.
+/** Does the LAST assignment to `name` across `segments` (in document order) give it a literal, non-empty,
+ *  non-root/home value this same command — as its own `VAR=value`/`export VAR=value` segment, or as a
+ *  leading prefix assignment on a segment that also runs the command using it (`VAR=/tmp/x rm -rf $VAR`)?
+ *  The LAST assignment, not the first: a decoy-then-real reassignment (`VAR=/tmp/x; VAR=/; rm -rf $VAR`)
+ *  must be judged by what `$VAR` actually is at `rm` time, same as real bash evaluates it. A later
+ *  assignment whose own value is itself a variable reference (`VAR=$OTHER`), is itself root/home-shaped,
+ *  or is empty overrides an earlier safe one back to unsafe — the opacity (or the danger) just moved one
+ *  hop and the latest hop is what counts. `segments` must be the command's genuine top-level segments
+ *  only (never ones pulled from inside a `$(...)`/backtick substitution or a loop body): an assignment
+ *  this function can't actually prove ran, in order, at the top level is unknown, not safe, and an
+ *  unrecognised segment shape (anything this scan doesn't parse as a leading assignment, which already
+ *  covers a loop/if/subshell body) simply never overrides the running verdict either way.
  */
 const ASSIGN_SKIP_PREFIX = new Set(["export", "declare", "typeset", "local", "readonly"]);
 function assignedSafeValue(name, segments, home) {
+  let lastSafe = false;
   for (const seg of segments) {
     const toks = words(seg);
     let i = 0;
@@ -608,11 +640,11 @@ function assignedSafeValue(name, segments, home) {
       const eq = toks[i].indexOf("=");
       if (toks[i].slice(0, eq) === name) {
         const v = toks[i].slice(eq + 1);
-        if (v && !v.includes("$") && !isRootOrHomeLiteral(v, home)) return true;
+        lastSafe = Boolean(v) && !v.includes("$") && !isRootOrHomeLiteral(v, home);
       }
     }
   }
-  return false;
+  return lastSafe;
 }
 function rdRootOrHome(aIn, home, segments) {
   let a = aIn;
@@ -652,7 +684,11 @@ function ruleRootDelete(ctx) {
     }
   } catch { /* ignore */ }
   for (const seg of segs) {
-    const hit = rdHit(seg, ctx.home, 0, segs);
+    // Assignment safety is only ever judged against the command's genuine top-level segments
+    // (ctx.segments), never a segment pulled from inside a $(...)/backtick substitution: an assignment
+    // that only ran inside a subshell never reaches the outer shell's $VAR, so treating it as proof of
+    // safety would be wrong in the unsafe direction.
+    const hit = rdHit(seg, ctx.home, 0, ctx.segments);
     if (hit) return { rule: "R7-root-delete", severity: "block", strict: true, reason: `\`rm -r ${hit}\` would delete the whole filesystem or home directory`, suggestion: R7_ROOT_SUGGESTION };
   }
   return null;
