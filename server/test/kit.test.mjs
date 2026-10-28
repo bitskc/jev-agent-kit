@@ -439,6 +439,35 @@ test("decide(): discloses_unverified gates an overclaim into disclosedUnverified
   v = decide({ ...base, discloses_unverified: { noul: 0.1 } }, evidence);
   assert.equal(v.block, true); assert.equal(v.disclosedUnverified, false);
 });
+test("decide(): a mixed message (claims verified AND discloses a gap) stays blocked -- disclosure never excuses a false verification claim", () => {
+  const evidence = { mutations: 1, checks: [], checksBeforeMutation: 0 };
+  const base = { claims_done: { noul: 0.9 }, verification_applies: { noul: 0.9 },
+    outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } };
+  // "Done! All tests pass. Note: I didn't run lint." -- claims_verified is high (the tests-pass claim) even
+  // though discloses_unverified also reads high (it admits the lint gap); the claimsVerified gate must win.
+  const v = decide({ ...base, claims_verified: { noul: 0.85 }, discloses_unverified: { noul: 0.75 } }, evidence);
+  assert.equal(v.block, true); assert.equal(v.disclosedUnverified, false); assert.equal(v.falseClaim, true);
+});
+test("verify_done: a mixed 'tests pass, but I didn't run lint' message still blocks end to end", async () => {
+  const j = spy({ claims_done: { type: "noul", noul: 0.92 }, claims_verified: { type: "noul", noul: 0.88 },
+    verification_applies: { type: "noul", noul: 0.9 }, discloses_unverified: { type: "noul", noul: 0.7 },
+    outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });
+  const r = await verifyDone({ task: "Fix the login redirect bug", final_message: "Done! All tests pass. Note: I didn't run lint.", file_changes: 1, checks: [] }, j);
+  assert.equal(r.verdict, "unverified"); assert.equal(r.action, "block"); assert.equal(r.false_claim, true);
+});
+test("verify_done: honest 'tests fail' with a real failing check still allows (disclosed, not a false claim)", async () => {
+  const j = spy({ claims_done: { type: "noul", noul: 0.85 }, claims_verified: { type: "noul", noul: 0.03 },
+    verification_applies: { type: "noul", noul: 0.9 }, discloses_unverified: { type: "noul", noul: 0.9 },
+    outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });
+  const r = await verifyDone({
+    task: "Fix the auth redirect",
+    final_message: "Implemented the redirect fix. Tests fail: 2 failing in auth.spec — looks like an existing flaky mock, still investigating.",
+    file_changes: 1,
+    checks: [{ command: "npx jest auth.spec.js", output: "Tests:       2 failed, 6 passed, 8 total", exit_code: 1 }],
+  }, j);
+  assert.equal(r.verdict, "disclosed_unverified"); assert.equal(r.action, "allow"); assert.equal(r.verified, null);
+  assert.equal(r.false_claim, false);
+});
 
 test("upstream resolution: gateway wins, then typesafe, then none; overrides", () => {
   assert.equal(resolveUpstream({}), null);
