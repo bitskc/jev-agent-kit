@@ -23,7 +23,7 @@ Tool: `kit_size_dispatch` on the `jev` MCP server (Claude Code: `mcp__jev__kit_s
 
 ## Act on the result
 
-Fields: `task_kind` (lookup, mechanical_edit, scoped_implementation, judgement, hard_problem, unclear), `recommended_model`, `mismatch`, `verdict` (`over_tiered` / `under_tiered` / `unknown` / ok), `action` (`block` / `warn` / `allow`), `reason`. `block` = the tool is confident enough to stop you (e.g. fable-tier dispatch with no justification); `warn` = borderline, proceed but note it.
+Fields: `task_kind` (lookup, mechanical_edit, scoped_implementation, judgement, hard_problem, unclear), `recommended_model`, `mismatch`, `verdict` (`over_tiered` / `under_tiered` / `unclear` / `unknown` / ok), `action` (`block` / `warn` / `allow`), `reason`. `block` = the tool is confident enough to stop you (e.g. fable-tier dispatch with no justification); `warn` = borderline, proceed but note it. `unclear` = the brief itself was too vague to size (never acts on it).
 
 - `mismatch: false`: dispatch as planned. `verdict:"unknown"` means Jev was unavailable, gave an unusable answer, or you passed a custom ladder — it does NOT mean the tier is fine, and it is different from an unrecognised model (which is silently treated as director-tier).
 - `over_tiered`: re-dispatch with `recommended_model` (cheaper). Only keep the bigger model if you can state a concrete reason the classifier could not see.

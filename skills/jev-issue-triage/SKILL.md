@@ -9,7 +9,12 @@ A backlog of 1-2K issues can't be read by an agent one at a time economically �
 
 **This is a ranking pass, not a closer.** Jev sees the issue text, not your code — so its `already_done`/`duplicate` buckets are *candidates* that an agent must verify with evidence before anything is closed. Closing on classification alone is how real bugs get silently deleted.
 
-## Step 1: pull the queue
+```bash
+# --limit must cover your backlog — gh paginates internally, so just ask for more than you have.
+# (1-2K issues: --limit 2500. A forgotten default silently drops the tail.)
+gh issue list -R <owner>/<repo> --state open --limit 2500 \
+  --json number,title,labels,createdAt,updatedAt,author --jq '.[] | {n:.number, title, labels:[.labels[].name], age:(.createdAt), touched:(.updatedAt)}'
+```
 
 ```bash
 # Paginate — 1-2K issues won't fit one call. Keep number/title/labels/state for later writes.

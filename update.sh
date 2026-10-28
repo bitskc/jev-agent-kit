@@ -18,7 +18,7 @@ curl -fsSL "https://github.com/$repo/archive/refs/heads/$ref.tar.gz" -o "$tmp/ki
 tar -xzf "$tmp/kit.tar.gz" -C "$tmp"
 kit="$(find "$tmp" -maxdepth 1 -type d -name 'jev-agent-kit-*' | head -1)"
 [ -n "$kit" ] || { echo "unpacked tree not found" >&2; exit 1; }
-"$kit/install.sh" "${args[@]}"
+"$kit/install.sh" ${args[@]+"${args[@]}"}
 
 if [ "$timer" = 1 ]; then
   unit=jev-skill-sync; d="$HOME/.config/systemd/user"; mkdir -p "$d"
@@ -27,7 +27,7 @@ if [ "$timer" = 1 ]; then
 Description=Sync jev-agent-kit skills from GitHub
 [Service]
 Type=oneshot
-ExecStart=$HOME/.local/bin/jev-update $(printf '%q ' "${args[@]}")
+ExecStart=$HOME/.local/bin/jev-update$(if [ ${#args[@]} -gt 0 ]; then printf ' %q' "${args[@]}"; fi)
 EOF
   cat > "$d/$unit.timer" <<EOF
 [Unit]
