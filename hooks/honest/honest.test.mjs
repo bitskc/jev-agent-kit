@@ -57,46 +57,62 @@ test("rules: a disabled entry at a later layer removes an earlier layer's same-i
 
 test("rules: malformed entries and an unparsable file are skipped, never crash", () => {
   const xdg = freshXdg();
-  fs.mkdirSync(path.join(xdg, "jev"), { recursive: true });
-  fs.writeFileSync(path.join(xdg, "jev", "rules.json"), JSON.stringify([
-    { id: "bad id with spaces", when: "x", ask: "y" },
-    { id: "no-ask", when: "x" },
-    { when: "x", ask: "y" },
-    { id: "good-one", when: "a real situation", ask: "a real question", evidence: "proof" },
-  ]));
-  const list = rt.rules();
-  assert.ok(list.some((r) => r.id === "good-one"));
-  assert.equal(list.length, 2); // the built-in default + good-one; every malformed entry skipped
-  fs.writeFileSync(path.join(xdg, "jev", "rules.json"), "not json at all");
-  assert.doesNotThrow(() => rt.rules());
-  assert.equal(rt.rules().length, 1); // falls back to just the built-in default
+  inRepo(freshRepo(), () => {
+    fs.mkdirSync(path.join(xdg, "jev"), { recursive: true });
+    fs.writeFileSync(path.join(xdg, "jev", "rules.json"), JSON.stringify([
+      { id: "bad id with spaces", when: "x", ask: "y" },
+      { id: "no-ask", when: "x" },
+      { when: "x", ask: "y" },
+      { id: "good-one", when: "a real situation", ask: "a real question", evidence: "proof" },
+    ]));
+    const list = rt.rules();
+    assert.ok(list.some((r) => r.id === "good-one"));
+    assert.equal(list.length, 2); // the built-in default + good-one; every malformed entry skipped
+    fs.writeFileSync(path.join(xdg, "jev", "rules.json"), "not json at all");
+    assert.doesNotThrow(() => rt.rules());
+    assert.equal(rt.rules().length, 1); // falls back to just the built-in default
+  });
   delete process.env.XDG_CONFIG_HOME;
 });
 
-test("parseRuleCommand: quoted, natural-language, list, remove, disable, and repo-scope forms", () => {
+test("parseRuleCommand: quoted, natural-language, list, remove, disable, and explicit repo-scope forms", () => {
   assert.deepEqual(rt.parseRuleCommand('honest-jev rule add "deploying to prod" -> "did migrations run?"'),
     { action: "add", when: "deploying to prod", ask: "did migrations run?", evidence: "", repo: false });
   assert.deepEqual(rt.parseRuleCommand('/honest-jev rule add "x" -> "y" evidence: "z"'),
     { action: "add", when: "x", ask: "y", evidence: "z", repo: false });
+  // a "repo" substring inside when/ask/evidence is not a scope marker: stays user-global
   assert.deepEqual(rt.parseRuleCommand("honest-jev rule add: when touching the repo ask is CI green evidence CI link"),
+    { action: "add", when: "touching the repo", ask: "is CI green", evidence: "CI link", repo: false });
+  // trailing --repo / (repo) on the whole command selects the repo layer
+  assert.deepEqual(rt.parseRuleCommand("honest-jev rule add: when touching the repo ask is CI green evidence CI link --repo"),
     { action: "add", when: "touching the repo", ask: "is CI green", evidence: "CI link", repo: true });
+  assert.deepEqual(rt.parseRuleCommand('honest-jev rule add "x" -> "y" (repo)'),
+    { action: "add", when: "x", ask: "y", evidence: "", repo: true });
+  // a leading "repo" token right after add/remove/disable also selects the repo layer
+  assert.deepEqual(rt.parseRuleCommand('honest-jev rule add repo "x" -> "y"'),
+    { action: "add", when: "x", ask: "y", evidence: "", repo: true });
   assert.deepEqual(rt.parseRuleCommand("honest-jev rule list"), { action: "list" });
   assert.deepEqual(rt.parseRuleCommand("honest-jev rule remove some-id"), { action: "remove", id: "some-id", repo: false });
+  assert.deepEqual(rt.parseRuleCommand("honest-jev rule remove repo some-id"), { action: "remove", id: "some-id", repo: true });
+  assert.deepEqual(rt.parseRuleCommand("honest-jev rule remove some-id --repo"), { action: "remove", id: "some-id", repo: true });
   assert.deepEqual(rt.parseRuleCommand("honest-jev rule disable some-id"), { action: "disable", id: "some-id", repo: false });
+  assert.deepEqual(rt.parseRuleCommand("honest-jev rule disable some-id (repo)"), { action: "disable", id: "some-id", repo: true });
   assert.equal(rt.parseRuleCommand("talk about honest-jev rule stuff"), null);
   assert.equal(rt.parseRuleCommand("just a normal prompt"), null);
 });
 
 test("hooks end to end: rule add via mode-tracker writes the file and emits the rule; rule remove masks it", () => {
   fresh(); const xdg = freshXdg();
-  const added = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: 'honest-jev rule add "shipping a release" -> "did CI run?" evidence: "CI link"' }));
-  assert.match(added, /^HONEST JEV RULE ADDED: \[shipping-a-release\]/);
-  const file = JSON.parse(fs.readFileSync(path.join(xdg, "jev", "rules.json"), "utf8"));
-  assert.equal(file.length, 1);
-  assert.equal(file[0].id, "shipping-a-release");
-  const removed = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "honest-jev rule remove shipping-a-release" }));
-  assert.equal(removed, "HONEST JEV RULE REMOVED: shipping-a-release");
-  assert.ok(!rt.rules().some((r) => r.id === "shipping-a-release"));
+  inRepo(freshRepo(), () => {
+    const added = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: 'honest-jev rule add "shipping a release" -> "did CI run?" evidence: "CI link"' }));
+    assert.match(added, /^HONEST JEV RULE ADDED: \[shipping-a-release\]/);
+    const file = JSON.parse(fs.readFileSync(path.join(xdg, "jev", "rules.json"), "utf8"));
+    assert.equal(file.length, 1);
+    assert.equal(file[0].id, "shipping-a-release");
+    const removed = run("jev-honest-mode-tracker.js", JSON.stringify({ prompt: "honest-jev rule remove shipping-a-release" }));
+    assert.equal(removed, "HONEST JEV RULE REMOVED: shipping-a-release");
+    assert.ok(!rt.rules().some((r) => r.id === "shipping-a-release"));
+  });
   delete process.env.XDG_CONFIG_HOME;
 });
 
@@ -124,11 +140,13 @@ test("filterSkillBody: only the active level's table row survives, everything el
 
 test("instructions: real SKILL.md is injected with exactly one level row", () => {
   fresh(); const xdg = fs.mkdtempSync(path.join(os.tmpdir(), "xdg-")); process.env.XDG_CONFIG_HOME = xdg;
-  for (const level of ["soft", "standard", "strict"]) {
-    const text = rt.instructions(level);
-    assert.ok(text.startsWith(`HONEST JEV ACTIVE — level: ${level}`));
-    assert.equal((text.match(/^\| \*\*/gm) || []).length, 1, level);
-  }
+  inRepo(freshRepo(), () => {
+    for (const level of ["soft", "standard", "strict"]) {
+      const text = rt.instructions(level);
+      assert.ok(text.startsWith(`HONEST JEV ACTIVE — level: ${level}`));
+      assert.equal((text.match(/^\| \*\*/gm) || []).length, 1, level);
+    }
+  });
   delete process.env.XDG_CONFIG_HOME;
 });
 

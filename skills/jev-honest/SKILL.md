@@ -71,7 +71,7 @@ User-authored standing checks, injected at every level except off as a `## Rules
 
 **Layers**, later wins on the same id: built-in examples shipped with the plugin → user global (`~/.config/jev/rules.json`) → repo (`.jev/rules.json` in the cwd, so a team can commit shared rules). A `{"id": "...", "disabled": true}` entry at a later layer removes an earlier layer's same-id rule.
 
-**Author on the fly**, no file editing: `honest-jev rule add "<when>" -> "<ask>" [evidence: "<evidence>"]`, or natural language: `honest-jev rule add: when <...> ask <...> evidence <...>`. Say "repo" anywhere in the command to write `.jev/rules.json` instead of the user-global file. `honest-jev rule list` shows what's active; `honest-jev rule remove <id>` / `honest-jev rule disable <id>` mask a rule (built-in or user-added) at the layer you're writing to.
+**Author on the fly**, no file editing: `honest-jev rule add "<when>" -> "<ask>" [evidence: "<evidence>"]`, or natural language: `honest-jev rule add: when <...> ask <...> evidence <...>`. Repo scope is explicit only — add a trailing `--repo` or `(repo)`, or lead with `repo` right after `add`/`remove`/`disable` (e.g. `honest-jev rule remove repo <id>`) — to write `.jev/rules.json` instead of the user-global file; a `when`/`ask` that merely mentions "the repo" stays user-global. `honest-jev rule list` shows what's active; `honest-jev rule remove <id>` / `honest-jev rule disable <id>` mask a rule (built-in or user-added) at the layer you're writing to.
 
 **When a rule fires**, answer it in the same message, verbatim shape: `<id>: YES — <evidence>` or `<id>: NO — <what is missing>; not presenting <outcome>`. Never substitute a guess or a self-check for the evidence a rule actually asks for.
 

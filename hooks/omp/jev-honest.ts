@@ -83,18 +83,33 @@ type RuleCmd =
   | { action: "list" }
   | { action: "remove" | "disable"; id: string; repo: boolean }
   | { action: "add"; when: string; ask: string; evidence: string; repo: boolean };
-// Parses the args already stripped of the leading "/honest-jev " — expects to start with "rule ".
+// Parses the args already stripped of the leading "/honest-jev " — expects to start with "rule ". Repo scope is
+// explicit only: a trailing " --repo" or " (repo)" on the whole command, or a leading "repo " / "repo: " right
+// after add/remove/disable — never a loose "repo" substring inside when/ask/evidence.
+const TRAILING_REPO = /^(.*?)\s+(?:--repo|\(repo\))\s*$/i;
+const LEADING_REPO = /^repo:?\s+(.*)$/i;
 function parseRuleArgs(a: string): RuleCmd | null {
   const m = a.match(/^rule\s+(.+)$/is);
   if (!m) return null;
-  const rest = m[1].trim();
+  let rest = m[1].trim();
+  let repo = false;
+  const trail = rest.match(TRAILING_REPO);
+  if (trail) { rest = trail[1].trim(); repo = true; }
   if (/^list\b/i.test(rest)) return { action: "list" };
   let mm: RegExpMatchArray | null;
-  if ((mm = rest.match(/^remove\s+([a-z0-9-]{2,48})\b/i))) return { action: "remove", id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
-  if ((mm = rest.match(/^disable\s+([a-z0-9-]{2,48})\b/i))) return { action: "disable", id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
+  if ((mm = rest.match(/^(remove|disable)\s+(.+)$/i))) {
+    const action = mm[1].toLowerCase();
+    let body = mm[2].trim();
+    const lead = body.match(LEADING_REPO);
+    if (lead) { body = lead[1].trim(); repo = true; }
+    const idm = body.match(/^([a-z0-9-]{2,48})\b/i);
+    if (!idm || (action !== "remove" && action !== "disable")) return null;
+    return { action, id: idm[1].toLowerCase(), repo };
+  }
   if (/^add\b/i.test(rest)) {
-    const body = rest.replace(/^add:?\s*/i, "");
-    const repo = /\brepo\b/i.test(body);
+    let body = rest.replace(/^add:?\s*/i, "");
+    const lead = body.match(LEADING_REPO);
+    if (lead) { body = lead[1].trim(); repo = true; }
     let m2 = body.match(/^"([^"]+)"\s*->\s*"([^"]+)"(?:\s*evidence:\s*"([^"]+)")?/i);
     if (m2) return { action: "add", when: m2[1].trim(), ask: m2[2].trim(), evidence: (m2[3] ?? "").trim(), repo };
     m2 = body.match(/^when\s+(.+?)\s+ask\s+(.+?)(?:\s+evidence\s+(.+))?$/i);

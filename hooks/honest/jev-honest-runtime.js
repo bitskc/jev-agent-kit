@@ -121,20 +121,34 @@ function slugify(text) {
 // "honest-jev rule add \"<when>\" -> \"<ask>\" [evidence: \"<evidence>\"]" (quoted form) or
 // "honest-jev rule add: when <when> ask <ask> [evidence <evidence>]" (natural-language form) ->
 // {action:'add', when, ask, evidence, repo} | {action:'list'} | {action:'remove'|'disable', id, repo} | null.
-// "repo" anywhere in the command text targets .jev/rules.json instead of the user-global file.
+// Repo scope is explicit only: a trailing " --repo" or " (repo)" on the whole command, or a leading "repo "
+// (or "repo: ") right after add/remove/disable — never a loose "repo" substring inside when/ask/evidence
+// (a rule about "pushing to the repo" must not silently target the repo layer).
 const RULE_CMD = /^[/@$]?(?:[a-z0-9-]+:)?honest-jev\s+rule\s+(.+)$/is;
+const TRAILING_REPO = /^(.*?)\s+(?:--repo|\(repo\))\s*$/i;
+const LEADING_REPO = /^repo:?\s+(.*)$/i;
 function parseRuleCommand(prompt) {
   const raw = String(prompt || '').trim();
   const m = raw.match(RULE_CMD);
   if (!m) return null;
-  const rest = m[1].trim();
+  let rest = m[1].trim();
+  let repo = false;
+  const trail = rest.match(TRAILING_REPO);
+  if (trail) { rest = trail[1].trim(); repo = true; }
   if (/^list\b/i.test(rest)) return { action: 'list' };
   let mm;
-  if ((mm = rest.match(/^remove\s+([a-z0-9-]{2,48})\b/i))) return { action: 'remove', id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
-  if ((mm = rest.match(/^disable\s+([a-z0-9-]{2,48})\b/i))) return { action: 'disable', id: mm[1].toLowerCase(), repo: /\brepo\b/i.test(rest) };
+  if ((mm = rest.match(/^(remove|disable)\s+(.+)$/i))) {
+    let body = mm[2].trim();
+    const lead = body.match(LEADING_REPO);
+    if (lead) { body = lead[1].trim(); repo = true; }
+    const idm = body.match(/^([a-z0-9-]{2,48})\b/i);
+    if (!idm) return null;
+    return { action: mm[1].toLowerCase(), id: idm[1].toLowerCase(), repo };
+  }
   if (/^add\b/i.test(rest)) {
-    const body = rest.replace(/^add:?\s*/i, '');
-    const repo = /\brepo\b/i.test(body);
+    let body = rest.replace(/^add:?\s*/i, '');
+    const lead = body.match(LEADING_REPO);
+    if (lead) { body = lead[1].trim(); repo = true; }
     let m2 = body.match(/^"([^"]+)"\s*->\s*"([^"]+)"(?:\s*evidence:\s*"([^"]+)")?/i);
     if (m2) return { action: 'add', when: m2[1].trim(), ask: m2[2].trim(), evidence: (m2[3] || '').trim(), repo };
     m2 = body.match(/^when\s+(.+?)\s+ask\s+(.+?)(?:\s+evidence\s+(.+))?$/i);
