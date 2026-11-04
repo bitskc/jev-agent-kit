@@ -125,6 +125,27 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["npm test 2>&1 | head -5", "  12 passing (3s)", 0],
     ["npm test | head", "  12 passing (3s)", 0],
     ["npm test |& tail -20", "  12 passing (3s)", 0],
+    // round 21 (N2 executor words only as a program with a quoted body; P3-f escaped `$'`)
+    ["docker exec app 'npm test || true'", "  12 passing (3s)", 0],
+    ["ssh ci 'cd repo && npm test'", "  12 passing (3s)", 0],
+    ['eval "npm test"', "  12 passing (3s)", 0],
+    ["script -c 'npm test'", "  12 passing (3s)", 0],
+    ["su -c 'npm test; true'", "  12 passing (3s)", 0],
+    ["sudo -E docker exec app 'npm test || true'", "  12 passing (3s)", 0],
+    ["podman exec app 'npm test || true'", "  12 passing (3s)", 0],
+    ["kubectl exec pod -- sh -c 'npm test || true'", "  12 passing (3s)", 0],
+    ["docker compose run --rm app npm test", "  12 passing (3s)", 0],
+    ["docker run --rm -v $PWD:/app img npm test", "  12 passing (3s)", 0],
+    ["kubectl exec pod -- npm test", "  12 passing (3s)", 0],
+    ["ssh ci npm test", "  12 passing (3s)", 0],
+    ["cd docker && npm test", "  12 passing (3s)", 0],
+    ["cd watch; npm test", "  12 passing (3s)", 0],
+    ["make -C docker test", "  12 passing (3s)", 0],
+    ["pytest -k docker", "  12 passing (3s)", 0],
+    ["go test ./watch ./...", "  12 passing (3s)", 0],
+    ["npx jest watch", "  12 passing (3s)", 0],
+    ["npm test `git diff --name-only`", "  12 passing (3s)", 0],
+    ["npm test -- -t \\$'a\\'", "  12 passing (3s)", 0],
   ];
   assert.equal(hook.CHECK_COMMAND.source, server.CHECK_COMMAND.source, "CHECK_COMMAND copy");
   for (const [command, output, exit] of cases) {
@@ -1475,57 +1496,88 @@ const verifyOut = async (lines, message = "Done, all tests pass.") => {
   const out = await stopGate.decide({ transcript_path: writeTranscript(lines), last_assistant_message: message }, { fetchImpl });
   return { out, calls };
 };
-test("F1: a >2000-char NON-check command at exit 0 is not a pass override, and the gate still blocks", async () => {
+// The kit_verify_done input schema exactly as deployed at dcbabe5 (`.strict()`, no `unproven`): a worker deployed by hand
+// can lag the auto-updated hook, so every payload the hook builds must still validate against it. A key the old schema
+// does not know is rejected (zod unrecognized_keys -> JSON-RPC -32602), which the hook turns into a block.
+let oldZ = null;
+try { oldZ = require(path.join(here, "..", "server", "node_modules", "zod")).z; } catch { /* zod not installed: the schema tests skip */ }
+const oldVerifySchema = oldZ && (() => {
+  const strict = (shape) => oldZ.object(shape).strict();
+  return strict({
+    final_message: oldZ.string().max(60000).optional(),
+    task: oldZ.string().max(20000).optional(),
+    transcript_tail: oldZ.string().max(4_000_000).optional(),
+    file_changes: oldZ.number().int().min(0).max(100000).optional(),
+    checks: oldZ.array(strict({
+      command: oldZ.string().max(2000),
+      output: oldZ.string().max(60000).optional(),
+      exit_code: oldZ.number().int().optional(),
+      passed: oldZ.boolean().optional(),
+    })).max(50).optional(),
+    threshold: oldZ.number().min(0.5).max(1).optional(),
+  });
+})();
+const acceptedByOldSchema = (calls) => {
+  const args = calls.find((c) => c.name === "kit_verify_done").arguments;
+  const r = oldVerifySchema.safeParse(args);
+  assert.ok(r.success, `old worker schema rejects the hook payload: ${r.success ? "" : JSON.stringify(r.error.issues)}`);
+};
+const skipNoZod = { skip: !oldZ && "zod not installed under server/node_modules" };
+test("F1: a >2000-char NON-check command is not sent at all, and the gate still blocks", skipNoZod, async () => {
   const { out, calls } = await verifyOut(editThen([`git commit -m "${"x".repeat(2500)}"`, "[main abc1234] msg"]));
-  const sent = sentChecks(calls);
-  assert.equal(sent.length, 1);
-  assert.notEqual(sent[0].passed, true);
+  assert.deepEqual(sentChecks(calls), []);
+  acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `a long git commit must not verify: ${JSON.stringify(out)}`);
   assert.match(out.reason, /VERIFY:/);
 });
-test("F1: a >2000-char non-check whose kept head text contains a check verb is still not a pass", async () => {
-  const { out } = await verifyOut(editThen([`git commit -m "npm test ${"x".repeat(2500)}"`, "[main abc1234] msg"]));
+test("F1: a >2000-char non-check whose kept head text contains a check verb is not sent and not a pass", skipNoZod, async () => {
+  const { out, calls } = await verifyOut(editThen([`git commit -m "npm test ${"x".repeat(2500)}"`, "[main abc1234] msg"]));
+  assert.deepEqual(sentChecks(calls), []);
+  acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `${JSON.stringify(out)}`);
 });
-test("F6: a >2000-char check whose full outcome is unknown is sent passed:false + unproven, and the gate blocks", async () => {
+test("F6: a >2000-char check whose full outcome is unknown is sent passed:false (old-schema valid), and the gate blocks", skipNoZod, async () => {
   const command = "npm test " + "x ".repeat(600) + "; echo done; " + "y ".repeat(600);
   assert.ok(command.length > 2000);
   const { out, calls } = await verifyOut(editThen([command, "  12 passing (3s)"]));
   const sent = sentChecks(calls);
+  assert.equal(sent.length, 1);
   assert.equal(sent[0].passed, false);
-  assert.equal(sent[0].unproven, true);
+  assert.ok(!("unproven" in sent[0]), "no wire field beyond the deployed schema");
+  acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `the cut text lost the mask, the full command did not: ${JSON.stringify(out)}`);
 });
-test("F6: a cut check that failed is passed:false without unproven; a cut check that passed keeps passed:true", () => {
+test("F6: a cut check that failed is passed:false; a cut check that passed keeps passed:true; neither adds a key", skipNoZod, async () => {
   const pad = "X=1 ".repeat(800);
   const failed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  1 failing", true])).checks[0];
   assert.equal(failed.passed, false);
-  assert.equal(failed.unproven, undefined);
   const passed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  12 passing (3s)"])).checks[0];
   assert.equal(passed.passed, true);
-  assert.equal(passed.unproven, undefined);
+  const { out, calls } = await verifyOut(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  12 passing (3s)"]));
+  acceptedByOldSchema(calls);
+  assert.equal(out, null, `a cut passing check still verifies: ${JSON.stringify(out)}`);
 });
-test("F2: 55 non-check commands after a passing `npm test` do not evict it (no false block)", async () => {
+test("F2: 55 non-check commands after a passing `npm test` are never sent, so they cannot evict it (no false block)", skipNoZod, async () => {
   const noise = Array.from({ length: 55 }, () => ["ls src", "a.js\nb.js"]);
   const { out, calls } = await verifyOut(editThen(["npm test", "  12 passing (3s)"], ...noise));
-  const sent = sentChecks(calls);
-  assert.equal(sent.length, 50);
-  assert.ok(sent.some((c) => c.command === "npm test"), "the passing check was evicted by noise");
+  assert.deepEqual(sentChecks(calls).map((c) => c.command), ["npm test"]);
+  acceptedByOldSchema(calls);
   assert.equal(out, null, `a passing check followed by noise must verify: ${JSON.stringify(out)}`);
 });
-test("F2: 55 non-check pipelines after a FAILING `npm test` do not evict the failing run", async () => {
+test("F2: 55 non-check pipelines after a FAILING `npm test` do not evict the failing run", skipNoZod, async () => {
   const noise = Array.from({ length: 55 }, () => ["git log | head", "abc commit"]);
-  const { calls } = await verifyOut(editThen(["npm test", "  1 failing", true], ...noise));
+  const { out, calls } = await verifyOut(editThen(["npm test", "  1 failing", true], ...noise));
   const sent = sentChecks(calls);
-  assert.equal(sent.length, 50);
-  assert.ok(sent.some((c) => c.command === "npm test" && c.exit_code === 1), "the failing check was evicted by noise");
+  assert.deepEqual(sent.map((c) => [c.command, c.exit_code]), [["npm test", 1]]);
+  acceptedByOldSchema(calls);
+  assert.ok(out && out.decision === "block");
 });
-test("F2: ordering after the cap stays chronological, checks ahead of non-checks", () => {
-  const lines = editThen(["npm test", "  12 passing (3s)"], ...Array.from({ length: 60 }, (_, i) => ["ls dir" + i, "x"]), ["npm run lint", "ok"]);
+test("F2: 60 checks are capped to 50 and stay chronological; the newest survives", () => {
+  const lines = editThen(["npm test", "  1 failing", true], ...Array.from({ length: 60 }, (_, i) => ["npm run lint -- --id=" + i, "ok"]));
   const sent = stopGate.parseForVerify(lines).checks;
   assert.equal(sent.length, 50);
-  assert.equal(sent[0].command, "npm test");
-  assert.equal(sent.at(-1).command, "npm run lint");
+  assert.equal(sent[0].command, "npm test", "the failing run is kept");
+  assert.equal(sent.at(-1).command, "npm run lint -- --id=59");
 });
 test("F3: `npm run build && npm test` at exit 0 with a clean summary verifies (no false block)", async () => {
   const { out } = await verifyOut(editThen(["npm run build && npm test", "  12 passing (3s)"]));

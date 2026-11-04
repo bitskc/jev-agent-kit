@@ -409,12 +409,34 @@ test("F1: a non-check command never becomes a fresh check, whatever `passed` say
   const r3 = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "npm test", passed: true }] });
   assert.equal(r3.verified, true);
 });
-test("F6: an unproven check never passes, even with passed:true, and says so in notes", async () => {
-  const r = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "npm test", passed: true, unproven: true }] });
+test("F6: a cut check sent as passed:false is a non-pass; the wire has no extra field", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "npm test", passed: false, output: "  12 passing (3s)", exit_code: 0 }] });
   assert.notEqual(r.verified, true);
   assert.equal(r.evidence.fresh_checks[0].passed, false);
-  assert.equal(r.evidence.fresh_checks[0].unproven, true);
-  assert.match(r.notes.join(" "), /unproven/);
+  const { registerKitTools } = await import("../src/kit/tools.mjs");
+  let schema;
+  registerKitTools({ registerTool: (name, def) => { if (name === "kit_verify_done") schema = def.inputSchema; } }, () => ({}));
+  assert.ok(schema.safeParse({ final_message: "x", checks: [{ command: "npm test", passed: false }] }).success);
+  assert.equal(schema.safeParse({ final_message: "x", checks: [{ command: "npm test", unproven: true }] }).success, false, "strict: no `unproven` key");
+});
+test("N2: executor words are masked only as the program of a stage that holds a quoted body; elsewhere they are plain words", () => {
+  for (const cmd of [
+    "docker compose run --rm app npm test", "docker exec app npm test", "docker run --rm -v $PWD:/app img npm test", "podman run x npm test",
+    "kubectl exec pod -- npm test", "ssh ci npm test", "cd docker && npm test", "cd ssh && npm test", "cd tools/script && npm test",
+    "cd watch; npm test", "cd watch && npm test", "make -C docker test", "pytest -k docker", "pytest docker", "npm test -- docker",
+    "cargo test --package su", "go test ./watch ./...", "npx jest watch", "sudo -E docker run img npm test",
+  ]) assert.equal(runOutcome(cmd, OK, 0), "pass", cmd);
+  for (const cmd of [
+    "docker exec app 'npm test || true'", "ssh ci 'cd repo && npm test'", 'eval "npm test"', "script -c 'npm test'", "su -c 'npm test; true'",
+    "/usr/bin/ssh ci 'npm test || true'", "sudo -E docker exec app 'npm test || true'", "FOO=1 docker exec app 'npm test || true'",
+    "xargs -I{} sh -c 'npm test'", "echo x | ssh ci 'npm test || true'", "podman exec app 'npm test || true'", "kubectl exec pod -- sh -c 'npm test || true'",
+    "docker exec app npm test -- -t 'a (b)'", // conservative by design: an executor program plus any quoted span could hide a body
+  ]) assert.equal(runOutcome(cmd, OK, 0), "unknown", cmd);
+});
+test("P3-f: a backslash-escaped `$` before a quote is not ANSI-C quoting", () => {
+  assert.equal(runOutcome("npm test -- -t \\$'a\\'", OK, 0), "pass");
+  assert.equal(runOutcome("npm test -- -t $'a\\'b'", OK, 0), "pass");
+  assert.equal(runOutcome("npm test -- -t $'a\\'b; echo c'; echo d", OK, 0), "unknown");
 });
 test("F3: an all-&& chain that exits 0 proves every element, so the check passes", () => {
   for (const [cmd, out] of [

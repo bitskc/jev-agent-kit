@@ -37,10 +37,26 @@ const PASSING_TITLE = /^\s*(?:[✓✔√]|PASS\b|ok\b)/;
 const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
 const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
 const BARE_PIPE = /(?<!\|)\|(?!\|)/;
-// A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order) or a command that runs a quoted string as
-// code (eval, exec, ssh, su, xargs, watch, script, parallel, docker, podman, kubectl, nsenter, chroot, runuser): the
-// quoted body is hidden from the scan, so its status is never attributable.
-const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$))/;
+// A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order): its quoted body is hidden from the
+// scan, so its status is never attributable.
+const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b/;
+// A command that runs a quoted string as code (eval, exec, ssh, su, xargs, watch, script, parallel, docker, podman,
+// kubectl, nsenter, chroot, runuser) hides a body only when it is the program of a pipeline stage (after prefix elements
+// and sudo/env/time/nohup) AND the stage holds a quoted span. `docker run img npm test` or `cd docker && npm test` are
+// plain commands whose status is the check's own.
+const CODE_RUNNER = /^(?:\S*\/)?(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$)/;
+const EXEC_PREFIX = /^(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup)\s+)*/;
+function hidesNestedCode(norm) {
+  if (NESTED_SHELL_C.test(norm)) return true;
+  for (const el of listGroups(norm).flat()) {
+    if (PREFIX_SEGMENT.test(el)) continue;
+    for (const stage of el.split(BARE_PIPE)) {
+      const s = stage.trim().replace(EXEC_PREFIX, "");
+      if (CODE_RUNNER.test(s) && s.includes("''")) return true;
+    }
+  }
+  return false;
+}
 const SET_PIPEFAIL_OP = /(?:^|\s)([-+])[A-Za-z]*o\s+pipefail(?=\s|$)/g;
 const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
 const PIPEFAIL_WRAPPER_WHOLE = /^bash\s+-o\s+pipefail\s+-c\s+(?:'([^']*)'|"((?:[^"\\$`]|\\.)*)")$/;
@@ -60,7 +76,7 @@ function stripQuoted(command) {
     if (ch !== " " && ch !== "\t") lineStart = false;
     if (ch === "\\") { if (i + 1 < command.length) { out += command[i + 1] === "\n" ? " " : "_"; i++; } continue; }
     if (ch === "'") {
-      const ansiC = command[i - 1] === "$";
+      const ansiC = out.endsWith("$"); // a plain `$` just before the quote; `\$'` leaves `_` in out
       let j = i + 1;
       while (j < command.length && command[j] !== "'") j += ansiC && command[j] === "\\" ? 2 : 1;
       if (j >= command.length) return null;
@@ -108,7 +124,7 @@ export function exitIsMasked(command, pipefail = false) {
     return whole ? exitIsMasked(whole[1] ?? whole[2], true) : true;
   }
   const norm = stripQuoted(command);
-  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || NESTED_SHELL_C.test(norm)) return true;
+  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || hidesNestedCode(norm)) return true;
   if (BARE_PIPE.test(norm) && !pipefailOn(norm, pipefail)) return true;
   const groups = listGroups(norm);
   if (groups.flat().some((s) => /^!(?:\s|$)/.test(s))) return true;
@@ -131,7 +147,7 @@ function maskedByTailPipeOnly(command) {
   const norm = stripQuoted(command);
   if (norm === null || UNATTRIBUTABLE.test(norm)) return false;
   if (norm.includes("||") || />/.test(norm.replace(FD_MERGE_STDERR, ""))) return false;
-  if (NESTED_SHELL_C.test(norm)) return false;
+  if (hidesNestedCode(norm)) return false;
   const parts = norm.split(BARE_PIPE);
   if (parts.length !== 2 || !TAIL_ARGS.test(parts[1])) return false;
   const segs = listGroups(parts[0]).flat();
@@ -338,10 +354,6 @@ export async function verifyDone(input, deps = {}) {
       const call = redact(command).slice(0, 200);
       // Only a check command can count, whatever `passed` says: a non-check with passed:true must never be a fresh check.
       if (!CHECK_COMMAND.test(command)) return null;
-      if (c.unproven === true) {
-        notes.push(`Check '${call}' was sent as unproven: its outcome could not be decided from the full command (cut to fit the schema cap). Rerun it alone and send exit_code or the runner's summary lines.`);
-        return { call, passed: false, unproven: true };
-      }
       if (typeof c.passed === "boolean") return { call, passed: c.passed };
       const outcome = runOutcome(command, c.output || "", typeof c.exit_code === "number" ? c.exit_code : undefined);
       if (outcome !== "unknown") return { call, passed: outcome === "pass" };

@@ -72,7 +72,6 @@ export function registerKitTools(server, getEnv, opts = {}) {
         output: z.string().max(60000).optional().describe("Its output (runner summary is read from the tail)."),
         exit_code: z.number().int().optional().describe("The check's exit status. 0 with no failure summary counts as passed; lets silent runners (tsc, lint) verify."),
         passed: z.boolean().optional().describe("Override the detected pass/fail of a check command. Use only when the runner's output is unrecognised and exit_code is unavailable. Ignored on a command that is not a check."),
-        unproven: z.boolean().optional().describe("The sender could not decide this check's outcome (e.g. its command was cut to fit the cap). Never counts as a pass."),
       })).max(50).optional().describe("Checks run after the changes."),
       threshold: z.number().min(0.5).max(1).optional().describe(`P(claims done) needed to block. Default ${DEFAULT_THRESHOLD}.`),
     }),

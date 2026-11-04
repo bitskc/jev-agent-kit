@@ -146,10 +146,26 @@ const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lin
 const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
 const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
 const BARE_PIPE = /(?<!\|)\|(?!\|)/;
-// A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order) or a command that runs a quoted string as
-// code (eval, exec, ssh, su, xargs, watch, script, parallel, docker, podman, kubectl, nsenter, chroot, runuser): the
-// quoted body is hidden from the scan, so its status is never attributable.
-const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$))/;
+// A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order): its quoted body is hidden from the
+// scan, so its status is never attributable.
+const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b/;
+// A command that runs a quoted string as code (eval, exec, ssh, su, xargs, watch, script, parallel, docker, podman,
+// kubectl, nsenter, chroot, runuser) hides a body only when it is the program of a pipeline stage (after prefix elements
+// and sudo/env/time/nohup) AND the stage holds a quoted span. `docker run img npm test` or `cd docker && npm test` are
+// plain commands whose status is the check's own.
+const CODE_RUNNER = /^(?:\S*\/)?(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$)/;
+const EXEC_PREFIX = /^(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup)\s+)*/;
+function hidesNestedCode(norm) {
+  if (NESTED_SHELL_C.test(norm)) return true;
+  for (const el of listGroups(norm).flat()) {
+    if (PREFIX_SEGMENT.test(el)) continue;
+    for (const stage of el.split(BARE_PIPE)) {
+      const s = stage.trim().replace(EXEC_PREFIX, "");
+      if (CODE_RUNNER.test(s) && s.includes("''")) return true;
+    }
+  }
+  return false;
+}
 const SET_PIPEFAIL_OP = /(?:^|\s)([-+])[A-Za-z]*o\s+pipefail(?=\s|$)/g;
 const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
 const PIPEFAIL_WRAPPER_WHOLE = /^bash\s+-o\s+pipefail\s+-c\s+(?:'([^']*)'|"((?:[^"\\$`]|\\.)*)")$/;
@@ -169,7 +185,7 @@ function stripQuoted(command) {
     if (ch !== " " && ch !== "\t") lineStart = false;
     if (ch === "\\") { if (i + 1 < command.length) { out += command[i + 1] === "\n" ? " " : "_"; i++; } continue; }
     if (ch === "'") {
-      const ansiC = command[i - 1] === "$";
+      const ansiC = out.endsWith("$"); // a plain `$` just before the quote; `\$'` leaves `_` in out
       let j = i + 1;
       while (j < command.length && command[j] !== "'") j += ansiC && command[j] === "\\" ? 2 : 1;
       if (j >= command.length) return null;
@@ -217,7 +233,7 @@ function exitIsMasked(command, pipefail = false) {
     return whole ? exitIsMasked(whole[1] ?? whole[2], true) : true;
   }
   const norm = stripQuoted(command);
-  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || NESTED_SHELL_C.test(norm)) return true;
+  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || hidesNestedCode(norm)) return true;
   if (BARE_PIPE.test(norm) && !pipefailOn(norm, pipefail)) return true;
   const groups = listGroups(norm);
   if (groups.flat().some((s) => /^!(?:\s|$)/.test(s))) return true;
@@ -240,7 +256,7 @@ function maskedByTailPipeOnly(command) {
   const norm = stripQuoted(command);
   if (norm === null || UNATTRIBUTABLE.test(norm)) return false;
   if (norm.includes("||") || />/.test(norm.replace(FD_MERGE_STDERR, ""))) return false;
-  if (NESTED_SHELL_C.test(norm)) return false;
+  if (hidesNestedCode(norm)) return false;
   const parts = norm.split(BARE_PIPE);
   if (parts.length !== 2 || !TAIL_ARGS.test(parts[1])) return false;
   const segs = listGroups(parts[0]).flat();
@@ -377,12 +393,11 @@ function keepTail(s, max) {
   const marker = '…[earlier text cut]…\n';
   return marker + s.slice(s.length - (max - marker.length));
 }
-// Keeps the most recent check command, then non-pass check runs (most recent first), then passing checks, then
-// non-check commands (most recent first); restores chronological order. Non-checks never evict a real check run.
+// Keeps the most recent check, then non-pass runs (most recent first), then passes; restores chronological order.
 function capChecks(list) {
   if (list.length <= CHECKS_CAP) return list;
-  const lastCheck = list.map((e) => e.check).lastIndexOf(true);
-  const rank = (i) => (!list[i].check ? 3 : i === lastCheck ? 0 : list[i].outcome === 'pass' ? 2 : 1);
+  const last = list.length - 1;
+  const rank = (i) => (i === last ? 0 : list[i].outcome === 'pass' ? 2 : 1);
   const kept = list.map((_, i) => i).sort((a, b) => rank(a) - rank(b) || b - a).slice(0, CHECKS_CAP);
   return kept.sort((a, b) => a - b).map((i) => list[i]);
 }
@@ -429,20 +444,18 @@ function parseForVerify(lines) {
       }
     }
   }
+  // Only commands that run a check are sent: the server ignores everything else, and a non-check can never be evidence.
   const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
     const exitCode = r.isError === null ? undefined : r.isError ? 1 : 0;
     return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) };
-  });
+  }).filter((e) => e.check);
   const checks = capChecks(evidence).map((e) => {
     const check = { command: capMiddle(e.command, CHECK_COMMAND_CAP), output: e.output.slice(-4000), exit_code: e.exitCode };
     // The server reads a masked exit from the command text, which the cap can cut, so a cut command carries the outcome
-    // decided on the whole command. A pass override goes only to a command that runs a check; a cut command whose full
-    // outcome is not a pass (or that is no check, which the cut text could otherwise pass as one) is sent as unproven.
-    if (check.command !== e.command) {
-      check.passed = e.check && e.outcome === 'pass';
-      if (e.outcome === 'unknown' || !e.check) check.unproven = true;
-    }
+    // decided on the whole command: passed:true only on a full pass, passed:false otherwise (a fail, or an unknown the
+    // cut text could otherwise turn into a pass). `passed` is in every deployed schema; no newer wire field is needed.
+    if (check.command !== e.command) check.passed = e.outcome === 'pass';
     return check;
   });
   return {
