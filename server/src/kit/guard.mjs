@@ -110,49 +110,159 @@ function* pathParts(tokens) {
     if (opt) yield opt[1];
   }
 }
-// A glob token is tested through the concrete names it can expand to (approximate, not a glob engine):
-// `*` as nothing, `x` or `.x`; `?` and `[...]` as one member character. Catches `.env*`, `.env.*`,
-// `~/.ssh/*`, `~/.aws/cred*` without writing out each spelling.
+// A glob token is parsed into units (a literal char, `*`, `?`, or a `[...]` class) and matched against the known
+// secret-store names, never enumerated by alphabet. `*` expands only as nothing, `x`, or `.x` (so `*.env`, `.env.*`,
+// and `~/.aws/*` see concrete spellings, and `*.json` is not read as `credentials.json`); every `?` and `[...]` is
+// matched exactly, so `.???rc` reaches `.netrc` however many spellings it has. A `*` that would have to supply
+// secret-name letters (`.n*rc` for `.netrc`) is not followed. A leading `?` or class may stand for the leading `.`
+// (`?env` is read as `.env`, an over-block kept from round 18): the guard fails closed on shells with dotglob.
 const GLOB_CHAR_RE = /[*?[]/;
-const GLOB_UNIT_RE = /\[!?[^\]]*\]|\*|\?|[^*?[]+|\[/g;
-// `?` is one filename character: the secret names are lowercase letters, digits, `.`, `_`, `-` (`.en?` is `.env`).
-const GLOB_ANY_CHARS = [..."abcdefghijklmnopqrstuvwxyz0123456789._-"];
-function bracketChars(body) {
-  const out = [];
-  for (let i = 0; i < body.length; i++) {
-    if (body[i + 1] === "-" && i + 2 < body.length) {
-      for (let c = body.charCodeAt(i); c <= body.charCodeAt(i + 2); c++) out.push(String.fromCharCode(c));
+const GLOB_UNIT_RE = /\[[!^]?[^\]]*\]|\*|\?|[^*?[]+|\[/g;
+const STAR = { k: "*" };
+const ANY = { k: "?" };
+function bracketUnit(body) {
+  const neg = body[0] === "!" || body[0] === "^";
+  const src = neg ? body.slice(1) : body;
+  const set = new Set();
+  for (let i = 0; i < src.length; i++) {
+    if (src[i + 1] === "-" && i + 2 < src.length) {
+      const lo = src.charCodeAt(i);
+      const hi = src.charCodeAt(i + 2);
+      if (hi - lo > 512) return ANY;
+      for (let c = lo; c <= hi; c++) set.add(String.fromCharCode(c));
       i += 2;
-    } else out.push(body[i]);
+    } else set.add(src[i]);
   }
-  return out.length ? out : ["x"];
+  return set.size ? { k: "[", set, neg } : ANY;
 }
-function globSamples(p) {
-  let cands = [""];
+function parseGlob(p) {
+  const units = [];
   for (const u of p.match(GLOB_UNIT_RE) ?? []) {
-    let alts;
-    if (u === "*") alts = ["", "x", ".x"];
-    else if (u === "?") alts = GLOB_ANY_CHARS;
-    else if (u.length > 1 && u.startsWith("[")) alts = u.startsWith("[!") ? ["x"] : bracketChars(u.slice(1, -1));
-    else alts = [u];
-    cands = cands.flatMap((c) => alts.map((a) => c + a)).slice(0, 2048);
+    if (u === "*") units.push(STAR);
+    else if (u === "?") units.push(ANY);
+    else if (u.length > 1 && u.startsWith("[")) units.push(bracketUnit(u.slice(1, -1)));
+    else units.push(...u);
   }
-  return cands;
+  return units;
 }
-function secretMatch(p, res) {
-  if (res.some((r) => r.test(p))) return true;
-  return GLOB_CHAR_RE.test(p) && globSamples(p).some((s) => res.some((r) => r.test(s)));
+const unitAccepts = (u, ch) => typeof u === "string" ? u === ch : u.k === "[" ? u.set.has(ch) !== u.neg : true;
+// Unit `c[i]` of a component accepts `ch`.
+const acc = (c, i, ch) => unitAccepts(c[i], ch);
+const accAny = (c, i, alphabet) => [...alphabet].some((ch) => acc(c, i, ch));
+const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+function unitsRegex(comp) {
+  const body = comp.map((u) => {
+    if (typeof u === "string") return reEscape(u);
+    if (u.k === "?") return "[^/]";
+    return `[${u.neg ? "^/" : ""}${[...u.set].map(reEscape).join("")}]`;
+  });
+  return new RegExp(`^${body.join("")}$`);
 }
-// Token-shape tiering. A secret store named by its shape blocks in any token position. A dash token is also tested
-// with its dashes stripped, so `-.env` and `--file=.env` cannot hide behind a flag prefix.
-function secretShapeIn(tokens, home) {
+const GLOB_CANDIDATE_CAP = 2048;
+// `*` as nothing, `x`, or `.x`. Past the cap the remaining stars collapse to `x` and the result is flagged
+// truncated: the caller must not treat an unchecked expansion as proof the glob misses a secret store.
+function starCandidates(units) {
+  let cands = [[]];
+  let truncated = false;
+  for (const u of units) {
+    let alts = u === STAR ? [[], ["x"], [".", "x"]] : [[u]];
+    if (cands.length * alts.length > GLOB_CANDIDATE_CAP) { truncated = true; alts = [["x"]]; }
+    cands = cands.flatMap((c) => alts.map((a) => [...c, ...a]));
+  }
+  return { cands, truncated };
+}
+const splitComps = (units) => {
+  const comps = [[]];
+  for (const u of units) { if (u === "/") comps.push([]); else comps.at(-1).push(u); }
+  return comps;
+};
+const WORD_ALNUM = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const ENV_CHAIN = `${WORD_ALNUM}_.-`;
+const KEY_CHAIN = `${WORD_ALNUM}_-`;
+const CRED_EXTS = ["json", "yaml", "yml", "ini", "toml", "txt", "conf", "cfg", "env"];
+const CRED_BACKUPS = ["bak", "old", "orig", "save", "backup", "tmp", ..."0123456789"];
+// Concrete secret-store basenames and basename tails, one entry per SECRET_PATH_RES family that has a fixed spelling.
+const SECRET_BASENAMES = [
+  ".env", ".envrc", ".netrc", ".pgpass", ".npmrc", ".pypirc", ".credentials", ".credentials.json", ".dev.vars",
+  "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+  ...CRED_BACKUPS.map((b) => `credentials.${b}`),
+  ...CRED_EXTS.flatMap((e) => [`credentials.${e}`, ...CRED_BACKUPS.map((b) => `credentials.${e}.${b}`)]),
+];
+const SECRET_TAILS = [
+  ".env", ".pem", ".key", ".p12", ".pfx", ".jks", ".tfstate", ".tfstate.backup", ".credentials.json",
+  ...["-", "_", "."].flatMap((s) => [...CRED_BACKUPS.map((b) => `${s}credentials.${b}`),
+    ...CRED_EXTS.flatMap((e) => [`${s}credentials.${e}`, ...CRED_BACKUPS.map((b) => `${s}credentials.${e}.${b}`)])]),
+];
+const SECRET_DIR_NAMES = [".ssh", ".aws", ".gnupg"];
+const SECRET_DIR_FILES = [[".docker", "config.json"], [".kube", "config"], ["etc", "shadow"], ["etc", "gshadow"], ["jev-kit", "env"], ["airlock", "env"]];
+const headIs = (c, s, from = 0) => from + s.length <= c.length && [...s].every((ch, k) => acc(c, from + k, ch));
+const tailIs = (c, t) => c.length >= t.length && [...t].every((ch, k) => acc(c, c.length - t.length + k, ch));
+// `(\.[chain]+)*` after a fixed stem: nothing, or a `.` followed by one or more chain characters.
+function chainFrom(c, from, alphabet) {
+  const rest = c.length - from;
+  if (rest === 0) return true;
+  if (rest < 2 || !acc(c, from, ".")) return false;
+  for (let i = from + 1; i < c.length; i++) if (!accAny(c, i, alphabet)) return false;
+  return true;
+}
+// Basename families with a variable part, tested on a star-free component (wildcards are single-character units).
+function variableSecretBasename(c) {
+  for (let i = 0; i + 4 <= c.length; i++) if (headIs(c, ".env", i) && chainFrom(c, i + 4, ENV_CHAIN)) return true;
+  if (headIs(c, ".dev.vars") && chainFrom(c, 9, ENV_CHAIN)) return true;
+  for (const k of ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]) {
+    if (!headIs(c, k)) continue;
+    if (c.length === k.length) return true;
+    if (c.length >= k.length + 2 && acc(c, k.length, "_") && c.slice(k.length + 1).every((_, j) => accAny(c, k.length + 1 + j, KEY_CHAIN))) return true;
+  }
+  if (c.length >= 20 && headIs(c, "service") && (acc(c, 7, "-") || acc(c, 7, "_")) && headIs(c, "account", 8) && tailIs(c, ".json")) return true;
+  if (headIs(c, ".credentials") && (c.length === 12 || accAny(c, 12, ".-"))) return true;
+  return SECRET_TAILS.some((t) => tailIs(c, t));
+}
+function compsSecret(comps) {
+  const res = comps.map(unitsRegex);
+  for (let i = 0; i < comps.length; i++) {
+    if (SECRET_DIR_NAMES.some((d) => res[i].test(d))) return true;
+    if (i + 1 < comps.length && res[i].test(".config") && res[i + 1].test("gh")) return true;
+    if (i === comps.length - 2 && SECRET_DIR_FILES.some(([d, f]) => res[i].test(d) && res[i + 1].test(f))) return true;
+  }
+  if (SECRET_BASENAMES.some((n) => res.at(-1).test(n))) return true;
+  return variableSecretBasename(comps.at(-1));
+}
+// { hit, truncated } for a glob token: does some spelling it can expand to name a secret store, and was the star
+// expansion cut short (so a miss proves nothing).
+function globSecret(p) {
+  const units = parseGlob(p);
+  const { cands, truncated } = starCandidates(units);
+  for (const cand of cands) {
+    const wild = cand.some((u) => typeof u !== "string");
+    if (!wild) {
+      if (SECRET_PATH_RES.some((r) => r.test(cand.join("")))) return { hit: true, truncated };
+      continue;
+    }
+    if (compsSecret(splitComps(cand))) return { hit: true, truncated };
+  }
+  return { hit: false, truncated };
+}
+function* secretCandidates(tokens, home) {
   for (const tok of pathParts(tokens)) {
     const cands = tok.startsWith("-") ? [tok, tok.replace(/^-+/, "")] : [tok];
     for (const c of cands) {
       if (isSafePath(c)) continue;
-      if (secretMatch(expand(c, home), SECRET_PATH_RES)) return tok;
+      yield [tok, expand(c, home)];
     }
   }
+}
+// Token-shape tiering. A secret store named by its shape blocks in any token position. A dash token is also tested
+// with its dashes stripped, so `-.env` and `--file=.env` cannot hide behind a flag prefix.
+function secretShapeIn(tokens, home) {
+  for (const [tok, p] of secretCandidates(tokens, home)) {
+    if (SECRET_PATH_RES.some((r) => r.test(p)) || (GLOB_CHAR_RE.test(p) && globSecret(p).hit)) return tok;
+  }
+  return null;
+}
+// A glob whose star expansion hit the candidate cap and found no secret store: it cannot be shown to miss one.
+function truncatedGlobIn(tokens, home) {
+  for (const [tok, p] of secretCandidates(tokens, home)) if (GLOB_CHAR_RE.test(p) && globSecret(p).truncated) return tok;
   return null;
 }
 // Bare credential words name a store only by context (`cat credentials` vs `npx vitest run credentials`): they ask.
@@ -164,12 +274,14 @@ function bareSecretWordIn(tokens) {
   }
   return null;
 }
-// The store a token list names: a shape match blocks, a bare word asks (soft), otherwise null.
+// The store a token list names: a shape match blocks; a bare word or an over-wide glob asks (soft); otherwise null.
 function secretStoreIn(tokens, home) {
   const hit = secretShapeIn(tokens, home);
   if (hit) return { hit, severity: "block" };
   const word = bareSecretWordIn(tokens);
-  return word ? { hit: word, severity: "soft" } : null;
+  if (word) return { hit: word, severity: "soft", why: "names a bare credential word" };
+  const wide = truncatedGlobIn(tokens, home);
+  return wide ? { hit: wide, severity: "soft", why: "is a glob too wide to prove it misses a secret store" } : null;
 }
 function ambiguousPathIn(tokens) {
   for (const tok of tokens) {
@@ -306,7 +418,16 @@ const SECRET_NAME_RE = /SECRET|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|CRED|
 // A bare credential word names a family, not a secret: `grep -rn auth src` is a source search. Searched from a broad
 // root (`.`, `~`, `/`, or no path), it still asks: that root holds the .env files whose lines carry the values.
 const GENERIC_CRED_WORD_RE = /^(?:auth|token)$/i;
-const BROAD_ROOT_RE = /^(?:\.|\.\/|\.\.|\.\.\/|~|~\/|\$HOME|\$HOME\/|\/)$/;
+// A root is broad when it is, or can reach, a directory that holds .env files: the cwd, home, `/`, or a parent.
+// `~`, `$HOME`, and `$PWD` are expanded and `.` segments dropped first, so `~/.` and `$PWD` classify like `~` and
+// `.`, and a root of only `..` segments (`$PWD/..`) is a parent. A `..` that follows a named directory (`src/..`,
+// `src/auth/..`) is broad without being resolved: the result is `src` only if `auth` is not a symlink.
+function isBroadRoot(root) {
+  const rest = root.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, "").replace(/^(?:\$\{PWD\}|\$PWD)(?=\/|$)/, "");
+  const segs = rest.split("/").filter((s) => s !== "" && s !== ".");
+  if (segs.every((s) => s === "..")) return true;
+  return segs.some((s, i) => s === ".." && i > 0 && segs[i - 1] !== "..");
+}
 // Assignment-name samples. A pattern that is a regex matching one of these names (`SECR.T_X`), or the assignment
 // operator (`=`), selects the assignment lines of every .env file it reaches.
 const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
@@ -359,7 +480,7 @@ function grepNamesSecret(prog, args) {
   const pats = fileMode ? args : patterns.length > 0 ? patterns : operands.slice(0, 1);
   const roots = patterns.length > 0 || fileMode ? operands : operands.slice(1);
   if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && patternMatchesValueName(p)))) return true;
-  const broad = roots.length === 0 || roots.some((r) => BROAD_ROOT_RE.test(r));
+  const broad = roots.length === 0 || roots.some(isBroadRoot);
   return broad && pats.some((p) => GENERIC_CRED_WORD_RE.test(p));
 }
 function grepRecursive(prog, args) {
@@ -507,7 +628,7 @@ function ruleSecret(ctx) {
     const operands = outputOperands(prog, args);
     const store = operands && secretStoreIn(grepPatternExempt(prog, args, operands), home);
     if (store?.severity === "block") return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` on a secret store (${store.hit}) would print its contents`, suggestion: R1_SUGGESTION };
-    if (store) soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${prog} ${store.hit}\` names a bare credential word, so it asks: confirm it is not a secret file`, suggestion: R1_SUGGESTION };
+    if (store) soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${prog} ${store.hit}\` ${store.why}, so it asks: confirm it is not a secret file`, suggestion: R1_SUGGESTION };
     if (READERS.has(prog)) {
       const amb = ambiguousPathIn(pathArgs(prog, args));
       if (amb && !ambiguous) ambiguous = { rule: "R1-secret-exposure", severity: "ambiguous", jev: "secret", reason: `\`${prog}\` on a path that may hold secrets (${amb})`, suggestion: R1_SUGGESTION, target: amb };
@@ -692,7 +813,7 @@ function ruleSecretExfil(ctx) {
     const store = secretStoreIn(tokens, home);
     if (!store) return null;
     if (store.severity === "block") return { rule: "R1-secret-exfiltration", severity: "block", reason: why(store.hit), suggestion: R1_EXFIL_SUGGESTION };
-    soft ??= { rule: "R1-secret-exfiltration", severity: "soft", reason: `${why(store.hit)}; \`${store.hit}\` is a bare credential word, so it asks`, suggestion: R1_EXFIL_SUGGESTION };
+    soft ??= { rule: "R1-secret-exfiltration", severity: "soft", reason: `${why(store.hit)}; \`${store.hit}\` ${store.why}, so it asks`, suggestion: R1_EXFIL_SUGGESTION };
     return null;
   };
   for (const seg of ctx.expandedSegments) {
@@ -1562,7 +1683,7 @@ function ruleCommitSecret(ctx) {
     gitWrite = true;
     const store = secretStoreIn(dropOptionValues(args.slice(i + 1), COMMIT_MSG_OPTS), ctx.home);
     if (store?.severity === "block") return { rule: "R9-commit-secret", severity: "block", reason: `\`git ${args[i]}\` would stage a secret file (${store.hit})`, suggestion: R9_SUGGESTION };
-    if (store) stageAsk ??= { rule: "R9-commit-secret", severity: "soft", reason: `\`git ${args[i]} ${store.hit}\` names a bare credential word, so it asks: stage it only if it is a secret file`, suggestion: R9_SUGGESTION };
+    if (store) stageAsk ??= { rule: "R9-commit-secret", severity: "soft", reason: `\`git ${args[i]} ${store.hit}\` ${store.why}, so it asks: stage it only if it is a secret file`, suggestion: R9_SUGGESTION };
   }
   if (!gitWrite) return null;
   const cred = firstBlockingHit(ctx.command);

@@ -299,3 +299,125 @@ test("round 18: value-name patterns and ? globs reach .env; bare auth/token in s
     assert.equal(r.decision, "allow", cmd);
   }
 });
+
+// Round 19 P1: a `?` or `[...]` glob that can expand to a secret-store name never passes. The glob is matched against
+// the known store names instead of being enumerated by alphabet (the old 2048-candidate cap cut off `.???rc` before
+// `.netrc`, `.np???` before `.npmrc`, `.?????` before `.pgpass`, ...).
+test("round 19 P1: a ? glob that can name .netrc, .npmrc, .pgpass or .pypirc blocks", async () => {
+  for (const cmd of ["cat .???rc", "cat .np???", "cat .?????", "cat .??????", "cat .n????"]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "block", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+});
+
+test("round 19 P1: each fixed-name secret store blocks as a literal and as a ? or [..] glob spelling of it", async () => {
+  const pairs = [
+    [".netrc", ".n?trc", ".ne[t]rc"],
+    [".pgpass", ".pg????", ".p?pass"],
+    [".npmrc", ".np?rc", ".npm[r]c"],
+    [".pypirc", ".py???c", ".pyp[a-z]rc"],
+    [".envrc", ".env??", ".env[r]c"],
+    [".env.local", ".env.l?cal", ".env.lo*"],
+    ["prod.env", "prod.e?v", "pr*.env"],
+    ["server.pem", "server.p?m", "serv*.pem"],
+    ["tls.key", "tls.k?y", "t*.key"],
+    ["id_rsa", "id_r?a", "id_[r]sa"],
+    ["id_ed25519", "id_ed2551?", "id_ed2551[9]"],
+    ["id_rsa_work", "id_r?a_work", "id_rsa_w*"],
+    [".dev.vars", ".dev.v??s", ".dev.[v]ars"],
+    ["credentials.json", "credentials.js?n", "credentials.[j]son"],
+    ["credentials.json.bak", "credentials.json.ba?", "credentials.json.b[a]k"],
+    [".credentials.json", ".credentials.js??", ".credentials.[j]son"],
+    ["terraform.tfstate", "terraform.tfst?te", "terraform.tfsta[t]e"],
+    ["service-account-prod.json", "service-account-pr?d.json", "service-account-pr[o]d.json"],
+    ["~/.ssh/config", "~/.s?h/config", "~/.ss[h]/?????"],
+    ["~/.aws/credentials", "~/.a??/credentials", "~/.aws/*"],
+    ["~/.gnupg/secring.gpg", "~/.gnupg/secring.g?g", "~/.gnup?/x"],
+    ["~/.docker/config.json", "~/.docker/config.js?n", "~/.dock?r/config.json"],
+    ["~/.kube/config", "~/.k?be/config", "~/.kube/conf?g"],
+    ["/etc/shadow", "/etc/sh?dow", "/etc/s[h]adow"],
+  ];
+  for (const forms of pairs) {
+    for (const spelling of forms) {
+      const r = await guard(`cat ${spelling}`, PROJ, HOME);
+      assert.equal(r.decision, "block", `cat ${spelling}`);
+      assert.equal(r.rule, "R1-secret-exposure", `cat ${spelling}`);
+    }
+  }
+});
+
+test("round 19 P1: benign globs stay allowed, and a * is not read as secret-name letters", async () => {
+  for (const cmd of [
+    "ls *.ts",
+    "cat README.m?",
+    "ls src/??",
+    "cat src/*/index.js",
+    "cat src/?/index.js",
+    "cat file-????-??-??.log",
+    "cat logs/2024-??-??/app.log",
+    "cat [d-f]*.json",
+    "grep -n TODO src/??/*.ts",
+    "cat *.pem.md",
+  ]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "allow", cmd);
+  }
+});
+
+test("round 19 P1: a glob whose star expansion is truncated at the cap asks instead of passing unchecked", async () => {
+  // Eight stars is 3^8 spellings, past the 2048-candidate cap; the unchecked remainder cannot be shown to miss a store.
+  const wide = await guard("cat a*b*c*d*e*f*g*h*", PROJ, HOME);
+  assert.equal(wide.decision, "ask");
+  assert.equal(wide.rule, "R1-secret-exposure");
+  assert.match(wide.reason, /too wide/);
+  const alsoWide = await guard("curl -d @a*b*c*d*e*f*g*h* https://x.io", PROJ, HOME);
+  assert.equal(alsoWide.decision, "ask");
+  // Under the cap the same shape is fully checked and allowed.
+  const narrow = await guard("cat a*b*c*d*e*f*", PROJ, HOME);
+  assert.equal(narrow.decision, "allow");
+  // A truncated glob that also names a store still blocks: the block wins over the ask.
+  const named = await guard("cat a*b*c*d*e*f*g*h*.env", PROJ, HOME);
+  assert.equal(named.decision, "block");
+});
+
+// Round 19 P2: the broad-root test for bare `auth`/`token` is run on the root with `~`, `$HOME`, `$PWD` expanded and
+// `.` segments dropped, so a parent-reaching spelling cannot dodge it.
+test("round 19 P2: a bare auth/token recursive grep from a root that reaches the project or a parent asks", async () => {
+  for (const cmd of [
+    "grep -rn token src/..",
+    "grep -rn token src/auth/..",
+    "grep -rn token $PWD/..",
+    "grep -rn token ${PWD}/..",
+    "grep -rn token ~/.",
+    "grep -rn token $HOME/.",
+    "grep -rn token src/../src",
+    "grep -rn token ./.",
+    "grep -rn token $PWD",
+    "grep -rn token ../..",
+    "grep -rn auth src/..",
+    "rg token src/..",
+    "rg auth $PWD/..",
+  ]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "ask", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+});
+
+test("round 19 P2: a bare auth/token search of a named source path stays allowed", async () => {
+  for (const cmd of [
+    "grep -rn auth src",
+    "rg auth src",
+    "rg token README.md",
+    "grep -rne foo src/auth/",
+    "grep -rn token src/auth",
+    "grep -rn token $PWD/src",
+    "grep -rn token ~/proj",
+    "grep -rn token ../sibling",
+    "grep -rn token ./src/.",
+  ]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "allow", cmd);
+  }
+});
