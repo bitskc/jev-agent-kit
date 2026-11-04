@@ -8,6 +8,7 @@
 // R7-root-delete, R9 commit-secret, R10 general risk. Not ported (host-specific or
 // need local state): R2 claude-api skill, R3 whole-suite build, R4 long-run bare shell,
 // R6 GUI/browser, R8 tool-choice (plocate/Everything), R11 browse redirect.
+import { posix } from "node:path";
 import {
   ASSIGN_RE, crontabCommands, expand, firstPositional, foldLiterals, indirectInvokes, inputScripts, normalizePath,
   programOf, redact, redactCap, resolveCommand, scriptOf, shellDashCScript, SHELL_WRAPPER_PROGS,
@@ -110,12 +111,16 @@ function* pathParts(tokens) {
     if (opt) yield opt[1];
   }
 }
-// A glob token is parsed into units (a literal char, `*`, `?`, or a `[...]` class) and matched against the known
-// secret-store names, never enumerated by alphabet. `*` expands only as nothing, `x`, or `.x` (so `*.env`, `.env.*`,
-// and `~/.aws/*` see concrete spellings, and `*.json` is not read as `credentials.json`); every `?` and `[...]` is
-// matched exactly, so `.???rc` reaches `.netrc` however many spellings it has. A `*` that would have to supply
-// secret-name letters (`.n*rc` for `.netrc`) is not followed. A leading `?` or class may stand for the leading `.`
-// (`?env` is read as `.env`, an over-block kept from round 18): the guard fails closed on shells with dotglob.
+// A glob token is parsed into units (a literal char, `*`, `?`, or a `[...]` class), split into path components, and each
+// component is matched against the known secret-store names by unit, never enumerated by alphabet and never by building
+// a regex per candidate. Components are independent (a secret directory, a `.config`/`gh` or `etc`/`shadow` pair, and the
+// basename are separate tests), so a token's cost is the sum over its components, not the product. Within a component `*`
+// expands as nothing, `x`, or `.x` (so `*.env`, `.env.*`, `~/.aws/*` see concrete spellings and `*.json` is not read as
+// `credentials.json`); consecutive stars collapse to one; every `?` and `[...]` is matched exactly, so `.???rc` reaches
+// `.netrc` however many spellings it has. A `*` that would have to supply secret-name letters (`.n*rc` for `.netrc`) is
+// not followed. A wildcard never stands for the dot that opens a hidden name, and a secret tail (`.pem`, `-credentials.json`)
+// needs its separator spelled literally: `cat ????` and `cat report-????` name no store, `cat mykey.???` asks.
+// Past a work budget the guard asks rather than guessing.
 const GLOB_CHAR_RE = /[*?[]/;
 const GLOB_UNIT_RE = /\[[!^]?[^\]]*\]|\*|\?|[^*?[]+|\[/g;
 const STAR = { k: "*" };
@@ -138,39 +143,20 @@ function bracketUnit(body) {
 function parseGlob(p) {
   const units = [];
   for (const u of p.match(GLOB_UNIT_RE) ?? []) {
-    if (u === "*") units.push(STAR);
+    if (u === "*") { if (units.at(-1) !== STAR) units.push(STAR); }
     else if (u === "?") units.push(ANY);
-    else if (u.length > 1 && u.startsWith("[")) units.push(bracketUnit(u.slice(1, -1)));
+    else if (u.length > 1 && u.startsWith("[")) {
+      const b = bracketUnit(u.slice(1, -1));
+      units.push(b.k === "[" && !b.neg && b.set.size === 1 ? [...b.set][0] : b);
+    }
     else units.push(...u);
   }
   return units;
 }
-const unitAccepts = (u, ch) => typeof u === "string" ? u === ch : u.k === "[" ? u.set.has(ch) !== u.neg : true;
-// Unit `c[i]` of a component accepts `ch`.
-const acc = (c, i, ch) => unitAccepts(c[i], ch);
-const accAny = (c, i, alphabet) => [...alphabet].some((ch) => acc(c, i, ch));
-const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
-function unitsRegex(comp) {
-  const body = comp.map((u) => {
-    if (typeof u === "string") return reEscape(u);
-    if (u.k === "?") return "[^/]";
-    return `[${u.neg ? "^/" : ""}${[...u.set].map(reEscape).join("")}]`;
-  });
-  return new RegExp(`^${body.join("")}$`);
-}
-const GLOB_CANDIDATE_CAP = 2048;
-// `*` as nothing, `x`, or `.x`. Past the cap the remaining stars collapse to `x` and the result is flagged
-// truncated: the caller must not treat an unchecked expansion as proof the glob misses a secret store.
-function starCandidates(units) {
-  let cands = [[]];
-  let truncated = false;
-  for (const u of units) {
-    let alts = u === STAR ? [[], ["x"], [".", "x"]] : [[u]];
-    if (cands.length * alts.length > GLOB_CANDIDATE_CAP) { truncated = true; alts = [["x"]]; }
-    cands = cands.flatMap((c) => alts.map((a) => [...c, ...a]));
-  }
-  return { cands, truncated };
-}
+const lit = (u) => typeof u === "string";
+const unitAccepts = (u, ch) => lit(u) ? u === ch : u.k === "[" ? u.set.has(ch) !== u.neg : true;
+const unitInAlpha = (u, alphabet) => lit(u) ? alphabet.includes(u) : u.k === "?" ? true : [...alphabet].some((ch) => unitAccepts(u, ch));
+const unitKey = (u) => lit(u) ? u : u === STAR ? "*" : u === ANY ? "?" : `[${u.neg ? "!" : ""}${[...u.set].join("")}]`;
 const splitComps = (units) => {
   const comps = [[]];
   for (const u of units) { if (u === "/") comps.push([]); else comps.at(-1).push(u); }
@@ -195,53 +181,155 @@ const SECRET_TAILS = [
 ];
 const SECRET_DIR_NAMES = [".ssh", ".aws", ".gnupg"];
 const SECRET_DIR_FILES = [[".docker", "config.json"], [".kube", "config"], ["etc", "shadow"], ["etc", "gshadow"], ["jev-kit", "env"], ["airlock", "env"]];
-const headIs = (c, s, from = 0) => from + s.length <= c.length && [...s].every((ch, k) => acc(c, from + k, ch));
-const tailIs = (c, t) => c.length >= t.length && [...t].every((ch, k) => acc(c, c.length - t.length + k, ch));
+const byLength = (names) => {
+  const m = new Map();
+  for (const n of names) m.set(n.length, [...(m.get(n.length) ?? []), n]);
+  return m;
+};
+const BASENAME_IDX = byLength(SECRET_BASENAMES);
+const DIR_IDX = byLength(SECRET_DIR_NAMES);
+// Reversed trie of the secret tails, so a component is matched from its end in one walk however many tails there are.
+const TAIL_TRIE = (() => {
+  const root = { next: new Map(), end: false };
+  for (const t of SECRET_TAILS) {
+    let node = root;
+    for (let i = t.length - 1; i >= 0; i--) {
+      let nx = node.next.get(t[i]);
+      if (!nx) { nx = { next: new Map(), end: false }; node.next.set(t[i], nx); }
+      node = nx;
+    }
+    node.end = true;
+  }
+  return root;
+})();
+// Number of literal units in c[from..from+s.length) if every unit accepts s, else -1.
+function headMatch(c, s, from = 0) {
+  if (from + s.length > c.length) return -1;
+  let n = 0;
+  for (let k = 0; k < s.length; k++) {
+    const u = c[from + k];
+    if (lit(u)) { if (u !== s[k]) return -1; n++; } else if (!unitAccepts(u, s[k])) return -1;
+  }
+  return n;
+}
+// A whole component equals `name`; at least one unit is literal, and a hidden name's dot is literal.
+function nameMatch(c, name) {
+  if (c.length !== name.length || (name[0] === "." && c[0] !== ".")) return false;
+  return headMatch(c, name) > 0;
+}
+const anyName = (c, idx) => (idx.get(c.length) ?? []).some((n) => nameMatch(c, n));
 // `(\.[chain]+)*` after a fixed stem: nothing, or a `.` followed by one or more chain characters.
 function chainFrom(c, from, alphabet) {
   const rest = c.length - from;
   if (rest === 0) return true;
-  if (rest < 2 || !acc(c, from, ".")) return false;
-  for (let i = from + 1; i < c.length; i++) if (!accAny(c, i, alphabet)) return false;
+  if (rest < 2 || !unitAccepts(c[from], ".")) return false;
+  for (let i = from + 1; i < c.length; i++) if (!unitInAlpha(c[i], alphabet)) return false;
   return true;
 }
-// Basename families with a variable part, tested on a star-free component (wildcards are single-character units).
-function variableSecretBasename(c) {
-  for (let i = 0; i + 4 <= c.length; i++) if (headIs(c, ".env", i) && chainFrom(c, i + 4, ENV_CHAIN)) return true;
-  if (headIs(c, ".dev.vars") && chainFrom(c, 9, ENV_CHAIN)) return true;
+const credDotName = (c) => c[0] === "." && headMatch(c, ".credentials") > 0 && (c.length === 12 || unitInAlpha(c[12], ".-"));
+// 2 = the component names a secret store, 1 = it might (ask), 0 = no. A star-free component (wildcards are one unit).
+function basenameVerdict(c) {
+  if (anyName(c, BASENAME_IDX)) return 2;
+  let v = 0;
+  const L = c.length;
+  for (let i = 0; i + 4 <= L; i++) {
+    if (c[i] !== ".") continue;
+    const n = headMatch(c, ".env", i);
+    if (n < 0 || !chainFrom(c, i + 4, ENV_CHAIN)) continue;
+    if (i === 0 || n > 1) return 2;
+    v = 1;
+  }
+  if (c[0] === "." && headMatch(c, ".dev.vars") > 0 && chainFrom(c, 9, ENV_CHAIN)) return 2;
   for (const k of ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]) {
-    if (!headIs(c, k)) continue;
-    if (c.length === k.length) return true;
-    if (c.length >= k.length + 2 && acc(c, k.length, "_") && c.slice(k.length + 1).every((_, j) => accAny(c, k.length + 1 + j, KEY_CHAIN))) return true;
+    if (headMatch(c, k) <= 0) continue;
+    if (L === k.length) return 2;
+    if (L >= k.length + 2 && unitAccepts(c[k.length], "_") && c.slice(k.length + 1).every((u) => unitInAlpha(u, KEY_CHAIN))) return 2;
   }
-  if (c.length >= 20 && headIs(c, "service") && (acc(c, 7, "-") || acc(c, 7, "_")) && headIs(c, "account", 8) && tailIs(c, ".json")) return true;
-  if (headIs(c, ".credentials") && (c.length === 12 || accAny(c, 12, ".-"))) return true;
-  return SECRET_TAILS.some((t) => tailIs(c, t));
-}
-function compsSecret(comps) {
-  const res = comps.map(unitsRegex);
-  for (let i = 0; i < comps.length; i++) {
-    if (SECRET_DIR_NAMES.some((d) => res[i].test(d))) return true;
-    if (i + 1 < comps.length && res[i].test(".config") && res[i + 1].test("gh")) return true;
-    if (i === comps.length - 2 && SECRET_DIR_FILES.some(([d, f]) => res[i].test(d) && res[i + 1].test(f))) return true;
-  }
-  if (SECRET_BASENAMES.some((n) => res.at(-1).test(n))) return true;
-  return variableSecretBasename(comps.at(-1));
-}
-// { hit, truncated } for a glob token: does some spelling it can expand to name a secret store, and was the star
-// expansion cut short (so a miss proves nothing).
-function globSecret(p) {
-  const units = parseGlob(p);
-  const { cands, truncated } = starCandidates(units);
-  for (const cand of cands) {
-    const wild = cand.some((u) => typeof u !== "string");
-    if (!wild) {
-      if (SECRET_PATH_RES.some((r) => r.test(cand.join("")))) return { hit: true, truncated };
-      continue;
+  if (L >= 20 && headMatch(c, "service") > 0 && (unitAccepts(c[7], "-") || unitAccepts(c[7], "_")) && headMatch(c, "account", 8) >= 0 && c[L - 5] === "." && headMatch(c, "json", L - 4) >= 0) return 2;
+  if (credDotName(c)) return 2;
+  // tails: the separator is literal; letters spelled only by wildcards (`mykey.???`) ask instead of blocking
+  const walk = (node, depth) => {
+    if (v === 2) return;
+    if (node.end) {
+      const si = L - depth;
+      const sepLit = lit(c[si]);
+      let letters = 0;
+      for (let j = si + 1; j < L; j++) if (lit(c[j])) letters++;
+      // literal separator and a literal letter blocks; a wildcard separator (`tls?key`) with every letter literal, or
+      // letters spelled only by wildcards after a literal separator (`mykey.???`), asks; `report-????` names nothing
+      if (sepLit) v = Math.max(v, letters > 0 ? 2 : 1);
+      else if (letters === L - si - 1) v = Math.max(v, 1);
     }
-    if (compsSecret(splitComps(cand))) return { hit: true, truncated };
+    if (depth === L) return;
+    const u = c[L - 1 - depth];
+    if (lit(u)) { const nx = node.next.get(u); if (nx) walk(nx, depth + 1); }
+    else for (const [ch, nx] of node.next) if (unitAccepts(u, ch)) walk(nx, depth + 1);
+  };
+  walk(TAIL_TRIE, 0);
+  return v;
+}
+const STARS_PER_COMPONENT = 4;
+const GLOB_TOKEN_MAX = 4096;
+const GLOB_WORK_BUDGET = 40000;
+let globBudget = GLOB_WORK_BUDGET;
+const verdictMemo = new Map();
+// Reset once per guardCommand: the units of work every glob in one command may spend before the guard asks.
+const resetGlobWork = () => { globBudget = GLOB_WORK_BUDGET; verdictMemo.clear(); };
+// A component's star spellings: each of the first STARS_PER_COMPONENT stars is nothing, `x`, or `.x`; the rest are nothing
+// (always the empty spelling, so a padded `.env*` cannot hide) and the component is flagged wide.
+function expandStars(comp) {
+  let cands = [[]];
+  let left = STARS_PER_COMPONENT;
+  let wide = false;
+  for (const u of comp) {
+    if (u !== STAR) { for (const c of cands) c.push(u); continue; }
+    if (left-- > 0) cands = cands.flatMap((c) => [c, [...c, "x"], [...c, ".", "x"]]);
+    else wide = true;
   }
-  return { hit: false, truncated };
+  return { cands, wide };
+}
+const compCache = new Map();
+// What one path component can be, over all its spellings.
+function classifyComp(comp, last) {
+  const key = `${last ? "L" : "D"}${comp.map(unitKey).join("")}`;
+  const cached = compCache.get(key);
+  if (cached) return cached;
+  const { cands, wide } = expandStars(comp);
+  globBudget -= cands.length * (comp.length + 2);
+  if (globBudget < 0) return { ssh: false, cfg: false, gh: false, df: [], base: 0, ask: true };
+  const f = { ssh: false, cfg: false, gh: false, df: SECRET_DIR_FILES.map(() => [false, false]), base: 0, ask: wide };
+  for (const c of cands) {
+    if (anyName(c, DIR_IDX) || nameMatch(c, ".credentials.json") || credDotName(c)) f.ssh = true;
+    if (nameMatch(c, ".config")) f.cfg = true;
+    if (nameMatch(c, "gh")) f.gh = true;
+    SECRET_DIR_FILES.forEach(([d, n], i) => { if (nameMatch(c, d)) f.df[i][0] = true; if (nameMatch(c, n)) f.df[i][1] = true; });
+    if (last) f.base = Math.max(f.base, basenameVerdict(c));
+  }
+  if (compCache.size > 4096) compCache.clear();
+  compCache.set(key, f);
+  return f;
+}
+// { hit, ask } for a glob token: some spelling of it names a secret store, or the guard cannot show it misses one.
+function globSecret(p) {
+  if (p.length > GLOB_TOKEN_MAX) return { hit: false, ask: true };
+  const comps = splitComps(parseGlob(p));
+  const fl = comps.map((c, i) => classifyComp(c, i === comps.length - 1));
+  let hit = false;
+  let ask = fl.some((f) => f.ask);
+  fl.forEach((f, i) => {
+    if (f.ssh) hit = true;
+    if (i + 1 < fl.length && f.cfg && fl[i + 1].gh) hit = true;
+    if (i === fl.length - 2 && f.df.some(([l], k) => l && fl[i + 1].df[k][1])) hit = true;
+  });
+  const last = fl.at(-1);
+  if (last.base === 2) hit = true;
+  else if (last.base === 1) ask = true;
+  return { hit, ask };
+}
+function globVerdict(p) {
+  let v = verdictMemo.get(p);
+  if (!v) { v = globSecret(p); verdictMemo.set(p, v); }
+  return v;
 }
 function* secretCandidates(tokens, home) {
   for (const tok of pathParts(tokens)) {
@@ -256,13 +344,13 @@ function* secretCandidates(tokens, home) {
 // with its dashes stripped, so `-.env` and `--file=.env` cannot hide behind a flag prefix.
 function secretShapeIn(tokens, home) {
   for (const [tok, p] of secretCandidates(tokens, home)) {
-    if (SECRET_PATH_RES.some((r) => r.test(p)) || (GLOB_CHAR_RE.test(p) && globSecret(p).hit)) return tok;
+    if (SECRET_PATH_RES.some((r) => r.test(p)) || (GLOB_CHAR_RE.test(p) && globVerdict(p).hit)) return tok;
   }
   return null;
 }
-// A glob whose star expansion hit the candidate cap and found no secret store: it cannot be shown to miss one.
-function truncatedGlobIn(tokens, home) {
-  for (const [tok, p] of secretCandidates(tokens, home)) if (GLOB_CHAR_RE.test(p) && globSecret(p).truncated) return tok;
+// A glob that cannot be shown to miss a secret store (too wide, over the work budget, or a tail spelled only by wildcards).
+function wideGlobIn(tokens, home) {
+  for (const [tok, p] of secretCandidates(tokens, home)) if (GLOB_CHAR_RE.test(p) && globVerdict(p).ask) return tok;
   return null;
 }
 // Bare credential words name a store only by context (`cat credentials` vs `npx vitest run credentials`): they ask.
@@ -280,8 +368,8 @@ function secretStoreIn(tokens, home) {
   if (hit) return { hit, severity: "block" };
   const word = bareSecretWordIn(tokens);
   if (word) return { hit: word, severity: "soft", why: "names a bare credential word" };
-  const wide = truncatedGlobIn(tokens, home);
-  return wide ? { hit: wide, severity: "soft", why: "is a glob too wide to prove it misses a secret store" } : null;
+  const wide = wideGlobIn(tokens, home);
+  return wide ? { hit: wide, severity: "soft", why: "is a glob too wide or ambiguous to prove it misses a secret store" } : null;
 }
 function ambiguousPathIn(tokens) {
   for (const tok of tokens) {
@@ -418,15 +506,31 @@ const SECRET_NAME_RE = /SECRET|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|CRED|
 // A bare credential word names a family, not a secret: `grep -rn auth src` is a source search. Searched from a broad
 // root (`.`, `~`, `/`, or no path), it still asks: that root holds the .env files whose lines carry the values.
 const GENERIC_CRED_WORD_RE = /^(?:auth|token)$/i;
-// A root is broad when it is, or can reach, a directory that holds .env files: the cwd, home, `/`, or a parent.
-// `~`, `$HOME`, and `$PWD` are expanded and `.` segments dropped first, so `~/.` and `$PWD` classify like `~` and
-// `.`, and a root of only `..` segments (`$PWD/..`) is a parent. A `..` that follows a named directory (`src/..`,
-// `src/auth/..`) is broad without being resolved: the result is `src` only if `auth` is not a symlink.
-function isBroadRoot(root) {
-  const rest = root.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/, "").replace(/^(?:\$\{PWD\}|\$PWD)(?=\/|$)/, "");
+// A root is broad when it is, or can reach, a directory that holds .env files: the cwd, home, `/`, or any ancestor of
+// them. It is resolved lexically against the cwd and home the caller passed in: `~`, `$HOME`, `$PWD`, `$(pwd)`, `` `pwd` ``
+// and `~+` become those directories, `.` and `..` segments are folded, and an absolute root is broad when it equals or
+// contains the cwd or home. `$OLDPWD`/`~-` are unknown, so broad. A root ending in a glob (`*`, `./*`, `../.*`, `.e*`,
+// `~/*`) is as broad as its parent directory. A `..` that follows a named directory (`src/..`, `src/auth/..`) is broad
+// without being resolved: the result is `src` only if `auth` is not a symlink. Without a cwd or home only the text can
+// be judged: a root of only `..` segments, or `~`/`$HOME` alone, is broad.
+const PWD_ANCHOR_RE = /^(?:\$\(\s*pwd\s*\)|`\s*pwd\s*`|\$\{PWD\}|\$PWD|~\+)(?=\/|$)/;
+const HOME_ANCHOR_RE = /^(?:~|\$\{HOME\}|\$HOME)(?=\/|$)/;
+const OLDPWD_ANCHOR_RE = /^(?:\$\{OLDPWD\}|\$OLDPWD|~-)(?=\/|$)/;
+function isBroadRoot(root, cwd = "", home = "") {
+  cwd = cwd.length > 1 ? cwd.replace(/\/+$/, "") : cwd;
+  home = home.length > 1 ? home.replace(/\/+$/, "") : home;
+  if (OLDPWD_ANCHOR_RE.test(root)) return true;
+  const slash = root.lastIndexOf("/");
+  if (GLOB_CHAR_RE.test(root.slice(slash + 1))) return isBroadRoot(slash < 0 ? "." : slash === 0 ? "/" : root.slice(0, slash), cwd, home);
+  const anchor = PWD_ANCHOR_RE.test(root) ? "cwd" : HOME_ANCHOR_RE.test(root) ? "home" : null;
+  const rest = anchor === "cwd" ? root.replace(PWD_ANCHOR_RE, "") : anchor === "home" ? root.replace(HOME_ANCHOR_RE, "") : root;
   const segs = rest.split("/").filter((s) => s !== "" && s !== ".");
-  if (segs.every((s) => s === "..")) return true;
-  return segs.some((s, i) => s === ".." && i > 0 && segs[i - 1] !== "..");
+  if (segs.some((s, i) => s === ".." && i > 0 && segs[i - 1] !== "..")) return true;
+  const start = anchor === "cwd" ? cwd : anchor === "home" ? home : rest.startsWith("/") ? "/" : cwd;
+  if (!start) return segs.every((s) => s === "..");
+  const abs = anchor ? posix.resolve(start, `.${rest}`) : posix.resolve(start, rest || ".");
+  const within = (dir) => !!dir && (abs === "/" || dir === abs || dir.startsWith(`${abs}/`));
+  return within(cwd) || within(home);
 }
 // Assignment-name samples. A pattern that is a regex matching one of these names (`SECR.T_X`), or the assignment
 // operator (`=`), selects the assignment lines of every .env file it reaches.
@@ -473,14 +577,14 @@ function grepArgv(prog, args) {
   }
   return { patterns, operands, fileMode };
 }
-function grepNamesSecret(prog, args) {
+function grepNamesSecret(prog, args, cwd, home) {
   if (!GREP_PATTERN_PROGS.has(prog)) return false;
   const { patterns, operands, fileMode } = grepArgv(prog, args);
   // -f/--file: the pattern is a file's contents, so every token is name-checked and no pattern text is probed.
   const pats = fileMode ? args : patterns.length > 0 ? patterns : operands.slice(0, 1);
   const roots = patterns.length > 0 || fileMode ? operands : operands.slice(1);
   if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && patternMatchesValueName(p)))) return true;
-  const broad = roots.length === 0 || roots.some(isBroadRoot);
+  const broad = roots.length === 0 || roots.some((r) => isBroadRoot(r, cwd, home));
   return broad && pats.some((p) => GENERIC_CRED_WORD_RE.test(p));
 }
 function grepRecursive(prog, args) {
@@ -618,7 +722,7 @@ function ruleSecret(ctx) {
     const [prog, args] = resolveCommand(seg);
     if (prog === null) continue;
     if (["grep", "egrep", "rg", "ag"].includes(prog) && quietGrep(args)) continue;
-    if (grepNamesSecret(prog, args) && (grepRecursive(prog, args) || ["xargs", "find", "parallel"].includes(bareProg) || (fed ??= consumerFedListings(ctx)).size > 0)) {
+    if (grepNamesSecret(prog, args, ctx.cwd, ctx.home) && (grepRecursive(prog, args) || ["xargs", "find", "parallel"].includes(bareProg) || (fed ??= consumerFedListings(ctx)).size > 0)) {
       soft ??= { rule: "R1-secret-exposure", severity: "soft", reason: `\`${prog}\` searches for a secret name across many files (recursive, or fed by find): matching lines carry their values`, suggestion: R1_SUGGESTION };
     }
     // openssl writes to -out/-outform's file when given one, not to stdout; a bare invocation (no -out)
@@ -682,25 +786,27 @@ const NETWORK_PIPE_SINKS = new Set(["curl", "wget", "http", "nc", "ncat", "netca
  *  that only matched the spaced form was trivially dodged by dropping one space. Returns the referenced
  *  file path, or null. */
 const CURL_SHORT_ATTACH_RE = /^-([dFT])(.+)$/;
+// A curl form value `name=@file;type=text/plain` or `name=<file;filename=x`: the file ends at the first `;`.
+const FORM_FILE_RE = /=[@<]([^;]+)/;
 function curlFileArg(args) {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if ((CURL_DATA_OPTS.has(a) || CURL_FORM_OPTS.has(a)) && args[i + 1] !== undefined) {
-      const m = CURL_FORM_OPTS.has(a) ? /=@(.+)$/.exec(args[i + 1]) : /^@(.+)$/.exec(args[i + 1]);
+      const m = CURL_FORM_OPTS.has(a) ? FORM_FILE_RE.exec(args[i + 1]) : /^@(.+)$/.exec(args[i + 1]);
       if (m) return m[1];
       continue;
     }
     if (CURL_UPLOAD_OPTS.has(a) && args[i + 1] !== undefined) return args[i + 1];
     const inlineData = /^(?:-d|--data(?:-ascii|-binary|-raw|-urlencode)?)=@(.+)$/.exec(a);
     if (inlineData) return inlineData[1];
-    const inlineForm = /^(?:-F|--form)=?.*=@(.+)$/.exec(a);
+    const inlineForm = /^(?:-F|--form)=?.*?=[@<]([^;]+)/.exec(a);
     if (inlineForm) return inlineForm[1];
     const attach = CURL_SHORT_ATTACH_RE.exec(a);
     if (attach) {
       const [, flag, rest] = attach;
       if (flag === "T") return rest;
       if (flag === "d") { const m2 = /^@(.+)$/.exec(rest); if (m2) return m2[1]; }
-      if (flag === "F") { const m3 = /=@(.+)$/.exec(rest); if (m3) return m3[1]; }
+      if (flag === "F") { const m3 = FORM_FILE_RE.exec(rest); if (m3) return m3[1]; }
     }
   }
   return null;
@@ -1928,6 +2034,7 @@ export function readChoice(a, keys) {
  * @param deps  {ask?: (state, questions) => Promise<{answers, ...}>, jevAvailable?: boolean}
  */
 export async function guardCommand(input, deps = {}) {
+  resetGlobWork();
   const askAt = typeof input.ask_at === "number" ? input.ask_at : DEFAULT_ASK_AT;
   const disabled = new Set(input.disable_rules || []);
   const tool = input.tool || "Bash";

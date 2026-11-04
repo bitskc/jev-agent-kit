@@ -74,6 +74,7 @@ export function words(segment) {
   let quote = null;
   let ansiC = false; // inside a $'...' ANSI-C quoted run: bash decodes \xNN/\n/\t/... escapes
   let inWord = false;
+  let tailClose = 0; // unquoted `)` characters at the very end of buf
   const s = segment || "";
   const n = s.length;
   for (let i = 0; i < n; i++) {
@@ -82,17 +83,17 @@ export function words(segment) {
       if (ch === quote) { quote = null; ansiC = false; continue; }
       if (ansiC && ch === "\\" && i + 1 < n) {
         const [decoded, len] = ansiEscape(s.slice(i));
-        buf += decoded; i += len - 1; inWord = true; continue; // for-loop continue still runs i++
+        buf += decoded; tailClose = 0; i += len - 1; inWord = true; continue; // for-loop continue still runs i++
       }
       if (ch === "\\" && quote === '"' && i + 1 < n && '"\\$`'.includes(s[i + 1])) {
-        buf += s[i + 1]; i++; inWord = true; continue;
+        buf += s[i + 1]; tailClose = 0; i++; inWord = true; continue;
       }
       // Inside double quotes bash only unescapes \" \\ \$ \` (and \newline); every other backslash
       // pair stays literal. Dequoting the four real escapes is what makes a nested -c script survive one
       // more tokenization round as ONE token: `bash -c "bash -c \"echo hi\""` -> `bash -c "echo hi"`,
       // exactly the script the inner bash would receive. Before this, `\"` inside a double-quoted run
       // closed the quote early and shredded the nested script into several tokens.
-      buf += ch; inWord = true;
+      buf += ch; tailClose = 0; inWord = true;
       continue;
     }
     // $'...' ANSI-C quoting and $"..." locale quoting: the `$` is consumed by the quote, not part of the
@@ -101,12 +102,24 @@ export function words(segment) {
       quote = s[i + 1]; ansiC = s[i + 1] === "'"; i++; inWord = true; continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
-    if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
+    if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; tailClose = 0; i++; inWord = true; continue; }
     if (/\s/.test(ch)) {
       if (inWord) { out.push(buf); buf = ""; inWord = false; }
       continue;
     }
     buf += ch; inWord = true;
+    tailClose = ch === ")" ? tailClose + 1 : 0;
+  }
+  // A subshell's closing paren rides the last word (`(cat .env)` -> `.env)`), which defeats every `$`-anchored path
+  // test. Drop unquoted trailing `)` the word does not itself open, but only when the segment is a subshell body (it
+  // opens with `(`, or has more `)` than `(`): the `)` closing a `$(...)` inside an argument list stays put.
+  if (inWord && tailClose > 0) {
+    const all = [...out, buf];
+    const count = (re) => all.reduce((acc, t) => acc + (t.match(re) || []).length, 0);
+    const open = (buf.match(/\(/g) || []).length;
+    const close = (buf.match(/\)/g) || []).length;
+    const k = Math.min(tailClose, close - open);
+    if (k > 0 && buf.length > tailClose && (all[0].startsWith("(") || count(/\)/g) > count(/\(/g))) buf = buf.slice(0, -k);
   }
   if (inWord) out.push(buf);
   return out;
