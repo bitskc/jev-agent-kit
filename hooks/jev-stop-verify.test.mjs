@@ -1530,9 +1530,11 @@ test("F1: a >2000-char NON-check command is not sent at all, and the gate still 
   assert.ok(out && out.decision === "block", `a long git commit must not verify: ${JSON.stringify(out)}`);
   assert.match(out.reason, /VERIFY:/);
 });
-test("F1: a >2000-char non-check whose kept head text contains a check verb is not sent and not a pass", skipNoZod, async () => {
+test("F1: a >2000-char non-check whose kept head text contains a check verb is sent passed:false, never a pass", skipNoZod, async () => {
   const { out, calls } = await verifyOut(editThen([`git commit -m "npm test ${"x".repeat(2500)}"`, "[main abc1234] msg"]));
-  assert.deepEqual(sentChecks(calls), []);
+  const sent = sentChecks(calls);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].passed, false);
   acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `${JSON.stringify(out)}`);
 });
@@ -1582,4 +1584,33 @@ test("F2: 60 checks are capped to 50 and stay chronological; the newest survives
 test("F3: `npm run build && npm test` at exit 0 with a clean summary verifies (no false block)", async () => {
   const { out } = await verifyOut(editThen(["npm run build && npm test", "  12 passing (3s)"]));
   assert.equal(out, null, `${JSON.stringify(out)}`);
+});
+
+// ── honest-path selection: the hook must send every command the server's CHECK_COMMAND counts as a check ──
+test("selection: every real runner invocation the server counts as a check reaches the payload through parseForVerify", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  const runners = [
+    "phpunit", "vendor/bin/phpunit tests/", "rspec", "bundle exec rspec", "mix test", "dotnet test", "gradle test", "./gradlew test",
+    "mvn test", "swift test", "ctest", "bazel test //...", "deno test", "bun test", "pnpm test", "yarn test", "tox", "nox", "pytest",
+    "cargo test", "go test ./...", "npx vitest", "npx jest", "tsc --noEmit", "eslint .", "ruff check .",
+    "docker exec app npm test", "ssh ci npm test", "bash -o pipefail -c 'npm test | tail -5'", "timeout 600 npm test", "xvfb-run npm test",
+  ];
+  let matched = 0;
+  for (const command of runners) {
+    const sent = stopGate.parseForVerify(editThen([command, "ok"])).checks.map((c) => c.command);
+    if (server.CHECK_COMMAND.test(command)) {
+      matched += 1;
+      assert.deepEqual(sent, [command], `server counts \`${command}\` as a check, so the hook must send it`);
+    }
+  }
+  assert.ok(matched >= 25, `the list should mostly be server-recognised runners (matched ${matched})`);
+  // a command neither side counts as a check is never sent
+  assert.deepEqual(stopGate.parseForVerify(editThen(["ls src", "a.js"], ["git status", "clean"])).checks, []);
+});
+test("selection: an honest `phpunit` / `bundle exec rspec` run after an edit verifies end to end (no false block)", async () => {
+  for (const [command, output] of [["phpunit", "OK (12 tests, 30 assertions)"], ["bundle exec rspec", "12 examples, 0 failures"], ["./gradlew test", "BUILD SUCCESSFUL in 3s"], ["dotnet test", "Passed!  - Failed:     0, Passed:    12"]]) {
+    const { out, calls } = await verifyOut(editThen([command, output]));
+    assert.equal(sentChecks(calls).length, 1, command);
+    assert.equal(out, null, `${command}: ${JSON.stringify(out)}`);
+  }
 });

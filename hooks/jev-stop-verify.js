@@ -444,18 +444,21 @@ function parseForVerify(lines) {
       }
     }
   }
-  // Only commands that run a check are sent: the server ignores everything else, and a non-check can never be evidence.
+  // Sent: every command the SERVER counts as a check (CHECK_COMMAND: phpunit, rspec, `bundle exec rspec`, `./gradlew test`,
+  // `docker exec app npm test`, ...) plus every command that runs a check in program position (commandRunsCheck, which
+  // also covers runners the server regex lacks). Anything else the server ignores, so it is never sent.
   const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
     const exitCode = r.isError === null ? undefined : r.isError ? 1 : 0;
-    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) };
-  }).filter((e) => e.check);
+    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command), serverCheck: CHECK_COMMAND.test(b.command) };
+  }).filter((e) => e.check || e.serverCheck);
   const checks = capChecks(evidence).map((e) => {
     const check = { command: capMiddle(e.command, CHECK_COMMAND_CAP), output: e.output.slice(-4000), exit_code: e.exitCode };
     // The server reads a masked exit from the command text, which the cap can cut, so a cut command carries the outcome
-    // decided on the whole command: passed:true only on a full pass, passed:false otherwise (a fail, or an unknown the
-    // cut text could otherwise turn into a pass). `passed` is in every deployed schema; no newer wire field is needed.
-    if (check.command !== e.command) check.passed = e.outcome === 'pass';
+    // decided on the whole command. passed:true only on a full pass of a command that runs a check in program position;
+    // otherwise passed:false (a fail, an unknown the cut text could turn into a pass, or a CHECK_COMMAND match that is
+    // not a program, like a verb inside `git commit -m "npm test ..."`). `passed` is in every deployed schema.
+    if (check.command !== e.command) check.passed = e.check && e.outcome === 'pass';
     return check;
   });
   return {
