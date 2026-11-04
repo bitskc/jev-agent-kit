@@ -66,9 +66,70 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["cd api || npm test 2>&1 | tail -20", "  12 passing (3s)", 0],
     ["npm test >log | tail -5", "  12 passing (3s)", 0],
     ["npm test 2>&1 | tail -20 forged.log", "  12 passing (3s)", 0],
+    // round 20 (F3 && chains and ;-lists, F4 quoted operators, F5 passing titles, F7 || and !, F8 head)
+    ["npm run build && npm test", "  12 passing (3s)", 0],
+    ["npm ci && npm test", "  12 passing (3s)", 0],
+    ["make clean && make test", "  12 passing (3s)", 0],
+    ["cargo build && cargo test", "test result: ok. 5 passed; 0 failed", 0],
+    ["go build ./... && go test ./...", "ok  \tpkg\t0.1s", 0],
+    ["npm test && echo OK", "  12 passing (3s)\nOK", 0],
+    ["npx tsc --noEmit && echo TSC OK", "TSC OK", 0],
+    ["rm -rf dist && npm run build && npm test", "  12 passing (3s)", 0],
+    ["npm run build && npm test", "  12 passing (3s)", 1],
+    ["npm test &&\n  echo OK", "  12 passing (3s)\nOK", 0],
+    ["echo hi; npm test", "  12 passing (3s)", 0],
+    ["# run the suite\nnpm test", "  12 passing (3s)", 0],
+    ["npm test\n# done", "  12 passing (3s)", 0],
+    ["cd api; npm test", "  12 passing (3s)", 0],
+    ["npm test\necho done", "  12 passing (3s)", 0],
+    ["npm test; npm run lint", "  12 passing (3s)", 0],
+    ["npm test; cd api", "  12 passing (3s)", 0],
+    ["npm test | cat", "  12 passing (3s)", 0],
+    ["npm test $(git diff --name-only)", "  12 passing (3s)", 0],
+    ['pytest -k "a and (b or c)"', "  12 passing (3s)", 0],
+    ["pytest -k 'not (slow or db)'", "  12 passing (3s)", 0],
+    ['npx jest -t "adds (two) numbers"', "  12 passing (3s)", 0],
+    ['npx vitest run -t "handles a;b"', "  12 passing (3s)", 0],
+    ["npm test -- -t 'x && y'", "  12 passing (3s)", 0],
+    ['npm test -- --grep "a|b"', "  12 passing (3s)", 0],
+    ['npm test -- -t "a & b"', "  12 passing (3s)", 0],
+    ['cd api && npm test -- -t "(x)"', "  12 passing (3s)", 0],
+    ['npm test -- -t "say \\"hi\\" (twice)"', "  12 passing (3s)", 0],
+    ["npm test -- -t 'it''s (fine)'", "  12 passing (3s)", 0],
+    ['FOO="a b" npm test', "  12 passing (3s)", 0],
+    ["# don't panic\nnpm test", "  12 passing (3s)", 0],
+    ['npm test -- -t "$(git diff)"', "  12 passing (3s)", 0],
+    ['npm test -- -t "`id`"', "  12 passing (3s)", 0],
+    ["npm test -- -t 'oops", "  12 passing (3s)", 0],
+    ['npm test -- -t "oops', "  12 passing (3s)", 0],
+    ["npm test -- -t 'a || b'", "  12 passing (3s)", 0],
+    ["bash -o pipefail -c 'npm test; echo hi'", "  12 passing (3s)", 0],
+    ["bash -o pipefail -c 'npm test | tail -5' ; echo x", "  12 passing (3s)", 0],
+    ["/bin/bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0],
+    ["eval 'npm test || true'", "  12 passing (3s)", 0],
+    ["ssh host 'npm test; echo done'", "  12 passing (3s)", 0],
+    ["sh -ec 'npm test || true'", "  12 passing (3s)", 0],
+    ["npm test", "  ✔ retries after 3 failed attempts\n\n  12 passing (3s)", 0],
+    ["npm test", "  ✓ exited with code 1 on bad flag\n\n  12 passing (3s)", 0],
+    ["npm test", "  ✓ exits with code 1 on bad flag\n\n  12 passing (3s)", 0],
+    ["npx jest --verbose", "  ✓ handles 2 failed logins\nTests: 12 passed, 12 total", 0],
+    ["npm test", "PASS src/a.test.js\n  √ rejects 4 failed requests\n  ok 2 failed over\n  12 passing", 0],
+    ["npm test", "  ✔ retries after 3 failed attempts\n\n  11 passing\n  1 failing", 0],
+    ["npx mocha 2>&1 | tail -3", "  1 failing", 0],
+    ["npx jest", "  ✓ handles 2 failed logins\nTests: 1 failed, 11 passed, 12 total", 0],
+    ["npm test", "  ✓ ok\nFAIL src/b.test.js", 0],
+    ["cd api || npm test", "  12 passing (3s)", 0],
+    ["export X=1 || npm test", "  12 passing (3s)", 0],
+    ["! npm test", "  12 passing (3s)", 0],
+    ["cd api && ! npm test", "  12 passing (3s)", 0],
+    ["npm test 2>&1 | head -5", "  12 passing (3s)", 0],
+    ["npm test | head", "  12 passing (3s)", 0],
+    ["npm test |& tail -20", "  12 passing (3s)", 0],
   ];
+  assert.equal(hook.CHECK_COMMAND.source, server.CHECK_COMMAND.source, "CHECK_COMMAND copy");
   for (const [command, output, exit] of cases) {
     assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);
+    assert.equal(hook.exitIsMasked(command), server.exitIsMasked(command), `exitIsMasked ${command}`);
     assert.equal(hook.checkSummary(output), server.checkSummary(output), `checkSummary ${JSON.stringify(output)}`);
   }
 });
@@ -1402,4 +1463,71 @@ test("#44: file_changes above the schema's 100000 cap is clamped, not sent over-
   const lines = [userPrompt("Fix it.")];
   for (let i = 0; i < 100005; i++) lines.push(assistantToolUse("e" + i, "Edit", { file_path: "x.js" }));
   assert.equal(stopGate.parseForVerify(lines).fileChanges, 100000);
+});
+
+// ── PR #31 round-20 review regressions (F1, F2, F3, F6): data-only; commands are text, never executed ──
+const editThen = (...bash) => [userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok"),
+  ...bash.flatMap(([command, output, isError = false], i) => [assistantToolUse("b" + i, "Bash", { command }), toolResult("b" + i, output, isError)])];
+const sentChecks = (calls) => calls.find((c) => c.name === "kit_verify_done").arguments.checks;
+const verifyOut = async (lines, message = "Done, all tests pass.") => {
+  fresh(); setBaseEnv({ gate: "verify" });
+  const { fetchImpl, calls } = stubFetch(serverPathPR30(standInClassifier));
+  const out = await stopGate.decide({ transcript_path: writeTranscript(lines), last_assistant_message: message }, { fetchImpl });
+  return { out, calls };
+};
+test("F1: a >2000-char NON-check command at exit 0 is not a pass override, and the gate still blocks", async () => {
+  const { out, calls } = await verifyOut(editThen([`git commit -m "${"x".repeat(2500)}"`, "[main abc1234] msg"]));
+  const sent = sentChecks(calls);
+  assert.equal(sent.length, 1);
+  assert.notEqual(sent[0].passed, true);
+  assert.ok(out && out.decision === "block", `a long git commit must not verify: ${JSON.stringify(out)}`);
+  assert.match(out.reason, /VERIFY:/);
+});
+test("F1: a >2000-char non-check whose kept head text contains a check verb is still not a pass", async () => {
+  const { out } = await verifyOut(editThen([`git commit -m "npm test ${"x".repeat(2500)}"`, "[main abc1234] msg"]));
+  assert.ok(out && out.decision === "block", `${JSON.stringify(out)}`);
+});
+test("F6: a >2000-char check whose full outcome is unknown is sent passed:false + unproven, and the gate blocks", async () => {
+  const command = "npm test " + "x ".repeat(600) + "; echo done; " + "y ".repeat(600);
+  assert.ok(command.length > 2000);
+  const { out, calls } = await verifyOut(editThen([command, "  12 passing (3s)"]));
+  const sent = sentChecks(calls);
+  assert.equal(sent[0].passed, false);
+  assert.equal(sent[0].unproven, true);
+  assert.ok(out && out.decision === "block", `the cut text lost the mask, the full command did not: ${JSON.stringify(out)}`);
+});
+test("F6: a cut check that failed is passed:false without unproven; a cut check that passed keeps passed:true", () => {
+  const pad = "X=1 ".repeat(800);
+  const failed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  1 failing", true])).checks[0];
+  assert.equal(failed.passed, false);
+  assert.equal(failed.unproven, undefined);
+  const passed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  12 passing (3s)"])).checks[0];
+  assert.equal(passed.passed, true);
+  assert.equal(passed.unproven, undefined);
+});
+test("F2: 55 non-check commands after a passing `npm test` do not evict it (no false block)", async () => {
+  const noise = Array.from({ length: 55 }, () => ["ls src", "a.js\nb.js"]);
+  const { out, calls } = await verifyOut(editThen(["npm test", "  12 passing (3s)"], ...noise));
+  const sent = sentChecks(calls);
+  assert.equal(sent.length, 50);
+  assert.ok(sent.some((c) => c.command === "npm test"), "the passing check was evicted by noise");
+  assert.equal(out, null, `a passing check followed by noise must verify: ${JSON.stringify(out)}`);
+});
+test("F2: 55 non-check pipelines after a FAILING `npm test` do not evict the failing run", async () => {
+  const noise = Array.from({ length: 55 }, () => ["git log | head", "abc commit"]);
+  const { calls } = await verifyOut(editThen(["npm test", "  1 failing", true], ...noise));
+  const sent = sentChecks(calls);
+  assert.equal(sent.length, 50);
+  assert.ok(sent.some((c) => c.command === "npm test" && c.exit_code === 1), "the failing check was evicted by noise");
+});
+test("F2: ordering after the cap stays chronological, checks ahead of non-checks", () => {
+  const lines = editThen(["npm test", "  12 passing (3s)"], ...Array.from({ length: 60 }, (_, i) => ["ls dir" + i, "x"]), ["npm run lint", "ok"]);
+  const sent = stopGate.parseForVerify(lines).checks;
+  assert.equal(sent.length, 50);
+  assert.equal(sent[0].command, "npm test");
+  assert.equal(sent.at(-1).command, "npm run lint");
+});
+test("F3: `npm run build && npm test` at exit 0 with a clean summary verifies (no false block)", async () => {
+  const { out } = await verifyOut(editThen(["npm run build && npm test", "  12 passing (3s)"]));
+  assert.equal(out, null, `${JSON.stringify(out)}`);
 });

@@ -125,57 +125,125 @@ function executesCheck(unit) {
 // Failure text a runner prints. Matched before any pass signal and regardless of exit status.
 const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
 const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
+// A runner's passing-test title line (mocha/jest `✓`/`✔`/`√`, jest `PASS`, TAP `ok`): its words are test names, not results.
+const PASSING_TITLE = /^\s*(?:[✓✔√]|PASS\b|ok\b)/;
+// Same regex as server/src/kit/verify.mjs CHECK_COMMAND (parity-tested): decides which list group holds the check.
+const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
 /**
- * Prefix elements (cd, pushd, popd, export, set, unset, source, env assignments) are transparent: the recorded
- * status is the last command's, so `cd api && npm test` reports npm test's own status. Once a real command has
- * appeared, a following `;`, `&&`, or `||` element, a subshell, command substitution, a nested `sh -c` (also
- * path-qualified, ksh, zsh, dash), a background `&`, or a bare `|` without pipefail masks the status. pipefail is
- * on when the last `set -o`/`set +o pipefail` prefix element sets it (`-eo`/`-euo` too). A leading
- * `bash -o pipefail -c` carries it into the body only when no pipe sits outside it. Quoted text is ignored.
+ * The exit status a Bash call reports is the status of the last command the shell ran. `exitIsMasked` decides whether
+ * a recorded exit 0 can be attributed to the check. Quoted text is data: every quoted span is blanked first by one
+ * quote-aware scan (`stripQuoted`), and all structure tests run on that blanked text.
+ *
+ * Prefix elements (cd, pushd, popd, export, set, unset, source, env assignments) are transparent. An `&&` chain that
+ * exits 0 proves every element succeeded, so it is trusted whole (`npm run build && npm test`, `npm test && echo OK`).
+ * A `;` / newline list reports only its LAST group's status: it is trusted only when the check sits in that last group
+ * and no earlier group holds a check (`echo hi; npm test` yes, `npm test ; echo done` no). Always masked: any `||`, a
+ * leading `!`, a subshell or command substitution, a nested `sh -c` (also path-qualified, ksh, zsh, dash), a background
+ * `&`, an unterminated quote, and a bare `|` without pipefail. pipefail is on when the last `set -o`/`set +o pipefail`
+ * prefix element sets it (`-eo`/`-euo` too). A whole-command `bash -o pipefail -c '<body>'` is judged on its body with
+ * pipefail on; a pipe outside the wrapper, or anything after it, masks.
  */
 const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
-const LIST_SPLIT = /;|&&|\|\||\n/;
-const QUOTED = /'[^']*'|"[^"]*"/g;
 const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
-const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:ba|z|da|k)?sh\s+(?:-\S+\s+)*-\w*c\b/;
+const BARE_PIPE = /(?<!\|)\|(?!\|)/;
+// A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order) or a command that runs a quoted string as
+// code (eval, exec, ssh, su, xargs, watch, script, parallel, docker, podman, kubectl, nsenter, chroot, runuser): the
+// quoted body is hidden from the scan, so its status is never attributable.
+const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$))/;
 const SET_PIPEFAIL_OP = /(?:^|\s)([-+])[A-Za-z]*o\s+pipefail(?=\s|$)/g;
 const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
-function pipefailOn(unquoted) {
-  // A bash wrapper carries pipefail into its -c body; a pipe outside the wrapper is not covered by it.
-  if (BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return !/(?<!\|)\|(?!\|)/.test(unquoted);
-  let on = false;
-  for (const s of unquoted.split(LIST_SPLIT).map((x) => x.trim()).filter(Boolean)) {
+const PIPEFAIL_WRAPPER_WHOLE = /^bash\s+-o\s+pipefail\s+-c\s+(?:'([^']*)'|"((?:[^"\\$`]|\\.)*)")$/;
+/**
+ * One quote-aware scan shared by every structure test. Returns the command with each quoted span replaced by `''`,
+ * each backslash-escaped character outside quotes by `_`, and whole-line `#` comments removed; or null when the text
+ * cannot be read safely (an unterminated quote, or `$(` / a backtick inside double quotes, which still execute).
+ * Single quotes hold no escapes; double quotes honour `\"`; `$'...'` honours backslash escapes.
+ */
+function stripQuoted(command) {
+  let out = "";
+  let lineStart = true;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "\n") { out += ch; lineStart = true; continue; }
+    if (lineStart && ch === "#") { const nl = command.indexOf("\n", i); if (nl === -1) break; i = nl - 1; continue; }
+    if (ch !== " " && ch !== "\t") lineStart = false;
+    if (ch === "\\") { if (i + 1 < command.length) { out += command[i + 1] === "\n" ? " " : "_"; i++; } continue; }
+    if (ch === "'") {
+      const ansiC = command[i - 1] === "$";
+      let j = i + 1;
+      while (j < command.length && command[j] !== "'") j += ansiC && command[j] === "\\" ? 2 : 1;
+      if (j >= command.length) return null;
+      out += "''"; i = j; continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === "\\") j += 2;
+        else if (command[j] === "`" || (command[j] === "$" && command[j + 1] === "(")) return null;
+        else j += 1;
+      }
+      if (j >= command.length) return null;
+      out += "''"; i = j; continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+/** Splits blanked text into `;`/newline-separated groups of `&&`-joined elements (`&&` then newline continues the chain). */
+function listGroups(norm) {
+  const groups = [];
+  let cur = [];
+  for (const piece of norm.replace(/&&\s*\n\s*/g, "&& ").split(/(;|&&|\n)/)) {
+    if (piece === "&&") continue;
+    if (piece === ";" || piece === "\n") { if (cur.length) groups.push(cur); cur = []; continue; }
+    const s = piece.trim();
+    if (s) cur.push(s);
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
+function pipefailOn(norm, preset) {
+  let on = preset;
+  for (const s of listGroups(norm).flat()) {
     if (!PREFIX_SEGMENT.test(s)) break;
     if (/^set(?=\s|$)/.test(s)) for (const m of s.matchAll(SET_PIPEFAIL_OP)) on = m[1] === "-";
   }
   return on;
 }
-function exitIsMasked(command) {
-  if (UNATTRIBUTABLE.test(command)) return true;
-  const unquoted = command.replace(QUOTED, "''");
-  if (NESTED_SHELL_C.test(unquoted) && !BASH_PIPEFAIL_WRAPPER.test(unquoted.trim())) return true;
-  if (/(?<!\|)\|(?!\|)/.test(command) && !pipefailOn(unquoted)) return true;
-  const segments = command.split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
-  const first = segments.findIndex((s) => !PREFIX_SEGMENT.test(s));
-  if (first === -1) return true;
-  return first < segments.length - 1;
+function exitIsMasked(command, pipefail = false) {
+  const trimmed = command.trim();
+  if (BASH_PIPEFAIL_WRAPPER.test(trimmed)) {
+    const whole = PIPEFAIL_WRAPPER_WHOLE.exec(trimmed);
+    return whole ? exitIsMasked(whole[1] ?? whole[2], true) : true;
+  }
+  const norm = stripQuoted(command);
+  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || NESTED_SHELL_C.test(norm)) return true;
+  if (BARE_PIPE.test(norm) && !pipefailOn(norm, pipefail)) return true;
+  const groups = listGroups(norm);
+  if (groups.flat().some((s) => /^!(?:\s|$)/.test(s))) return true;
+  const real = groups.map((g) => g.filter((s) => !PREFIX_SEGMENT.test(s)));
+  const withCommand = real.filter((g) => g.length);
+  if (!withCommand.length || !real[real.length - 1].length) return true;
+  if (withCommand.length === 1) return false;
+  const holdsCheck = (g) => g.some((s) => CHECK_COMMAND.test(s));
+  return withCommand.slice(0, -1).some(holdsCheck) || !holdsCheck(real[real.length - 1]);
 }
-const TAIL_HEAD_ARGS = /^\s*(?:tail|head)(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
+const TAIL_ARGS = /^\s*tail(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
 const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
 /**
- * A pass summary may stand in for a masked exit only when the sole mask is one bare pipe into `tail` or `head`:
- * the check's own stdout is not redirected, no `||` appears, nothing follows the pipe, and the left side is the
- * check command preceded only by prefix elements. Any other mask (a trailing segment, a redirect, a second pipe,
- * a filter) could print a summary the check did not produce, so it stays unknown.
+ * A pass summary may stand in for a masked exit only when the sole mask is one bare pipe into `tail`: the check's own
+ * stdout is not redirected, no `||` appears, nothing follows the pipe, and the left side is the check command preceded
+ * only by prefix elements. `head` is not trusted (it can cut the failing line off the end); any other mask (a trailing
+ * segment, a redirect, a second pipe, a filter) could print a summary the check did not produce, so it stays unknown.
  */
 function maskedByTailPipeOnly(command) {
-  if (UNATTRIBUTABLE.test(command)) return false;
-  const unquoted = command.replace(QUOTED, "''");
-  if (unquoted.includes("||") || />/.test(unquoted.replace(FD_MERGE_STDERR, ""))) return false;
-  if (NESTED_SHELL_C.test(unquoted)) return false;
-  const parts = unquoted.split(/(?<!\|)\|(?!\|)/);
-  if (parts.length !== 2 || !TAIL_HEAD_ARGS.test(parts[1])) return false;
-  const segs = parts[0].split(LIST_SPLIT).map((s) => s.trim()).filter(Boolean);
+  const norm = stripQuoted(command);
+  if (norm === null || UNATTRIBUTABLE.test(norm)) return false;
+  if (norm.includes("||") || />/.test(norm.replace(FD_MERGE_STDERR, ""))) return false;
+  if (NESTED_SHELL_C.test(norm)) return false;
+  const parts = norm.split(BARE_PIPE);
+  if (parts.length !== 2 || !TAIL_ARGS.test(parts[1])) return false;
+  const segs = listGroups(parts[0]).flat();
   if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
   return segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s));
 }
@@ -184,7 +252,9 @@ function checkSummary(output) {
   if (typeof output !== 'string' || !output) return undefined;
   const tail = output.slice(-6000);
   // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER).
-  if (FAILURE_MARKER.test(tail) || EXIT_MENTION.test(tail)) return 'fail';
+  // A passing test's own title ("✔ retries after 3 failed attempts") is not a failure signal; the summary lines decide.
+  const scan = tail.split('\n').filter((l) => !PASSING_TITLE.test(l)).join('\n');
+  if (FAILURE_MARKER.test(scan) || EXIT_MENTION.test(scan)) return 'fail';
   const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
   if (nodeTest) return Number(nodeTest[1]) > 0 ? 'fail' : 'pass';
   const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
@@ -307,11 +377,12 @@ function keepTail(s, max) {
   const marker = '…[earlier text cut]…\n';
   return marker + s.slice(s.length - (max - marker.length));
 }
-// Keeps the most recent check, then non-pass runs (most recent first), then passes; restores chronological order.
+// Keeps the most recent check command, then non-pass check runs (most recent first), then passing checks, then
+// non-check commands (most recent first); restores chronological order. Non-checks never evict a real check run.
 function capChecks(list) {
   if (list.length <= CHECKS_CAP) return list;
-  const last = list.length - 1;
-  const rank = (i) => (i === last ? 0 : list[i].outcome === 'pass' ? 2 : 1);
+  const lastCheck = list.map((e) => e.check).lastIndexOf(true);
+  const rank = (i) => (!list[i].check ? 3 : i === lastCheck ? 0 : list[i].outcome === 'pass' ? 2 : 1);
   const kept = list.map((_, i) => i).sort((a, b) => rank(a) - rank(b) || b - a).slice(0, CHECKS_CAP);
   return kept.sort((a, b) => a - b).map((i) => list[i]);
 }
@@ -361,12 +432,17 @@ function parseForVerify(lines) {
   const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
     const exitCode = r.isError === null ? undefined : r.isError ? 1 : 0;
-    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode) };
+    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) };
   });
   const checks = capChecks(evidence).map((e) => {
     const check = { command: capMiddle(e.command, CHECK_COMMAND_CAP), output: e.output.slice(-4000), exit_code: e.exitCode };
-    // The server reads a masked exit from the command text, which the cap can cut: send the outcome decided on the whole command.
-    if (check.command !== e.command && e.outcome !== 'unknown') check.passed = e.outcome === 'pass';
+    // The server reads a masked exit from the command text, which the cap can cut, so a cut command carries the outcome
+    // decided on the whole command. A pass override goes only to a command that runs a check; a cut command whose full
+    // outcome is not a pass (or that is no check, which the cut text could otherwise pass as one) is sent as unproven.
+    if (check.command !== e.command) {
+      check.passed = e.check && e.outcome === 'pass';
+      if (e.outcome === 'unknown' || !e.check) check.unproven = true;
+    }
     return check;
   });
   return {
@@ -937,4 +1013,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS, runOutcome, checkSummary };
+module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS, runOutcome, checkSummary, exitIsMasked, CHECK_COMMAND };
