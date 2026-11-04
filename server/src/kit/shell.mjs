@@ -68,13 +68,21 @@ const RUNUSER_VALUE_OPTS = new Set(["-u", "--user", "-s", "--shell", "-g", "--gr
  *  quote is tracked at a time (no nesting), and deliberately permissive about an obfuscated quote char
  *  landing inside a word -- for a security prefilter, collapsing is the safer failure mode than preserving
  *  an exotic literal. */
+// Words after which a `(` opens a grouping subshell (`if (cmd)`, `{ (cmd); }`, `! (cmd)`) rather than continuing the word.
+const PAREN_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "time", "coproc", "select", "{", "!"]);
 export function words(segment) {
   const out = [];
   let buf = "";
   let quote = null;
   let ansiC = false; // inside a $'...' ANSI-C quoted run: bash decodes \xNN/\n/\t/... escapes
   let inWord = false;
-  let tailClose = 0; // unquoted `)` characters at the very end of buf
+  // Grouping parens (`( cmd )`, `if (cmd)`, `{ (cmd); }`) are word separators and come out as their own `(` / `)` tokens,
+  // so a subshell body is tokenized like the bare command (`(cat .env) 2>&1` -> `(` `cat` `.env` `)` `2>&1`). A paren stays
+  // glued to its word where it is part of the word: `$(`/`<(`/`>(`/`=(` and extglob openers (and every paren up to their
+  // match), `f()` function heads, a `case` pattern after `in`, and a `case` label `a)` that is followed by its command.
+  let substDepth = 0; // open parens that belong to a `$(...)`-style construct
+  let casePat = false; // inside a `(pattern)` right after `in`
+  const flush = () => { if (inWord) { out.push(buf); buf = ""; inWord = false; } };
   const s = segment || "";
   const n = s.length;
   for (let i = 0; i < n; i++) {
@@ -83,17 +91,17 @@ export function words(segment) {
       if (ch === quote) { quote = null; ansiC = false; continue; }
       if (ansiC && ch === "\\" && i + 1 < n) {
         const [decoded, len] = ansiEscape(s.slice(i));
-        buf += decoded; tailClose = 0; i += len - 1; inWord = true; continue; // for-loop continue still runs i++
+        buf += decoded; i += len - 1; inWord = true; continue; // for-loop continue still runs i++
       }
       if (ch === "\\" && quote === '"' && i + 1 < n && '"\\$`'.includes(s[i + 1])) {
-        buf += s[i + 1]; tailClose = 0; i++; inWord = true; continue;
+        buf += s[i + 1]; i++; inWord = true; continue;
       }
       // Inside double quotes bash only unescapes \" \\ \$ \` (and \newline); every other backslash
       // pair stays literal. Dequoting the four real escapes is what makes a nested -c script survive one
       // more tokenization round as ONE token: `bash -c "bash -c \"echo hi\""` -> `bash -c "echo hi"`,
       // exactly the script the inner bash would receive. Before this, `\"` inside a double-quoted run
       // closed the quote early and shredded the nested script into several tokens.
-      buf += ch; tailClose = 0; inWord = true;
+      buf += ch; inWord = true;
       continue;
     }
     // $'...' ANSI-C quoting and $"..." locale quoting: the `$` is consumed by the quote, not part of the
@@ -102,26 +110,33 @@ export function words(segment) {
       quote = s[i + 1]; ansiC = s[i + 1] === "'"; i++; inWord = true; continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
-    if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; tailClose = 0; i++; inWord = true; continue; }
-    if (/\s/.test(ch)) {
-      if (inWord) { out.push(buf); buf = ""; inWord = false; }
+    if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
+    if (/\s/.test(ch)) { flush(); continue; }
+    if (ch === "(") {
+      // A `(` right after a word that is not a shell keyword is not shell grouping (`name(` is a function head or an
+      // interpreter call such as `console.log(process.env.HOME)` inside a `node -e` payload): it stays in the word.
+      if (substDepth > 0 || (inWord && !PAREN_KEYWORDS.has(buf))) {
+        substDepth++; buf += ch; inWord = true; continue;
+      }
+      if (!inWord && out[out.length - 1] === "in") { casePat = true; buf += ch; inWord = true; continue; }
+      flush(); out.push("(");
+      continue;
+    }
+    if (ch === ")") {
+      if (substDepth > 0) { substDepth--; buf += ch; inWord = true; continue; }
+      if (casePat && inWord) { casePat = false; buf += ch; continue; }
+      // A word with a glued `)` is a case label when its command follows it; otherwise it is the closer of a subshell (the
+      // opener may sit in an earlier segment: `(echo hi; cat .env)` splits at the `;`). A closer after a `(` token is
+      // never first in the segment, so only a label can be.
+      const label = inWord && (out[out.length - 1] === "in" ||
+        (out.length === 0 && /^\s*\S/.test(s.slice(i + 1)) && !/^\s*(?:\d*[<>]|#|\)|&)/.test(s.slice(i + 1))));
+      if (label) { buf += ch; continue; }
+      flush(); out.push(")");
       continue;
     }
     buf += ch; inWord = true;
-    tailClose = ch === ")" ? tailClose + 1 : 0;
   }
-  // A subshell's closing paren rides the last word (`(cat .env)` -> `.env)`), which defeats every `$`-anchored path
-  // test. Drop unquoted trailing `)` the word does not itself open, but only when the segment is a subshell body (it
-  // opens with `(`, or has more `)` than `(`): the `)` closing a `$(...)` inside an argument list stays put.
-  if (inWord && tailClose > 0) {
-    const all = [...out, buf];
-    const count = (re) => all.reduce((acc, t) => acc + (t.match(re) || []).length, 0);
-    const open = (buf.match(/\(/g) || []).length;
-    const close = (buf.match(/\)/g) || []).length;
-    const k = Math.min(tailClose, close - open);
-    if (k > 0 && buf.length > tailClose && (all[0].startsWith("(") || count(/\)/g) > count(/\(/g))) buf = buf.slice(0, -k);
-  }
-  if (inWord) out.push(buf);
+  flush();
   return out;
 }
 

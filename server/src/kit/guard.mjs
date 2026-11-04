@@ -202,52 +202,72 @@ const TAIL_TRIE = (() => {
   }
   return root;
 })();
-// Number of literal units in c[from..from+s.length) if every unit accepts s, else -1.
+// Leading-dot rule (bash without dotglob): a wildcard (`?`, `[...]`, `*`) in a component's first position never matches the
+// dot that opens a hidden name; every other position matches any character but `/`.
+const acc = (c, i, ch) => unitAccepts(c[i], ch) && !(i === 0 && ch === "." && !lit(c[i]));
+// Number of literal units in c[from..from+s.length) if every unit can spell s there, else -1.
 function headMatch(c, s, from = 0) {
   if (from + s.length > c.length) return -1;
   let n = 0;
   for (let k = 0; k < s.length; k++) {
-    const u = c[from + k];
-    if (lit(u)) { if (u !== s[k]) return -1; n++; } else if (!unitAccepts(u, s[k])) return -1;
+    if (!acc(c, from + k, s[k])) return -1;
+    if (lit(c[from + k])) n++;
   }
   return n;
 }
-// A whole component equals `name`; at least one unit is literal, and a hidden name's dot is literal.
+// A whole component can spell `name`: 0 = no, 1 = only through wildcards alone, 2 = at least one literal unit fixes it.
 function nameMatch(c, name) {
-  if (c.length !== name.length || (name[0] === "." && c[0] !== ".")) return false;
-  return headMatch(c, name) > 0;
+  if (c.length !== name.length) return 0;
+  const n = headMatch(c, name);
+  return n < 0 ? 0 : n > 0 ? 2 : 1;
 }
-const anyName = (c, idx) => (idx.get(c.length) ?? []).some((n) => nameMatch(c, n));
+const anyName = (c, idx) => (idx.get(c.length) ?? []).reduce((v, n) => Math.max(v, nameMatch(c, n)), 0);
 // `(\.[chain]+)*` after a fixed stem: nothing, or a `.` followed by one or more chain characters.
 function chainFrom(c, from, alphabet) {
   const rest = c.length - from;
   if (rest === 0) return true;
-  if (rest < 2 || !unitAccepts(c[from], ".")) return false;
+  if (rest < 2 || !acc(c, from, ".")) return false;
   for (let i = from + 1; i < c.length; i++) if (!unitInAlpha(c[i], alphabet)) return false;
   return true;
 }
 const credDotName = (c) => c[0] === "." && headMatch(c, ".credentials") > 0 && (c.length === 12 || unitInAlpha(c[12], ".-"));
-// 2 = the component names a secret store, 1 = it might (ask), 0 = no. A star-free component (wildcards are one unit).
+// A store with a stem (`server.pem`, `x.env`) needs a stem that can end in a name character: a stem that ends in a literal
+// `-`, `_` or `.` (`report-` + `.pem`) is not a realistic store, so a glob that only reaches it through wildcards (`report-????`)
+// names nothing. A stem ending in a wildcard (`server?` + `.pem`) or a letter (`server` + `????`) can be one.
+const stemOk = (c, si) => si >= 1 && !(lit(c[si - 1]) && "-_.".includes(c[si - 1]));
+// What a star-free component can be: 2 = it names a secret store (some literal unit fixes it), 1 = it can spell one through
+// wildcards that bash may expand to it (ask), 0 = no. A component made only of wildcards is a width pattern, not a name
+// (`cat ??????` may be `id_rsa` but nothing ties it to a store), so it is 0; a literal anywhere in it ties it down.
 function basenameVerdict(c) {
-  if (anyName(c, BASENAME_IDX)) return 2;
-  let v = 0;
+  if (!c.some(lit)) return 0;
   const L = c.length;
+  let v = anyName(c, BASENAME_IDX) === 2 ? 2 : 0;
+  if (v === 2) return 2;
+  // dotenv family `X.env`, `.env`, `.env.local`: the `.env` may sit after any stem.
   for (let i = 0; i + 4 <= L; i++) {
-    if (c[i] !== ".") continue;
+    if (!acc(c, i, ".")) continue;
     const n = headMatch(c, ".env", i);
     if (n < 0 || !chainFrom(c, i + 4, ENV_CHAIN)) continue;
-    if (i === 0 || n > 1) return 2;
-    v = 1;
+    if (i === 0 || (lit(c[i]) && n > 1)) return 2;
+    if (stemOk(c, i) || lit(c[i])) v = 1;
   }
   if (c[0] === "." && headMatch(c, ".dev.vars") > 0 && chainFrom(c, 9, ENV_CHAIN)) return 2;
   for (const k of ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"]) {
-    if (headMatch(c, k) <= 0) continue;
-    if (L === k.length) return 2;
-    if (L >= k.length + 2 && unitAccepts(c[k.length], "_") && c.slice(k.length + 1).every((u) => unitInAlpha(u, KEY_CHAIN))) return 2;
+    const n = headMatch(c, k);
+    if (n < 0) continue;
+    const chain = L >= k.length + 2 && acc(c, k.length, "_") && c.slice(k.length + 1).every((u) => unitInAlpha(u, KEY_CHAIN));
+    // (all-wildcard first six characters plus a `_x` chain is also a dotenv spelling, which asks above)
+    if ((L === k.length || chain) && n > 0) return 2;
   }
-  if (L >= 20 && headMatch(c, "service") > 0 && (unitAccepts(c[7], "-") || unitAccepts(c[7], "_")) && headMatch(c, "account", 8) >= 0 && c[L - 5] === "." && headMatch(c, "json", L - 4) >= 0) return 2;
+  // service[-_]account[^/]*.json: the `.` before `json` may be a wildcard (`service-account?json`)
+  if (L >= 20 && headMatch(c, "service") >= 0 && (acc(c, 7, "-") || acc(c, 7, "_")) && headMatch(c, "account", 8) >= 0 && acc(c, L - 5, ".") && headMatch(c, "json", L - 4) >= 0) {
+    if (lit(c[L - 5]) && headMatch(c, "service") > 0) return 2;
+    v = 1;
+  }
   if (credDotName(c)) return 2;
-  // tails: the separator is literal; letters spelled only by wildcards (`mykey.???`) ask instead of blocking
+  // Tails (`.pem`, `.key`, `.p12`, `.tfstate`, `-credentials.json`, ...) from the end of the component. A literal separator
+  // with a literal letter blocks. Anything else the wildcards can spell asks: a literal separator with letters spelled only by
+  // wildcards (`mykey.???`), or a wildcard separator behind a stem that can be a name (`server?p?m`, `tls????`, `cert??12`).
   const walk = (node, depth) => {
     if (v === 2) return;
     if (node.end) {
@@ -255,15 +275,14 @@ function basenameVerdict(c) {
       const sepLit = lit(c[si]);
       let letters = 0;
       for (let j = si + 1; j < L; j++) if (lit(c[j])) letters++;
-      // literal separator and a literal letter blocks; a wildcard separator (`tls?key`) with every letter literal, or
-      // letters spelled only by wildcards after a literal separator (`mykey.???`), asks; `report-????` names nothing
       if (sepLit) v = Math.max(v, letters > 0 ? 2 : 1);
-      else if (letters === L - si - 1) v = Math.max(v, 1);
+      else if (si === 0 || stemOk(c, si)) v = Math.max(v, 1);
     }
     if (depth === L) return;
-    const u = c[L - 1 - depth];
+    const idx = L - 1 - depth;
+    const u = c[idx];
     if (lit(u)) { const nx = node.next.get(u); if (nx) walk(nx, depth + 1); }
-    else for (const [ch, nx] of node.next) if (unitAccepts(u, ch)) walk(nx, depth + 1);
+    else for (const [ch, nx] of node.next) if (acc(c, idx, ch)) walk(nx, depth + 1);
   };
   walk(TAIL_TRIE, 0);
   return v;
@@ -273,8 +292,10 @@ const GLOB_TOKEN_MAX = 4096;
 const GLOB_WORK_BUDGET = 40000;
 let globBudget = GLOB_WORK_BUDGET;
 const verdictMemo = new Map();
-// Reset once per guardCommand: the units of work every glob in one command may spend before the guard asks.
-const resetGlobWork = () => { globBudget = GLOB_WORK_BUDGET; verdictMemo.clear(); };
+const compCache = new Map();
+// Reset at the start of every guardCommand, so a decision never depends on an earlier call: the units of work the star
+// expansions of one command may spend before the guard asks, and everything memoized under that budget.
+const resetGlobWork = () => { globBudget = GLOB_WORK_BUDGET; verdictMemo.clear(); compCache.clear(); };
 // A component's star spellings: each of the first STARS_PER_COMPONENT stars is nothing, `x`, or `.x`; the rest are nothing
 // (always the empty spelling, so a padded `.env*` cannot hide) and the component is flagged wide.
 function expandStars(comp) {
@@ -288,27 +309,44 @@ function expandStars(comp) {
   }
   return { cands, wide };
 }
-const compCache = new Map();
-// What one path component can be, over all its spellings.
+// The cheap spelling tried when the work budget is spent: every star nothing (so `.env*`, `server.p?m*` and every secret
+// name a star merely trails or pads are still found). Linear in the component and never budgeted, so a secret name is found
+// however much padding came first; the component still asks (it was not fully checked), but a hit found here blocks.
+const emptyStars = (comp) => comp.filter((u) => u !== STAR);
+// What one path component can be, over all its spellings. Levels: 0 = no, 1 = only through wildcards alone (ask), 2 = fixed
+// by at least one literal unit (block).
 function classifyComp(comp, last) {
   const key = `${last ? "L" : "D"}${comp.map(unitKey).join("")}`;
   const cached = compCache.get(key);
   if (cached) return cached;
-  const { cands, wide } = expandStars(comp);
-  globBudget -= cands.length * (comp.length + 2);
-  if (globBudget < 0) return { ssh: false, cfg: false, gh: false, df: [], base: 0, ask: true };
-  const f = { ssh: false, cfg: false, gh: false, df: SECRET_DIR_FILES.map(() => [false, false]), base: 0, ask: wide };
+  let cands;
+  let wide = false;
+  const stars = comp.reduce((n, u) => n + (u === STAR ? 1 : 0), 0);
+  const cost = stars === 0 ? 0 : 3 ** Math.min(stars, STARS_PER_COMPONENT) * (comp.length + 2);
+  if (cost <= globBudget) {
+    globBudget -= cost;
+    ({ cands, wide } = expandStars(comp));
+  } else {
+    cands = [emptyStars(comp)];
+    wide = true;
+  }
+  const f = { ssh: 0, cfg: 0, gh: 0, df: SECRET_DIR_FILES.map(() => [0, 0]), base: 0, ask: wide };
   for (const c of cands) {
-    if (anyName(c, DIR_IDX) || nameMatch(c, ".credentials.json") || credDotName(c)) f.ssh = true;
-    if (nameMatch(c, ".config")) f.cfg = true;
-    if (nameMatch(c, "gh")) f.gh = true;
-    SECRET_DIR_FILES.forEach(([d, n], i) => { if (nameMatch(c, d)) f.df[i][0] = true; if (nameMatch(c, n)) f.df[i][1] = true; });
+    f.ssh = Math.max(f.ssh, anyName(c, DIR_IDX) === 2 || nameMatch(c, ".credentials.json") === 2 || credDotName(c) ? 2 : 0);
+    f.cfg = Math.max(f.cfg, nameMatch(c, ".config"));
+    f.gh = Math.max(f.gh, nameMatch(c, "gh"));
+    SECRET_DIR_FILES.forEach(([d, n], i) => {
+      f.df[i][0] = Math.max(f.df[i][0], nameMatch(c, d));
+      f.df[i][1] = Math.max(f.df[i][1], nameMatch(c, n));
+    });
     if (last) f.base = Math.max(f.base, basenameVerdict(c));
   }
-  if (compCache.size > 4096) compCache.clear();
   compCache.set(key, f);
   return f;
 }
+// A secret directory pair (`etc`/`shadow`, `.config`/`gh`): both parts fixed by a literal blocks; a part spelled only by
+// wildcards (`/???/shadow`, `.config/??/hosts.yml`) next to a fixed part asks; two all-wildcard parts name nothing.
+const pairLevel = (a, b) => (a === 2 && b === 2 ? 2 : a > 0 && b > 0 && (a === 2 || b === 2) ? 1 : 0);
 // { hit, ask } for a glob token: some spelling of it names a secret store, or the guard cannot show it misses one.
 function globSecret(p) {
   if (p.length > GLOB_TOKEN_MAX) return { hit: false, ask: true };
@@ -318,8 +356,11 @@ function globSecret(p) {
   let ask = fl.some((f) => f.ask);
   fl.forEach((f, i) => {
     if (f.ssh) hit = true;
-    if (i + 1 < fl.length && f.cfg && fl[i + 1].gh) hit = true;
-    if (i === fl.length - 2 && f.df.some(([l], k) => l && fl[i + 1].df[k][1])) hit = true;
+    if (i + 1 < fl.length) {
+      const lv = Math.max(pairLevel(f.cfg, fl[i + 1].gh), i === fl.length - 2 ? Math.max(0, ...f.df.map(([l], k) => pairLevel(l, fl[i + 1].df[k][1]))) : 0);
+      if (lv === 2) hit = true;
+      else if (lv === 1) ask = true;
+    }
   });
   const last = fl.at(-1);
   if (last.base === 2) hit = true;
@@ -1140,7 +1181,8 @@ function installOperands(argsRaw) {
   return { srcs: ops.slice(0, -1), dst: ops.at(-1) ?? "", dirOnly: false };
 }
 function launderTargets(seg, home) {
-  const [prog, argsRaw] = programOf(seg);
+  const [prog, parenArgs] = programOf(seg);
+  const argsRaw = parenArgs.filter((t) => t !== "(" && t !== ")"); // grouping parens are their own tokens
   let srcs;
   let dst;
   let dirOnly = false;
