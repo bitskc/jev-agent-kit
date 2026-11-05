@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { guardCommand } from "../src/kit/guard.mjs";
-import { words, peelCommand, programOf, splitKeep, substitutedSegments, processSubBodies, PROC_SUB_CHAR_BUDGET, SUBST_EXACT_LIMIT } from "../src/kit/shell.mjs";
+import { words, peelCommand, programOf, splitKeep, foldLiterals, substitutedSegments, processSubBodies, PROC_SUB_CHAR_BUDGET, SUBST_EXACT_LIMIT } from "../src/kit/shell.mjs";
 
 // Secret reads are decided by token shape, not argv position. Every test here asserts the guard's DECISION (and rule)
 // for a command string passed to guardCommand(); no command in this file is ever executed, and no fixture files are
@@ -919,6 +919,35 @@ test("round 21c: nested process substitution is decided quickly and a later bloc
   assert.equal((await timedGuard(`cat ${rep(">(", 2000)}ls${rep(")", 2000)}`)).decision, "ask");
   // the outer bodies are still analyzed: a secret read inside the outermost bodies blocks
   assert.equal((await timedGuard(`cat ${rep("<(", 5000)}cat .env${rep(")", 5000)}`)).decision, "block");
+});
+
+// ── Round 22b ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+// foldChunk re-scanned the whole remaining suffix once per leading assignment word (quadratic), and foldLiterals runs
+// before every guard rule: 100,000 chars of `a=$(x) ` took ~2.5 s to fold, ~100-150 ms at the 20,000-char tool cap.
+test("round 22b: a long run of leading assignments folds in linear time and a later block still blocks", async () => {
+  for (const unit of ["a=1 ", "A=x ", "a='1' ", "a=$(x) ", "a=`x` "]) {
+    const big = rep(unit, Math.floor(100000 / unit.length)) + "ls";
+    const t0 = performance.now();
+    foldLiterals(big);
+    const took = performance.now() - t0;
+    assert.ok(took < 500, `${took.toFixed(0)} ms folding ${JSON.stringify(unit)} x ${big.length} chars`);
+  }
+  for (const unit of ["a=1 ", "a='1' ", "a=$(x) "]) {
+    const run = rep(unit, Math.floor(19900 / unit.length));
+    assert.equal((await timedGuard(`${run}ls`)).decision, unit === "a=$(x) " ? "ask" : "allow", unit);
+    const hit = await timedGuard(`${run}cat .env`);
+    assert.equal(hit.decision, "block", unit);
+    assert.equal(hit.rule, "R1-secret-exposure", unit);
+    assert.equal((await timedGuard(`${run}; x=rm; $x -rf /`)).rule, "R7-root-delete", unit);
+  }
+});
+
+test("round 22b: assignment folding keeps its semantics", () => {
+  assert.equal(foldLiterals("x=rm"), "x='rm'");
+  assert.equal(foldLiterals("x=rm; $x -rf /"), "x='rm'; rm -rf /");
+  assert.equal(foldLiterals("x=1 ls $x"), "x=1 ls $x"); // a prefix assignment persists nothing
+  assert.equal(foldLiterals("export x=rm; $x -rf /"), "export x='rm'; rm -rf /");
+  assert.equal(foldLiterals("x=rm; unset x; $x -rf /"), "x='rm'; unset x; $x -rf /");
 });
 
 test("round 21c: small substitutions decide as before", async () => {
