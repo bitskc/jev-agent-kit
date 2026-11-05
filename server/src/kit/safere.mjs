@@ -7,9 +7,9 @@
 // Supported: literals, `.`, character classes (ranges, negation, \d\w\s class escapes), alternation,
 // capturing and non-capturing groups, `*`/`+`/`?`/`{m,n}` (lazy suffixes read as greedy — only
 // match/no-match is ever asked), anchors `^` `$` `\b` `\B`, `(?i:`/`(?m:`/`(?s:` scoped flag groups,
-// and lookahead/lookbehind via bounded sub-simulation. Anything else — backreferences, bare (?flags)
-// — fails to compile; the caller treats that as "does not match", the same direction `new RegExp`
-// took on a syntax error. Patterns over MAX_PATTERN_LEN or MAX_STATES also fail to compile.
+// and lookahead/lookbehind via bounded sub-simulation. Unsupported but valid syntax (e.g. backreferences)
+// and patterns over MAX_PATTERN_LEN or MAX_STATES return unknown, which the caller treats conservatively
+// as possibly selecting a credential assignment. Invalid regex syntax returns no-match.
 
 const MAX_PATTERN_LEN = 512;
 const MAX_STATES = 16384;
@@ -17,7 +17,9 @@ const MAX_REPEAT = 1000;
 
 const WORD = /[A-Za-z0-9_]/;
 
-class ReSyntax extends Error {}
+class ReSyntax extends Error {
+  constructor(message, unsupported = false) { super(message); this.unsupported = unsupported; }
+}
 
 // ── parser → AST ────────────────────────────────────────────────────────────
 // {t:'lit',c,ci} {t:'class',neg,ci,items:[lo,hi] pairs or predicates} {t:'any',nl}
@@ -27,7 +29,7 @@ function parse(src) {
   let i = 0;
   const peek = () => src[i];
   const take = () => src[i++];
-  const err = (m) => { throw new ReSyntax(m); };
+  const err = (m, unsupported = false) => { throw new ReSyntax(m, unsupported); };
 
   const CLASS_ESCAPES = {
     d: (ch) => ch >= "0" && ch <= "9",
@@ -75,7 +77,7 @@ function parse(src) {
       }
       case "c": { const l = take(); if (l === undefined || !/[a-zA-Z]/.test(l)) err("\\c"); return { t: "lit", c: String.fromCharCode(l.toUpperCase().charCodeAt(0) % 32), ci: flags.i }; }
       default:
-        if (/[1-9]/.test(c)) err("backreference"); // backrefs cannot be NFA'd
+        if (/[1-9]/.test(c)) err("backreference", true); // valid syntax, unsupported by an NFA
         return { t: "lit", c, ci: flags.i };
     }
   }
@@ -118,7 +120,7 @@ function parse(src) {
     if (peek() !== "}") { i = save; return null; }
     take();
     if (max !== Infinity && max < min) err("{n,m}");
-    if (min > MAX_REPEAT || (max !== Infinity && max > MAX_REPEAT)) err("repeat too large");
+    if (min > MAX_REPEAT || (max !== Infinity && max > MAX_REPEAT)) err("repeat too large", true);
     return [min, max];
   }
   function atom(flags) {
@@ -136,7 +138,7 @@ function parse(src) {
             return { t: "look", neg: k1 === "!", ahead: true, x: body, ci: flags.i };
           }
           if (k1 === "<") {
-            if (src[i + 2] !== "=" && src[i + 2] !== "!") err("named group");
+            if (src[i + 2] !== "=" && src[i + 2] !== "!") err("named group", true);
             const neg = src[i + 2] === "!";
             i += 3;
             const body = alt(flags);
@@ -150,7 +152,7 @@ function parse(src) {
             while (/[ims]/.test(src[j])) { nf[src[j]] = true; j++; }
             if (src[j] === ":") { i = j + 1; const body = alt(nf); if (take() !== ")") err("unclosed group"); return body; }
           }
-          err("unsupported group"); // bare (?flags) and named groups are not modeled
+          err("unsupported group", true); // valid/unknown group syntax is conservatively flagged
         }
         const body = alt(flags);
         if (take() !== ")") err("unclosed group");
@@ -199,7 +201,7 @@ function parse(src) {
 // {kind:'split',a,b} {kind:'pred',k,sub,subStates,out} {kind:'match'}
 function compile(ast) {
   const states = [];
-  const add = (s) => { if (states.length >= MAX_STATES) throw new ReSyntax("too many states"); states.push(s); return s; };
+  const add = (s) => { if (states.length >= MAX_STATES) throw new ReSyntax("too many states", true); states.push(s); return s; };
   const patch = (outs, target) => { for (const o of outs) o.st[o.f] = target; };
   // returns {start, outs:[{st,f}]} — outs are dangling arrow fields to patch
   function build(n) {
@@ -282,7 +284,7 @@ function compile(ast) {
         const inner = compile(n.x);
         const s = add({ kind: "pred", k: n.ahead ? (n.neg ? "nla" : "la") : (n.neg ? "nlb" : "lb"), sub: inner.start, subStates: inner.states, out: null });
         states.push(...inner.states); // inner states count against the same cap
-        if (states.length > MAX_STATES) throw new ReSyntax("too many states");
+        if (states.length > MAX_STATES) throw new ReSyntax("too many states", true);
         return { start: s, outs: [{ st: s, f: "out" }] };
       }
     }
@@ -374,12 +376,14 @@ function lookResult(pred, text, pos) {
 }
 
 /** test(pattern, text): does `pattern` match a substring of `text` — RegExp.prototype.test semantics
- *  without the backtracker. Returns null when the pattern is unsupported/invalid/too large, so the
- *  caller picks its own "no information" direction. Never throws on user input. */
+ *  without the backtracker. Returns null for valid but unsupported/over-budget patterns and false
+ *  for syntax errors; callers must not silently allow the null case. Never throws on user input. */
 export function safeRegexTest(pattern, text) {
-  if (typeof pattern !== "string" || pattern.length > MAX_PATTERN_LEN) return null;
+  if (typeof pattern !== "string") return false;
+  if (pattern.length > MAX_PATTERN_LEN) return null;
   let nfa;
-  try { nfa = compile(parse(pattern)); } catch { return null; }
+  try { nfa = compile(parse(pattern)); }
+  catch (e) { return e instanceof ReSyntax ? (e.unsupported ? null : false) : null; }
   const predMemo = new Map();
   // Inject a fresh start state at each input position instead of re-running a search from every
   // possible start. That preserves unanchored RegExp.test semantics while keeping work linear in

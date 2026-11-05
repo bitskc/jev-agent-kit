@@ -586,10 +586,10 @@ function isBroadRoot(root, cwd = "", home = "") {
 const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
 function patternMatchesValueName(p) {
   if (GENERIC_CRED_WORD_RE.test(p)) return false;
-  // The pattern is untrusted text, so it never reaches a backtracking engine: safeRegexTest
-  // (safere.mjs) compiles it to a Thompson NFA and answers test() in O(pattern x sample).
-  // An invalid or unsupported pattern can't select a value-name line, so it does not match.
-  return VALUE_NAME_SAMPLES.some((s) => safeRegexTest(p, s) === true);
+  // safeRegexTest uses a Thompson NFA and never runs the untrusted pattern through a backtracker.
+  // An invalid pattern cannot match; a valid but unsupported/over-budget pattern is unknown and
+  // treated as potentially selecting a value-bearing assignment (the recursive-root rule asks).
+  return VALUE_NAME_SAMPLES.some((s) => safeRegexTest(p, s) !== false);
 }
 // Splits a grep/rg argv the way getopt does: short options take their value from the rest of the cluster or the next
 // token (`-drecurse`, `-d recurse`, `-ePAT`, `-e PAT`), so no option value is read as a flag. Returns the -e/--regexp

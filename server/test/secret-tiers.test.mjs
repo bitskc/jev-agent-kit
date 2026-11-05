@@ -1008,9 +1008,10 @@ test("round 22 P0: a hostile regex grep pattern is decided in bounded time, and 
   }
 });
 
-test("round 22 P0: ordinary grep patterns keep the round-18 verdicts; invalid/unsupported patterns fall out the same side", async () => {
+test("round 22 P0: ordinary grep patterns, invalid syntax, and unsupported backreferences remain safe", async () => {
   for (const cmd of [
     "grep -rn 'SECR.T_X' .", "grep -rn 'DATABASE.URL' .", "grep -rn '^[A-Z_]+=$' .", "grep -rn = .",
+    "grep -rnE '([A-Z])\\1' .", // valid backreference matches repeated letters in AWS_ACCESS_KEY_ID=
   ]) {
     const r = await guard(cmd, PROJ, HOME);
     assert.equal(r.decision, "ask", cmd);
@@ -1018,8 +1019,7 @@ test("round 22 P0: ordinary grep patterns keep the round-18 verdicts; invalid/un
   }
   for (const cmd of [
     "grep -rn '[a-z]+' .",      // matches no uppercase sample name
-    "grep -rn '[' .",           // invalid regex: new RegExp threw before, compile fails now
-    "grep -rn '(a)\\\\1' .",    // backreference: unsupported, treated as no-match
+    "grep -rn '[' .",           // invalid regex has no match (grep itself will reject it)
     "grep -rn auth src", "rg token app.ts",
   ]) {
     const r = await guard(cmd, PROJ, HOME);
