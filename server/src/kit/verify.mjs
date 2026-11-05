@@ -12,7 +12,70 @@ const OUTCOME_FLOOR = 0.4;
 const TASK_CAP = 1500;
 const MESSAGE_CAP = 2000;
 
-export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
+export const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|(?:python3?|pypy3?)\s+-m\s+(?:pytest|unittest)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
+
+// A check counts only in executable position: the program of a pipeline stage after prefix elements
+// (VAR=val, sudo, env, time, nohup, `timeout <dur>`, `xvfb-run`, `bundle exec`). A check verb anywhere else —
+// a commit message, an `echo` payload, a filename, a flag argument, inside a quoted string — is text, never a
+// check. CHECK_ANCHORED is CHECK_COMMAND required to lead the stage (allowing a path prefix: `./gradlew`,
+// `vendor/bin/phpunit`).
+const CHECK_ANCHORED = new RegExp("^" + CHECK_COMMAND.source.replace(/^\\b/, ""));
+const EXEC_PREFIX = /^(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup|timeout\s+\S+|xvfb-run(?:\s+-\S+)*|bundle\s+exec)\s+)*/;
+// `docker exec app npm test`, `kubectl exec pod -- npm test`, `docker compose run app npm test`, `chroot /r npm test`:
+// for these executors the first non-flag argument is a target and everything after it is the real command line.
+// `docker run` is NOT here — where its image ends and the command begins cannot be told apart reliably.
+const INNER_CMD = /^(?:\S*\/)?(?:(?:docker|podman|kubectl)\s+exec|(?:docker|podman)\s+compose\s+run|docker-compose\s+run|chroot|ssh)\b(?:\s+-\S+)*\s+\S+\s+(?:--\s+)?(.*)$/;
+// `sh -c 'body'`, `eval 'body'`, `ssh host 'body'`, `docker exec app 'body'`, `bash -o pipefail -c 'body'`:
+// when such an executor IS the whole command, the quoted tail is the real command line; recursing into it keeps
+// `bash -o pipefail -c 'npm test'` a check while `docker exec app 'echo npm test'` is not (the body is parsed,
+// not substring-matched).
+const QUOTED_BODY_WHOLE = /^\s*(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup|timeout\s+\S+|xvfb-run(?:\s+-\S+)*|bundle\s+exec)\s+)*(?:\S*\/)?(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|eval|exec|ssh\s+\S+|su\s+\S+|xargs|watch|script\s+\S*|parallel|docker|podman|kubectl|nsenter|chroot\s+\S+|runuser)(?:\s+\S+)*?\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")\s*$/;
+// Heredoc bodies are data, never commands: the lines between `<<WORD` and the closing WORD line are dropped.
+function stripHeredocBodies(command) {
+  const out = [];
+  let end = null;
+  for (const line of String(command || "").split("\n")) {
+    if (end !== null) { if (line.trim() === end) end = null; continue; }
+    out.push(line);
+    const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
+    if (m) end = m[2];
+  }
+  return out.join("\n");
+}
+// One pipeline stage (quote-blanked): does its program run a check? A stage-first match after prefix elements,
+// or a check in the tail of an executor whose argument IS a command line (`docker exec app npm test`).
+function stageRunsCheck(seg) {
+  const s = seg.trim().replace(EXEC_PREFIX, "");
+  const [executable, ...args] = s.split(/\s+/);
+  const program = executable.includes("/") ? executable.slice(executable.lastIndexOf("/") + 1) + (args.length ? " " + args.join(" ") : "") : s;
+  if (CHECK_ANCHORED.test(program) || /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.test(s)) return true;
+  const inner = INNER_CMD.exec(s);
+  if (inner && inner[1] && stageRunsCheck(inner[1])) return true;
+  return false;
+}
+// Whether the command runs a check anywhere in executable position: any stage of any list element. Quoted spans
+// and heredoc bodies are blanked first; when quoting cannot be read safely (unterminated quote, `$(`/backtick
+// inside double quotes) a lossy naive strip is used — program position still decides, never substring content.
+// The one exception is a whole-command `RUNNER ... 'body'` form (`bash -c`, `eval`, `ssh host`, `docker exec app`):
+// its quoted tail IS the command line, so the body is unwrapped on the raw text and judged the same way. Quoted
+// bodies are still parsed as commands — `docker exec app 'echo npm test'` does not count.
+export function commandRunsCheck(command) {
+  const raw = stripHeredocBodies(command);
+  const whole = QUOTED_BODY_WHOLE.exec(raw);
+  if (whole) return commandRunsCheck(whole[1] ?? whole[2]);
+  const norm = stripQuoted(raw) ?? raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
+  return listGroups(norm).flat().some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
+}
+// A program that only prints existing text can forge a pass summary (`cat mocha-results.log`, `sed -n p`,
+// `awk ...`, `grep`, `head`/`tail`, `jq`, `python -c 'print("12 passing")'`): their "summary" is not runner
+// output. Such a command must not earn a pass through the summary/exit path; a custom runner (./run-suite.sh,
+// make, npm) is any other program.
+const PRINT_ONLY = /^(?:\S*\/)?(?:cat|head|tail|grep|egrep|fgrep|rg|sed|awk|gawk|perl|python[0-9.]*|ruby|node|deno|bun|php|lua|jq|yq|xargs|echo|printf|tee|cut|tr|sort|uniq|wc|column|less|more|fold|dd|base64|openssl|curl|wget|git|ssh|sh|bash|dash|zsh|ksh|xsel|xclip|pbcopy|pbpaste|tar|gzip|gunzip|zcat|strings|file|stat|find|ls|tree|env|printenv|set|read)(?=\s|$)/;
+function onlyPrintsText(norm) {
+  const els = listGroups(norm).flat().filter((el) => !PREFIX_SEGMENT.test(el));
+  if (!els.length) return true; // nothing ran at all
+  return els.every((el) => el.split(BARE_PIPE).every((seg) => PRINT_ONLY.test(seg.trim().replace(EXEC_PREFIX, ""))));
+}
 
 // Failure text a runner prints. Matched before any pass signal and regardless of exit status: `npx mocha | tail -3`
 // exits 0 while printing "1 failing". "0 failing" does not match (the count must be 1 or more).
@@ -45,7 +108,6 @@ const NESTED_SHELL_C = /(?:^|[\s;&|\/])(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b/;
 // and sudo/env/time/nohup) AND the stage holds a quoted span. `docker run img npm test` or `cd docker && npm test` are
 // plain commands whose status is the check's own.
 const CODE_RUNNER = /^(?:\S*\/)?(?:eval|exec|ssh|su|xargs|watch|script|parallel|docker|podman|kubectl|nsenter|chroot|runuser)(?=\s|$)/;
-const EXEC_PREFIX = /^(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup)\s+)*/;
 function hidesNestedCode(norm) {
   if (NESTED_SHELL_C.test(norm)) return true;
   for (const el of listGroups(norm).flat()) {
@@ -123,7 +185,7 @@ export function exitIsMasked(command, pipefail = false) {
     const whole = PIPEFAIL_WRAPPER_WHOLE.exec(trimmed);
     return whole ? exitIsMasked(whole[1] ?? whole[2], true) : true;
   }
-  const norm = stripQuoted(command);
+  const norm = stripQuoted(stripHeredocBodies(command));
   if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || hidesNestedCode(norm)) return true;
   if (BARE_PIPE.test(norm) && !pipefailOn(norm, pipefail)) return true;
   const groups = listGroups(norm);
@@ -132,7 +194,9 @@ export function exitIsMasked(command, pipefail = false) {
   const withCommand = real.filter((g) => g.length);
   if (!withCommand.length || !real[real.length - 1].length) return true;
   if (withCommand.length === 1) return false;
-  const holdsCheck = (g) => g.some((s) => CHECK_COMMAND.test(s));
+  // A group "holds the check" only when a stage of one of its elements runs a check in program position —
+  // a check verb inside an argument or a quoted string does not hold the exit status either.
+  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
   return withCommand.slice(0, -1).some(holdsCheck) || !holdsCheck(real[real.length - 1]);
 }
 const TAIL_ARGS = /^\s*tail(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
@@ -140,11 +204,12 @@ const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
 /**
  * A pass summary may stand in for a masked exit only when the sole mask is one bare pipe into `tail`: the check's own
  * stdout is not redirected, no `||` appears, nothing follows the pipe, and the left side is the check command preceded
- * only by prefix elements. `head` is not trusted (it can cut the failing line off the end); any other mask (a trailing
- * segment, a redirect, a second pipe, a filter) could print a summary the check did not produce, so it stays unknown.
+ * only by prefix elements, and the left's last stage actually runs a check — or is a runnable program that is not a
+ * print-only tool (`cat mocha-results.log | tail -20` replays stale output; `./run-suite.sh | tail` is allowed as a
+ * custom runner). `head` is not trusted (it can cut the failing line off the end); any other mask stays unknown.
  */
 function maskedByTailPipeOnly(command) {
-  const norm = stripQuoted(command);
+  const norm = stripQuoted(stripHeredocBodies(command));
   if (norm === null || UNATTRIBUTABLE.test(norm)) return false;
   if (norm.includes("||") || />/.test(norm.replace(FD_MERGE_STDERR, ""))) return false;
   if (hidesNestedCode(norm)) return false;
@@ -152,7 +217,19 @@ function maskedByTailPipeOnly(command) {
   if (parts.length !== 2 || !TAIL_ARGS.test(parts[1])) return false;
   const segs = listGroups(parts[0]).flat();
   if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
-  return segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s));
+  if (!segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s))) return false;
+  const last = segs[segs.length - 1];
+  if (stageRunsCheck(last)) return true;
+  const prog = last.trim().replace(EXEC_PREFIX, "");
+  return !PRINT_ONLY.test(prog);
+}
+
+// An explicit zero-pass summary ("0 passed", "Tests: 0 passed", "0 passing", "0 tests ran") is not a success
+// and not a failure: nothing was verified. It must not fall through to the bare exit-0 pass.
+function zeroPassSummary(output) {
+  if (typeof output !== "string" || !output) return false;
+  const tail = output.slice(-6000);
+  return /^\s*0 (?:tests? )?(?:passed|passing|ran)\b|^\s*0 pass(?:ed|es|ing)?\s*$|passed:\s*0\b|^\s*Tests:\s.*0 total\b|test result: ok\.\s+0 passed|0 examples, 0 failures/im.test(tail);
 }
 /**
  * One check run's outcome: "pass" | "fail" | "unknown". A nonzero exit or failure text is a fail whatever else says.
@@ -164,30 +241,43 @@ export function runOutcome(command, output, exitCode) {
   const summary = checkSummary(output);
   if (summary === "fail") return "fail";
   if (exitIsMasked(command)) return summary === "pass" && maskedByTailPipeOnly(command) ? "pass" : "unknown";
-  if (summary === "pass") return "pass";
+  if (summary === "pass") {
+    // A non-check command earns a pass only when it ran a real program; a command that only prints a stored
+    // file (`cat mocha-results.log`) can carry a stale or forged green summary and proves nothing.
+    const norm = stripQuoted(stripHeredocBodies(command));
+    if (!commandRunsCheck(command) && (norm === null || onlyPrintsText(norm))) return "unknown";
+    return "pass";
+  }
+  if (zeroPassSummary(output)) return "unknown";
   if (exitCode === 0) return "pass";
   return "unknown";
 }
+
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 export function checkSummary(output) {
   if (typeof output !== "string" || !output) return undefined;
   const tail = output.slice(-6000);
-  // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER).
+  // Failure text wins over every pass signal and over the exit status (see FAILURE_MARKER). Modern npm prints
+  // `npm error ...` where older npm printed `npm ERR!`, and coverage thresholds (jest/vitest/nyc) fail after a
+  // green `N passing`/`N passed` summary — all of these must veto the earlier pass text.
   // A passing test's own title ("✔ retries after 3 failed attempts") is not a failure signal; the summary lines decide.
   const scan = tail.split("\n").filter((l) => !PASSING_TITLE.test(l)).join("\n");
   if (FAILURE_MARKER.test(scan) || EXIT_MENTION.test(scan)) return "fail";
-  const nodeTest = /[ℹi] fail (\d+)/.exec(tail);
-  if (nodeTest) return Number(nodeTest[1]) > 0 ? "fail" : "pass";
-  const jest = /^Tests:\s+(?:(\d+) failed, )?.*?\d+ total/m.exec(tail);
+  if (/^npm (?:ERR!|error)\b/m.test(scan) || /coverage[^\n]*(?:does not meet|threshold[^\n]*not met)|threshold[^\n]*not met/i.test(scan)) return "fail";
+  const nodeTest = /[ℹi] fail ([1-9]\d*)/.exec(tail);
+  if (nodeTest) return "fail";
+  const nodePass = /[ℹi] pass ([1-9]\d*)/.exec(tail);
+  if (nodePass) return "pass";
+  const jest = /^Tests:\s+(?:(\d+) failed, )?.*?([1-9]\d*) total/m.exec(tail);
   if (jest) return jest[1] && Number(jest[1]) > 0 ? "fail" : "pass";
-  const pytest = /^=+ .*?(?:(\d+) failed|(\d+) error).*?in [\d.]+s/m.exec(tail) ?? /^=+ (\d+) passed.*? in [\d.]+s/m.exec(tail);
+  const pytest = /^=+ .*?(?:(\d+) failed|(\d+) error).*?in [\d.]+s/m.exec(tail) ?? /^=+ ([1-9]\d*) passed.*? in [\d.]+s/m.exec(tail);
   if (pytest) return /\d+ (?:failed|error)/.test(pytest[0]) ? "fail" : "pass";
-  const cargoOrGo = /^test result: (ok|FAILED)\./m.exec(tail) ?? /^(ok|FAIL)\s+\S+\s+[\d.]+s$/m.exec(tail);
+  const cargoOrGo = /^test result: (ok|FAILED)\.\s+[1-9]\d* passed/m.exec(tail) ?? /^test result: (FAILED)\./m.exec(tail) ?? /^(ok|FAIL)\s+\S+\s+[\d.]+s$/m.exec(tail);
   if (cargoOrGo) return cargoOrGo[1] === "ok" ? "pass" : "fail";
-  const vitest = /^\s*Tests\s{2,}([^\n]*\(\d+\))\s*$/m.exec(tail);
-  if (vitest) return /\d+ failed/.test(vitest[1]) ? "fail" : "pass";
-  const bunFail = /^\s*(\d+) fail\s*$/m.exec(tail);
-  if (bunFail && /^\s*\d+ pass\s*$/m.test(tail)) return Number(bunFail[1]) > 0 ? "fail" : "pass";
+  const vitest = /^\s*Tests\s{2,}([^\n]*\([1-9]\d*\))\s*$/m.exec(tail);
+  if (vitest) return /[1-9]\d* failed/.test(vitest[1]) ? "fail" : "pass";
+  const bunFail = /^\s*([1-9]\d*) fail\s*$/m.exec(tail);
+  if (bunFail && /^\s*\d+ pass\s*$/m.test(tail)) return "fail";
   const mix = /^(?:\d+ doctests?, )?\d+ tests?, (\d+) failures?/m.exec(tail);
   if (mix) return Number(mix[1]) > 0 ? "fail" : "pass";
   const dotnet = /^(Passed|Failed)!\s+-\s+Failed:\s+\d+/m.exec(tail);
@@ -200,9 +290,10 @@ export function checkSummary(output) {
   if (mocha) return Number(mocha[1]) > 0 ? "fail" : "pass";
   // Check fail signals before the bare "N passing" match: a later lifecycle/build failure in the same
   // output (e.g. "12 passing" followed by "npm ERR! code ELIFECYCLE") must not be reported as a pass.
-  if (/\berror TS\d{4,}:/.test(tail) || /^npm ERR! (?:Test failed|code ELIFECYCLE)/m.test(tail)) return "fail";
-  if (/^\s*\d+ passing\b/m.test(tail)) return "pass";
-  if (/^\s*(?:all tests pass(?:ed)?\b|tests? passed\b|\d+ (?:tests? )?passed\b)/im.test(tail)) return "pass";
+  if (/\berror TS\d{4,}:/.test(tail)) return "fail";
+  // A zero count never verifies: "0 passed" is not a success.
+  if (/^\s*[1-9]\d* passing\b/m.test(tail)) return "pass";
+  if (/^\s*(?:all tests pass(?:ed)?\b|tests? passed\b|[1-9]\d* (?:tests? )?passed\b)/im.test(tail)) return "pass";
   return undefined;
 }
 
@@ -210,7 +301,7 @@ export const MUTATING_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEd
 export function classifyToolResult(tool, input = {}, failed = false, output = "") {
   if (MUTATING_TOOLS.has(tool)) return "mutation";
   const command = typeof input.command === "string" ? input.command : "";
-  const isCheck = tool === "Bash" && CHECK_COMMAND.test(command);
+  const isCheck = tool === "Bash" && commandRunsCheck(command);
   if (!isCheck && !checkSummary(output)) return "unknown";
   const outcome = runOutcome(command, output, failed ? 1 : 0);
   return outcome === "fail" ? "check-fail" : outcome === "pass" ? "check-pass" : "unknown";
@@ -352,8 +443,9 @@ export async function verifyDone(input, deps = {}) {
     const checks = (input.checks || []).map((c) => {
       const command = c.command || "check";
       const call = redact(command).slice(0, 200);
-      // Only a check command can count, whatever `passed` says: a non-check with passed:true must never be a fresh check.
-      if (!CHECK_COMMAND.test(command)) return null;
+      // Only a check in program position can count, whatever `passed` says: a check verb in a commit message, an
+      // argument, or a quoted string is text, and a non-check with passed:true must never be a fresh check.
+      if (!commandRunsCheck(command)) return null;
       if (typeof c.passed === "boolean") return { call, passed: c.passed };
       const outcome = runOutcome(command, c.output || "", typeof c.exit_code === "number" ? c.exit_code : undefined);
       if (outcome !== "unknown") return { call, passed: outcome === "pass" };

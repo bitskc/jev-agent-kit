@@ -146,11 +146,18 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["npx jest watch", "  12 passing (3s)", 0],
     ["npm test `git diff --name-only`", "  12 passing (3s)", 0],
     ["npm test -- -t \\$'a\\'", "  12 passing (3s)", 0],
+    ["git commit -m 'fix jest cfg'", "[main abc] fix", 0],
+    ["echo done; echo npm test", "done\nnpm test", 0],
+    ["cat mocha-results.log | tail -20", "  12 passing", 0],
+    ["npm test", "0 passed", 0],
+    ["npm test", "  12 passing\ncoverage threshold not met", 0],
+    ["npm test", "  12 passing\nnpm error code 1", 0],
   ];
   assert.equal(hook.CHECK_COMMAND.source, server.CHECK_COMMAND.source, "CHECK_COMMAND copy");
   for (const [command, output, exit] of cases) {
     assert.equal(hook.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${command}`);
     assert.equal(hook.exitIsMasked(command), server.exitIsMasked(command), `exitIsMasked ${command}`);
+    assert.equal(hook.commandRunsCheck(command), server.commandRunsCheck(command), `commandRunsCheck ${command}`);
     assert.equal(hook.checkSummary(output), server.checkSummary(output), `checkSummary ${JSON.stringify(output)}`);
   }
 });
@@ -1586,26 +1593,69 @@ test("F3: `npm run build && npm test` at exit 0 with a clean summary verifies (n
   assert.equal(out, null, `${JSON.stringify(out)}`);
 });
 
-// ── honest-path selection: the hook must send every command the server's CHECK_COMMAND counts as a check ──
-test("selection: every real runner invocation the server counts as a check reaches the payload through parseForVerify", async () => {
+// ── honest-path selection: the hook sends exactly the commands the server counts as a check ──
+test("selection: every check in program position reaches the payload through parseForVerify; verbs in text do not", async () => {
   const server = await import("../server/src/kit/verify.mjs");
-  const runners = [
+  const checks = [
     "phpunit", "vendor/bin/phpunit tests/", "rspec", "bundle exec rspec", "mix test", "dotnet test", "gradle test", "./gradlew test",
-    "mvn test", "swift test", "ctest", "bazel test //...", "deno test", "bun test", "pnpm test", "yarn test", "tox", "nox", "pytest",
+    "mvn test", "swift test", "ctest", "deno test", "bun test", "pnpm test", "yarn test", "pytest", "python -m pytest",
     "cargo test", "go test ./...", "npx vitest", "npx jest", "tsc --noEmit", "eslint .", "ruff check .",
-    "docker exec app npm test", "ssh ci npm test", "bash -o pipefail -c 'npm test | tail -5'", "timeout 600 npm test", "xvfb-run npm test",
+    "docker exec app npm test", "docker compose run --rm app npm test", "kubectl exec pod -- npm test", "ssh ci npm test",
+    "make -C docker test",
+    "bash -o pipefail -c 'npm test | tail -5'", "timeout 600 npm test", "xvfb-run npm test", "sudo -E npm test",
+    "FOO=1 npm test", "cd api && npm test", "npm run build && npm test",
   ];
-  let matched = 0;
-  for (const command of runners) {
+  for (const command of checks) {
     const sent = stopGate.parseForVerify(editThen([command, "ok"])).checks.map((c) => c.command);
-    if (server.CHECK_COMMAND.test(command)) {
-      matched += 1;
-      assert.deepEqual(sent, [command], `server counts \`${command}\` as a check, so the hook must send it`);
-    }
+    assert.deepEqual(sent, [command], `the hook must send \`${command}\``);
+    assert.equal(server.commandRunsCheck(command), true, `server must count \`${command}\` as a check`);
   }
-  assert.ok(matched >= 25, `the list should mostly be server-recognised runners (matched ${matched})`);
-  // a command neither side counts as a check is never sent
-  assert.deepEqual(stopGate.parseForVerify(editThen(["ls src", "a.js"], ["git status", "clean"])).checks, []);
+  // A check verb outside program position is sent to NOBODY: neither hook nor server may count it.
+  const nonChecks = [
+    "git commit -m 'fix jest cfg'", 'git commit -m "fix jest cfg"', "git commit -m 'npm test broke'",
+    "echo done; echo npm test", 'echo "npm test"', "cat mocha-results.log", "cat mocha-results.log | tail -20",
+    "grep -c jest package.json", "ls vitest",
+    "docker run --rm -v $PWD:/app img npm test", "bazel test //...", "cat <<EOF\nnpm test\nEOF",
+  ];
+  for (const command of nonChecks) {
+    const sent = stopGate.parseForVerify(editThen([command, "ok"])).checks;
+    assert.deepEqual(sent, [], `the hook must not send \`${command}\``);
+    assert.equal(server.commandRunsCheck(command), false, `server must not count \`${command}\` as a check`);
+  }
+});
+test("capChecks ranks only actual check runs; false check-shaped text cannot evict the passing run", async () => {
+  const noise = Array.from({ length: 55 }, () => ["git commit -m 'fix jest cfg'", "[main abc] fix"]);
+  const { out, calls } = await verifyOut(editThen(["npm test", "  12 passing (3s)"], ...noise));
+  assert.deepEqual(sentChecks(calls).map((c) => c.command), ["npm test"]);
+  acceptedByOldSchema(calls);
+  assert.equal(out, null, `the real passing check must survive non-check text: ${JSON.stringify(out)}`);
+});
+test("regression: command text cannot re-admit false checks; real runner checks remain selectable", () => {
+  const falseCommands = [
+    "git commit -m 'fix jest cfg'",
+    "echo done; echo npm test",
+    "cat mocha-results.log | tail -20",
+  ];
+  for (const command of falseCommands) {
+    assert.deepEqual(stopGate.parseForVerify(editThen([command, "12 passing"])).checks, [], command);
+  }
+  for (const command of ["npm test", "sudo npm test", "timeout 600 npm test", "bundle exec rspec", "./gradlew test"]) {
+    assert.equal(stopGate.parseForVerify(editThen([command, "12 passing"])).checks.length, 1, command);
+  }
+});
+
+test("regression: zero-pass and post-summary failure markers are mirrored by the hook", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const [command, output] of [
+    ["npm test", "0 passed"],
+    ["npm test", "12 passing\ncoverage threshold for branches not met"],
+    ["npm test", "12 passing\nnpm error code 1"],
+  ]) {
+    assert.equal(stopGate.checkSummary(output), server.checkSummary(output), JSON.stringify(output));
+    assert.equal(stopGate.runOutcome(command, output, 0), server.runOutcome(command, output, 0), JSON.stringify(output));
+  }
+  assert.equal(stopGate.runOutcome("npm test", "0 passed", 0), "unknown");
+  assert.equal(stopGate.runOutcome("npm test", "12 passing\nnpm error code 1", 0), "fail");
 });
 test("selection: an honest `phpunit` / `bundle exec rspec` run after an edit verifies end to end (no false block)", async () => {
   for (const [command, output] of [["phpunit", "OK (12 tests, 30 assertions)"], ["bundle exec rspec", "12 examples, 0 failures"], ["./gradlew test", "BUILD SUCCESSFUL in 3s"], ["dotnet test", "Passed!  - Failed:     0, Passed:    12"]]) {

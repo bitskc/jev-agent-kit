@@ -268,6 +268,75 @@ test("verify_done supplied checks: a non-check command never verifies, even with
   r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 1 }] });
   assert.notEqual(r.verified, true);
 });
+
+test("verify_done supplied checks: a check verb outside program position never verifies (anchored detection)", async () => {
+  // P1: CHECK_COMMAND matched anywhere in the command text, so a verb inside a commit message, an echo payload,
+  // a filename or a log read counted as a check — and its exit 0 hard-vetoed every real check result.
+  const fakeChecks = [
+    "git commit -m 'fix jest cfg'",
+    'git commit -m "fix jest cfg"',
+    "echo done; echo npm test",
+    "cat mocha-results.log",
+    "grep -c jest package.json",
+    "ls vitest",
+    "make -C docker test",
+    "ssh ci npm test",
+  ];
+  for (const command of fakeChecks) {
+    const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command, exit_code: 0 }] });
+    assert.notEqual(r.verified, true, `must not verify: ${command}`);
+    assert.equal(r.evidence.fresh_checks.length, 0, `must not be a fresh check: ${command}`);
+  }
+  // even a fabricated pass summary or passed:true cannot rescue a non-program-position verb
+  let r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "git commit -m 'fix jest cfg'", output: "12 passing", passed: true }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  // real checks in program position — bare, wrapped, and executor forms — still count
+  const realChecks = ["npm test", "cd api && npm test", "FOO=1 npm test", "sudo -E npm test", "timeout 600 npm test",
+    "xvfb-run npm test", "bundle exec rspec", "./gradlew test", "vendor/bin/phpunit", "phpunit", "pytest",
+    "python -m pytest", "docker exec app npm test", "kubectl exec pod -- npm test", "docker compose run --rm app npm test",
+    "bash -o pipefail -c 'npm test'", "ssh ci 'npm test'", "npx vitest", "npm run build && npm test"];
+  for (const command of realChecks) {
+    r = await verifyDone({ task: "x", final_message: "done", checks: [{ command, exit_code: 0 }] });
+    assert.equal(r.verified, true, `must verify: ${command}`);
+  }
+});
+test("runOutcome: a stale log read through `tail` never counts as a check pass", () => {
+  // P2: maskedByTailPipeOnly trusted the left side of `| tail` without requiring it to run a check.
+  assert.equal(runOutcome("cat mocha-results.log | tail -20", "All tests passed", 0), "unknown");
+  assert.equal(runOutcome("cat mocha-results.log | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("cat mocha-results.log", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("sed -n '1,3p' mocha-results.log | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("python -c 'print(\"12 passing\")' | tail", "12 passing", 0), "unknown");
+  // a real check (or a custom runner, which is not a print-only tool) still clears the tail
+  assert.equal(runOutcome("npm test | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("./run-suite.sh | tail -3", "  12 passing (3s)", 0), "pass");
+});
+test("checkSummary/runOutcome: zero passes never verify; green text followed by a failure marker still fails", () => {
+  // P2: "0 passed" matched the pass phrases and fell through to the bare exit-0 pass.
+  for (const out of ["0 passed", "Tests: 0 passed, 0 total", "  0 passing", "test result: ok. 0 passed; 0 failed", "0 examples, 0 failures"]) {
+    assert.notEqual(checkSummary(out), "pass", `must not pass: ${JSON.stringify(out)}`);
+    assert.equal(runOutcome("npm test", out, 0), "unknown", `must not verify: ${JSON.stringify(out)}`);
+  }
+  // P2: coverage-threshold and modern `npm error` failures printed after a green summary must win.
+  assert.equal(checkSummary("12 passing\nJest: coverage threshold for branches (80%) not met: 75%"), "fail");
+  assert.equal(checkSummary("12 passing\nJest: \"global\" coverage threshold for lines (80%) not met: 70%"), "fail");
+  assert.equal(checkSummary("5 passed in 1.2s\nERROR: Coverage for lines: 72% does not meet threshold: 80%"), "fail");
+  assert.equal(checkSummary("12 passing\nnpm error code 1\nnpm error command failed"), "fail");
+  assert.equal(runOutcome("npm test", "12 passing\nnpm error code 1\nnpm error command failed", 0), "fail");
+  // ordinary clean output still passes; a passing title mentioning failures is still not failure text
+  assert.equal(runOutcome("npm test", "  12 passing (3s)", 0), "pass");
+  assert.equal(checkSummary("  ✔ retries after 3 failed attempts\n\n  12 passing (3s)"), "pass");
+});
+test("classifyToolResult: transcript classification uses the same anchored check detection", async () => {
+  assert.equal(classifyToolResult("Bash", { command: "git commit -m 'fix jest cfg'" }, false, "[main abc] fix"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "git commit -m 'fix jest cfg'" }, false, "12 passing"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "echo done; echo npm test" }, false, "done"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "cat mocha-results.log" }, false, "  12 passing (3s)"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "cat mocha-results.log | tail -20" }, false, "All tests passed"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "npm test" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "cd api && npm test" }, false, "  1 failing"), "check-fail");
+  assert.equal(classifyToolResult("Bash", { command: "docker exec app npm test" }, false, "  12 passing (3s)"), "check-pass");
+});
 test("rungFor: claude-* ids resolve to their own family, not the generic director alias", async () => {
   assert.equal((await sizeDispatch({ description: "x", model: "claude-fable-5-1" }, noJev)).chosen.tier, "fable");
   assert.equal((await sizeDispatch({ description: "x", model: "claude-haiku-4-5" }, noJev)).chosen.tier, "scout");
