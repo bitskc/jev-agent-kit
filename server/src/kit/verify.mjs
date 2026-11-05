@@ -44,28 +44,32 @@ function stripHeredocBodies(command) {
 }
 // One pipeline stage (quote-blanked): does its program run a check? A stage-first match after prefix elements,
 // or a check in the tail of an executor whose argument IS a command line (`docker exec app npm test`).
-function stageRunsCheck(seg) {
+function stageCheckCommand(seg) {
   const s = seg.trim().replace(EXEC_PREFIX, "");
   const [executable, ...args] = s.split(/\s+/);
   const program = executable.includes("/") ? executable.slice(executable.lastIndexOf("/") + 1) + (args.length ? " " + args.join(" ") : "") : s;
-  if (CHECK_ANCHORED.test(program) || /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.test(s)) return true;
+  const direct = CHECK_ANCHORED.exec(program);
+  if (direct) return direct[0];
+  const make = /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.exec(s);
+  if (make) return make[0];
   const inner = INNER_CMD.exec(s);
-  if (inner && inner[1] && stageRunsCheck(inner[1])) return true;
-  return false;
+  return inner && inner[1] ? stageCheckCommand(inner[1]) : null;
 }
-// Whether the command runs a check anywhere in executable position: any stage of any list element. Quoted spans
-// and heredoc bodies are blanked first; when quoting cannot be read safely (unterminated quote, `$(`/backtick
-// inside double quotes) a lossy naive strip is used — program position still decides, never substring content.
-// The one exception is a whole-command `RUNNER ... 'body'` form (`bash -c`, `eval`, `ssh host`, `docker exec app`):
-// its quoted tail IS the command line, so the body is unwrapped on the raw text and judged the same way. Quoted
-// bodies are still parsed as commands — `docker exec app 'echo npm test'` does not count.
-export function commandRunsCheck(command) {
+// A check command means an actual runner in executable position, not a verb found in arguments or quoted text.
+function checkCommandSnippet(command) {
   const raw = stripHeredocBodies(command);
   const whole = QUOTED_BODY_WHOLE.exec(raw);
-  if (whole) return commandRunsCheck(whole[1] ?? whole[2]);
+  if (whole) return checkCommandSnippet(whole[1] ?? whole[2]);
   const norm = stripQuoted(raw) ?? raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
-  return listGroups(norm).flat().some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
+  for (const el of listGroups(norm).flat()) {
+    for (const stage of el.split(BARE_PIPE)) {
+      const snippet = stageCheckCommand(stage);
+      if (snippet) return snippet;
+    }
+  }
+  return null;
 }
+export function commandRunsCheck(command) { return checkCommandSnippet(command) !== null; }
 // A program that only prints existing text can forge a pass summary (`cat mocha-results.log`, `sed -n p`,
 // `awk ...`, `grep`, `head`/`tail`, `jq`, `python -c 'print("12 passing")'`): their "summary" is not runner
 // output. Such a command must not earn a pass through the summary/exit path; a custom runner (./run-suite.sh,
@@ -196,7 +200,7 @@ export function exitIsMasked(command, pipefail = false) {
   if (withCommand.length === 1) return false;
   // A group "holds the check" only when a stage of one of its elements runs a check in program position —
   // a check verb inside an argument or a quoted string does not hold the exit status either.
-  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
+  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some((stage) => stageCheckCommand(stage) !== null));
   return withCommand.slice(0, -1).some(holdsCheck) || !holdsCheck(real[real.length - 1]);
 }
 const TAIL_ARGS = /^\s*tail(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
@@ -219,7 +223,7 @@ function maskedByTailPipeOnly(command) {
   if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
   if (!segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s))) return false;
   const last = segs[segs.length - 1];
-  if (stageRunsCheck(last)) return true;
+  if (stageCheckCommand(last) !== null) return true;
   const prog = last.trim().replace(EXEC_PREFIX, "");
   return !PRINT_ONLY.test(prog);
 }
@@ -263,7 +267,7 @@ export function checkSummary(output) {
   // A passing test's own title ("✔ retries after 3 failed attempts") is not a failure signal; the summary lines decide.
   const scan = tail.split("\n").filter((l) => !PASSING_TITLE.test(l)).join("\n");
   if (FAILURE_MARKER.test(scan) || EXIT_MENTION.test(scan)) return "fail";
-  if (/^npm (?:ERR!|error)\b/m.test(scan) || /coverage[^\n]*(?:does not meet|threshold[^\n]*not met)|threshold[^\n]*not met/i.test(scan)) return "fail";
+  if (/^npm (?:ERR!(?=\s|$)|error\b)/m.test(scan) || /coverage[^\n]*(?:does not meet|threshold[^\n]*not met)|threshold[^\n]*not met/i.test(scan)) return "fail";
   const nodeTest = /[ℹi] fail ([1-9]\d*)/.exec(tail);
   if (nodeTest) return "fail";
   const nodePass = /[ℹi] pass ([1-9]\d*)/.exec(tail);

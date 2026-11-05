@@ -151,7 +151,7 @@ test("hook outcome rules match server/src/kit/verify.mjs (parity)", async () => 
     ["cat mocha-results.log | tail -20", "  12 passing", 0],
     ["npm test", "0 passed", 0],
     ["npm test", "  12 passing\ncoverage threshold not met", 0],
-    ["npm test", "  12 passing\nnpm error code 1", 0],
+    ["npm test", "  12 passing\nnpm ERR! code ELIFECYCLE\nnpm ERR! Test failed.", 0],
   ];
   assert.equal(hook.CHECK_COMMAND.source, server.CHECK_COMMAND.source, "CHECK_COMMAND copy");
   for (const [command, output, exit] of cases) {
@@ -1537,11 +1537,9 @@ test("F1: a >2000-char NON-check command is not sent at all, and the gate still 
   assert.ok(out && out.decision === "block", `a long git commit must not verify: ${JSON.stringify(out)}`);
   assert.match(out.reason, /VERIFY:/);
 });
-test("F1: a >2000-char non-check whose kept head text contains a check verb is sent passed:false, never a pass", skipNoZod, async () => {
+test("F1: a >2000-char non-check whose kept head text contains a check verb is never sent", skipNoZod, async () => {
   const { out, calls } = await verifyOut(editThen([`git commit -m "npm test ${"x".repeat(2500)}"`, "[main abc1234] msg"]));
-  const sent = sentChecks(calls);
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].passed, false);
+  assert.deepEqual(sentChecks(calls), []);
   acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `${JSON.stringify(out)}`);
 });

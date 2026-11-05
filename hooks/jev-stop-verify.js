@@ -148,27 +148,33 @@ const INNER_CMD = /^(?:\S*\/)?(?:(?:docker|podman|kubectl)\s+exec|(?:docker|podm
 const QUOTED_BODY_WHOLE = /^\s*(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup|timeout\s+\S+|xvfb-run(?:\s+-\S+)*|bundle\s+exec)\s+)*(?:\S*\/)?(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|eval|exec|ssh\s+\S+|su\s+\S+|xargs|watch|script\s+\S*|parallel|docker|podman|kubectl|nsenter|chroot\s+\S+|runuser)(?:\s+\S+)*?\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")\s*$/;
 // One pipeline stage (quote-blanked): does its program run a check? A stage-first match after prefix elements,
 // or a check in the tail of an executor whose argument IS a command line (`docker exec app npm test`).
-function stageRunsCheck(seg) {
+function stageCheckCommand(seg) {
   const s = seg.trim().replace(EXEC_PREFIX, '');
   const [executable, ...args] = s.split(/\s+/);
   const program = executable.includes('/') ? executable.slice(executable.lastIndexOf('/') + 1) + (args.length ? ' ' + args.join(' ') : '') : s;
-  if (CHECK_ANCHORED.test(program) || /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.test(s)) return true;
+  const direct = CHECK_ANCHORED.exec(program);
+  if (direct) return direct[0];
+  const make = /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.exec(s);
+  if (make) return make[0];
   const inner = INNER_CMD.exec(s);
-  if (inner && inner[1] && stageRunsCheck(inner[1])) return true;
-  return false;
+  return inner && inner[1] ? stageCheckCommand(inner[1]) : null;
 }
-// Whether the command runs a check anywhere in executable position: any stage of any list element. Quoted spans
-// and heredoc bodies are blanked first; when quoting cannot be read safely (unterminated quote, `$(`/backtick
-// inside double quotes) a lossy naive strip is used — program position still decides, never substring content.
-// The one exception is a whole-command `RUNNER ... 'body'` form (`bash -c`, `eval`, `ssh host`, `docker exec app`):
-// its quoted tail IS the command line, so the body is unwrapped on the raw text and judged the same way.
-function commandRunsCheck(command) {
+// Extract an anchored check invocation so a long command can be shortened without cutting away the evidence
+// that the command actually ran a check. The full command still determines its outcome before truncation.
+function checkCommandSnippet(command) {
   const raw = stripHeredocBodies(command);
   const whole = QUOTED_BODY_WHOLE.exec(raw);
-  if (whole) return commandRunsCheck(whole[1] ?? whole[2]);
+  if (whole) return checkCommandSnippet(whole[1] ?? whole[2]);
   const norm = stripQuoted(raw) ?? raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
-  return listGroups(norm).flat().some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
+  for (const el of listGroups(norm).flat()) {
+    for (const stage of el.split(BARE_PIPE)) {
+      const snippet = stageCheckCommand(stage);
+      if (snippet) return snippet;
+    }
+  }
+  return null;
 }
+function commandRunsCheck(command) { return checkCommandSnippet(command) !== null; }
 // A program that only prints existing text can forge a pass summary (`cat mocha-results.log`, `sed -n p`,
 // `awk ...`, `grep`, `python -c 'print("12 passing")'`): their "summary" is not runner output.
 const PRINT_ONLY = /^(?:\S*\/)?(?:cat|head|tail|grep|egrep|fgrep|rg|sed|awk|gawk|perl|python[0-9.]*|ruby|node|deno|bun|php|lua|jq|yq|xargs|echo|printf|tee|cut|tr|sort|uniq|wc|column|less|more|fold|dd|base64|openssl|curl|wget|git|ssh|sh|bash|dash|zsh|ksh|xsel|xclip|pbcopy|pbpaste|tar|gzip|gunzip|zcat|strings|file|stat|find|ls|tree|env|printenv|set|read)(?=\s|$)/;
@@ -279,7 +285,7 @@ function exitIsMasked(command, pipefail = false) {
   if (withCommand.length === 1) return false;
   // A group "holds the check" only when a stage of one of its elements runs a check in program position —
   // a check verb inside an argument or a quoted string does not hold the exit status either.
-  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some(stageRunsCheck));
+  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some((stage) => stageCheckCommand(stage) !== null));
   return withCommand.slice(0, -1).some(holdsCheck) || !holdsCheck(real[real.length - 1]);
 }
 const TAIL_ARGS = /^\s*tail(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
@@ -302,7 +308,7 @@ function maskedByTailPipeOnly(command) {
   if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
   if (!segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s))) return false;
   const last = segs[segs.length - 1];
-  if (stageRunsCheck(last)) return true;
+  if (stageCheckCommand(last) !== null) return true;
   const prog = last.trim().replace(EXEC_PREFIX, '');
   return !PRINT_ONLY.test(prog);
 }
@@ -324,7 +330,7 @@ function checkSummary(output) {
   // A passing test's own title ("✔ retries after 3 failed attempts") is not a failure signal; the summary lines decide.
   const scan = tail.split('\n').filter((l) => !PASSING_TITLE.test(l)).join('\n');
   if (FAILURE_MARKER.test(scan) || EXIT_MENTION.test(scan)) return 'fail';
-  if (/^npm (?:ERR!|error)\b/m.test(scan) || /coverage[^\n]*(?:does not meet|threshold[^\n]*not met)|threshold[^\n]*not met/i.test(scan)) return 'fail';
+  if (/^npm (?:ERR!(?=\s|$)|error\b)/m.test(scan) || /coverage[^\n]*(?:does not meet|threshold[^\n]*not met)|threshold[^\n]*not met/i.test(scan)) return 'fail';
   const nodeTest = /[ℹi] fail ([1-9]\d*)/.exec(tail);
   if (nodeTest) return 'fail';
   const nodePass = /[ℹi] pass ([1-9]\d*)/.exec(tail);
@@ -452,6 +458,16 @@ function capMiddle(s, max) {
   const head = Math.ceil(keep / 2);
   return s.slice(0, head) + marker + s.slice(s.length - (keep - head));
 }
+function capCheckCommand(command, max, snippet) {
+  if (command.length <= max) return command;
+  const capped = capMiddle(command, max);
+  if (!snippet || commandRunsCheck(capped)) return capped;
+  // The schema cut is only a reporting cap: retain an executable check invocation rather than placing it
+  // after arbitrary truncated text, where the server's executable-position detector would reject it.
+  const pipefailPrefix = /^\s*set\s+-o\s+pipefail\s*;\s*/.exec(command)?.[0] || '';
+  const tailSuffix = /(\s*\|\s*tail(?:\s+-\S+)*\s*)$/.exec(command)?.[0] || '';
+  return (pipefailPrefix + snippet + tailSuffix).slice(0, max);
+}
 function keepTail(s, max) {
   if (s.length <= max) return s;
   const marker = '…[earlier text cut]…\n';
@@ -518,7 +534,7 @@ function parseForVerify(lines) {
     return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) };
   }).filter((e) => e.check);
   const checks = capChecks(evidence).map((e) => {
-    const check = { command: capMiddle(e.command, CHECK_COMMAND_CAP), output: e.output.slice(-4000), exit_code: e.exitCode };
+    const check = { command: capCheckCommand(e.command, CHECK_COMMAND_CAP, e.check ? checkCommandSnippet(e.command) : null), output: e.output.slice(-4000), exit_code: e.exitCode };
     // The server reads a masked exit from the command text, which the cap can cut, so a cut command carries the outcome
     // decided on the whole command. passed:true only on a full pass of a command that runs a check in program position;
     // otherwise passed:false (a fail, or an unknown the cut text could turn into a pass). `passed` is in every
