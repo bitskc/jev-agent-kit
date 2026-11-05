@@ -9,7 +9,7 @@ signal on ambiguous cases; `--offline` (no credentials) still exercises every de
 case, which is the whole surface the `kit_command_guard` rules themselves (as opposed to Jev's own judgment)
 can be held accountable for.
 
-## Latest: 2026-10-28, offline (no Jev credentials in this environment)
+## Latest: 2026-11-05, offline (no Jev credentials in this environment)
 
 620 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
