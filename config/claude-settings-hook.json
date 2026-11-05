@@ -29,6 +29,13 @@
           { "type": "command", "command": "$HOME/.local/share/jev-agent-skills/hooks/jev-guard-hook.sh", "timeout": 5 }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.local/share/jev-agent-skills/hooks/jev-stop-verify.js\"", "timeout": 10 }
+        ]
+      }
     ]
   }
 }

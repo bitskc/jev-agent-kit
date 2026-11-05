@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { sizeDispatch } from "../src/kit/tier.mjs";
-import { verifyDone, checkSummary } from "../src/kit/verify.mjs";
+import { verifyDone, checkSummary, runOutcome, classifyToolResult, exitIsMasked, commandRunsCheck, turnsOf, parseJsonl } from "../src/kit/verify.mjs";
 import { resolveUpstream, askUpstream, GATEWAY_BASE, TYPESAFE_BASE } from "../src/kit/jev.mjs";
 
 const noJev = { ask: null, jevAvailable: false };
@@ -142,6 +142,99 @@ test("checkSummary: a fail signal after an early 'passing' line still reports fa
   // a combined build+test command: tests passed, the build step after them did not.
   assert.equal(checkSummary("5 passing (1s)\nsrc/foo.ts(10,5): error TS2345: argument of type"), "fail");
 });
+test("runOutcome: failure text beats a clean exit status through a pipe (the masked-failure regression)", () => {
+  // `npx mocha | tail -3` exits 0 while the runner printed "1 failing".
+  assert.equal(runOutcome("npx mocha | tail -3", "  1 failing\n  11 passing", 0), "fail");
+  // Other runners' failure text behind a masked exit 0 must also be a fail (FAILURE_MARKER is not mocha-only).
+  assert.equal(runOutcome("go test ./... | tail -3", "--- FAIL: TestAdd (0.00s)\nFAIL\texample/pkg\t0.01s", 0), "fail");
+  assert.equal(runOutcome("python -m unittest | tail -3", "Ran 3 tests\nFAILED (failures=1)", 0), "fail");
+  assert.equal(runOutcome("npx jest | tail -3", "Tests:       1 failed, 4 passed, 5 total", 0), "fail");
+  assert.equal(checkSummary("  0 failing\n  12 passing (3s)"), "pass");
+});
+test("runOutcome: a masked exit passes on a pass summary only when the sole mask is one bare pipe into tail/head (#91)", () => {
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test || true", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test ; echo done", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "  12 passing (3s)", 0), "pass");
+  // a masked status is not a pass on its own: failure text beats the summary, and no summary is unknown.
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)\n  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test | tail -5", "  12 passing (3s)", 1), "fail");
+  assert.equal(runOutcome("npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test | tail -5", "", 0), "unknown");
+});
+test("runOutcome: a masked pass summary is trusted only through the structural tail/head rule; forgeries and redirects stay unknown", () => {
+  // a trailing segment could print a summary the check did not produce, so only one bare pipe into tail/head counts
+  assert.equal(runOutcome("npm test 2>&1 | tail -20; printf 'a\\nb\\n  12 passing\\n'", "a\nb\n  12 passing\n", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | grep -v failing | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20 || echo hi", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >log 2>&1; tail log", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >/dev/null 2>&1; echo '  12 passing'", "  12 passing", 0), "unknown");
+  assert.equal(runOutcome("echo pipefail; npm test | tail -20", "  12 passing (3s)", 0), "unknown");
+  // the honest shapes still pass: one bare pipe into tail or head, stderr merged, prefix elements before the check
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test 2>&1 | head -n 5", "  12 passing (3s)", 0), "unknown"); // head can cut the failing line off: only tail is trusted
+  assert.equal(runOutcome("cd api && npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "pass");
+  // the checks that are load-bearing on the left side of a single pipe: a `||`, a redirect, or a file argument to tail
+  assert.equal(runOutcome("cd api || npm test 2>&1 | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test >log | tail -5", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20 forged.log", "  12 passing (3s)", 0), "unknown");
+});
+test("runOutcome: pipefail decides whether a masked status is trusted, shown on output with no summary", () => {
+  // Under pipefail the piped check's own status is the exit code, so exit 0 with no failure text passes.
+  assert.equal(runOutcome("set -o pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set +o pipefail; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -eo pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("set +o pipefail -e; set -o pipefail; npm test | tail -5", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("set -o pipefail; set +o pipefail -e; npm test | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "pass");
+  assert.equal(runOutcome("npm test -- \"set -o pipefail\" | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; bash -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; /bin/bash -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("set -o pipefail; ksh -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test' | tail -5", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("/bin/bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  // pipefail counts only from an exact `set -o pipefail` prefix, or a leading `bash -o pipefail -c`.
+  assert.equal(runOutcome("node --test test/x.test.mjs --test-name-pattern pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+  assert.equal(runOutcome("npm test -- -t pipefail | tail -5", "SyntaxError: Unexpected token ')' in test/x.test.mjs", 0), "unknown");
+});
+test("runOutcome: a chained command masks the exit status; failure text fails, a pass summary is unknown, bare exit 0 is unknown", () => {
+  assert.equal(runOutcome("npm test ; echo done", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test ; echo done", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("npm test ; echo done", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "boom", 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test || echo hi'", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("cd api && npm test", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("cd api && npm test", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("cd api && npm test ; echo done", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("(npm test)", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("npm test &", "Error: boom", 0), "unknown");
+});
+test("classifyToolResult: a non-CHECK command's summary follows the same masking rule", () => {
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh | tail -3" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh ; echo done" }, false, "Error: boom"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "  1 failing"), "check-fail");
+  assert.equal(classifyToolResult("Bash", { command: "./run-suite.sh" }, false, "all good"), "unknown");
+});
+test("verify_done: an honest piped run with a pass summary is a proven check (#91)", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npm test 2>&1 | tail -20", output: "  12 passing (3s)", exit_code: 0 }] });
+  assert.equal(r.evidence.fresh_checks[0].passed, true);
+});
+test("verify_done: a clean-looking check followed by a chained command is not a pass", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npm test ; echo done", output: "Error: boom", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.equal(r.evidence.fresh_checks[0].passed, false);
+});
+test("verify_done: a failing run hidden behind a pipe is a fail, not an unproven check", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx mocha | tail -3", output: "  1 failing", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.ok(r.evidence.fresh_checks.some((c) => c.passed === false && !c.unproven));
+});
 test("verify_done supplied checks: unproven check never passes; exit_code and recognised summary do", async () => {
   const j = spy({ claims_done: { type: "noul", noul: 0.95 }, claims_verified: { type: "noul", noul: 0.9 }, verification_applies: { type: "noul", noul: 0.9 },
     outcome: { type: "choice", choice: "complete", probabilities: { complete: 0.9, partial: 0.05, blocked: 0.03, other: 0.02 }, confidence: 0.9 } });
@@ -174,6 +267,73 @@ test("verify_done supplied checks: a non-check command never verifies, even with
   assert.equal(r.verified, true);
   r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "npx tsc --noEmit", exit_code: 1 }] });
   assert.notEqual(r.verified, true);
+});
+
+test("verify_done supplied checks: a check verb outside program position never verifies (anchored detection)", async () => {
+  // P1: CHECK_COMMAND matched anywhere in the command text, so a verb inside a commit message, an echo payload,
+  // a filename or a log read counted as a check — and its exit 0 hard-vetoed every real check result.
+  const fakeChecks = [
+    "git commit -m 'fix jest cfg'",
+    'git commit -m "fix jest cfg"',
+    "echo done; echo npm test",
+    "cat mocha-results.log",
+    "grep -c jest package.json",
+    "ls vitest",
+  ];
+  for (const command of fakeChecks) {
+    const r = await verifyDone({ task: "x", final_message: "done", checks: [{ command, exit_code: 0 }] });
+    assert.notEqual(r.verified, true, `must not verify: ${command}`);
+    assert.equal(r.evidence.fresh_checks.length, 0, `must not be a fresh check: ${command}`);
+  }
+  // even a fabricated pass summary or passed:true cannot rescue a non-program-position verb
+  let r = await verifyDone({ task: "x", final_message: "done", checks: [{ command: "git commit -m 'fix jest cfg'", output: "12 passing", passed: true }] });
+  assert.notEqual(r.verified, true); assert.equal(r.evidence.fresh_checks.length, 0);
+  // real checks in program position — bare, wrapped, and executor forms — still count
+  const realChecks = ["npm test", "cd api && npm test", "FOO=1 npm test", "sudo -E npm test", "timeout 600 npm test",
+    "xvfb-run npm test", "bundle exec rspec", "./gradlew test", "vendor/bin/phpunit", "phpunit", "pytest",
+    "python -m pytest", "docker exec app npm test", "kubectl exec pod -- npm test", "docker compose run --rm app npm test",
+    "make -C docker test", "ssh ci npm test"];
+  for (const command of realChecks) {
+    r = await verifyDone({ task: "x", final_message: "done", checks: [{ command, exit_code: 0 }] });
+    assert.equal(r.verified, true, `must verify: ${command}`);
+  }
+});
+test("runOutcome: a stale log read through `tail` never counts as a check pass", () => {
+  // P2: maskedByTailPipeOnly trusted the left side of `| tail` without requiring it to run a check.
+  assert.equal(runOutcome("cat mocha-results.log | tail -20", "All tests passed", 0), "unknown");
+  assert.equal(runOutcome("cat mocha-results.log | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("cat mocha-results.log", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("sed -n '1,3p' mocha-results.log | tail -20", "  12 passing (3s)", 0), "unknown");
+  assert.equal(runOutcome("python -c 'print(\"12 passing\")' | tail", "12 passing", 0), "unknown");
+  // a real check (or a custom runner, which is not a print-only tool) still clears the tail
+  assert.equal(runOutcome("npm test | tail -20", "  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("./run-suite.sh | tail -3", "  12 passing (3s)", 0), "pass");
+});
+test("checkSummary/runOutcome: zero passes never verify; green text followed by a failure marker still fails", () => {
+  // P2: "0 passed" matched the pass phrases and fell through to the bare exit-0 pass.
+  for (const out of ["0 passed", "Tests: 0 passed, 0 total", "  0 passing", "test result: ok. 0 passed; 0 failed", "0 examples, 0 failures"]) {
+    assert.notEqual(checkSummary(out), "pass", `must not pass: ${JSON.stringify(out)}`);
+    assert.equal(runOutcome("npm test", out, 0), "unknown", `must not verify: ${JSON.stringify(out)}`);
+  }
+  // P2: coverage-threshold and modern `npm error` failures printed after a green summary must win.
+  assert.equal(checkSummary("12 passing\nJest: coverage threshold for branches (80%) not met: 75%"), "fail");
+  assert.equal(checkSummary("12 passing\nJest: \"global\" coverage threshold for lines (80%) not met: 70%"), "fail");
+  assert.equal(checkSummary("5 passed in 1.2s\nERROR: Coverage for lines: 72% does not meet threshold: 80%"), "fail");
+  assert.equal(checkSummary("12 passing\nnpm error code 1\nnpm error command failed"), "fail");
+  assert.equal(runOutcome("npm test", "12 passing\nnpm error code 1\nnpm error command failed", 0), "fail");
+  // ordinary clean output still passes; a passing title mentioning failures is still not failure text
+  assert.equal(runOutcome("npm test", "  12 passing (3s)", 0), "pass");
+  assert.equal(checkSummary("  ✔ retries after 3 failed attempts\n\n  12 passing (3s)"), "pass");
+});
+test("classifyToolResult: transcript classification uses the same anchored check detection", async () => {
+  assert.equal(classifyToolResult("Bash", { command: "git commit -m 'fix jest cfg'" }, false, "[main abc] fix"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "git commit -m 'fix jest cfg'" }, false, "12 passing"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "echo done; echo npm test" }, false, "done"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "cat mocha-results.log" }, false, "  12 passing (3s)"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "cat mocha-results.log | tail -20" }, false, "All tests passed"), "unknown");
+  assert.equal(classifyToolResult("Bash", { command: "npm test" }, false, "  12 passing (3s)"), "check-pass");
+  assert.equal(classifyToolResult("Bash", { command: "cd api && npm test" }, false, "  1 failing"), "check-fail");
+  assert.equal(classifyToolResult("Bash", { command: "docker exec app npm test" }, false, "  12 passing (3s)"), "check-pass");
 });
 test("rungFor: claude-* ids resolve to their own family, not the generic director alias", async () => {
   assert.equal((await sizeDispatch({ description: "x", model: "claude-fable-5-1" }, noJev)).chosen.tier, "fable");
@@ -301,4 +461,229 @@ test("guard.mjs firstBlockingHit: url_credentials scheme must not go quadratic, 
   assert.ok(ms < 50, `firstBlockingHit took ${ms}ms on a 20000-char input, expected well under 50ms`);
   const hit = firstBlockingHit("creds: postgres://admin:s3cr3tPassw0rd@db.internal:5432/app");
   assert.equal(hit && hit.kind, "url_credentials");
+});
+
+// ── PR #31 round-20 review: masked-exit rules (F1 server side, F3, F4, F5, F7, F8) ──
+// Data-only: every command string below is passed to runOutcome/verifyDone as text and never executed.
+const OK = "  12 passing (3s)";
+test("F1: a non-check command never becomes a fresh check, whatever `passed` says", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "git commit -m " + "x".repeat(300), passed: true }] });
+  assert.notEqual(r.verified, true);
+  assert.equal(r.evidence.fresh_checks.length, 0);
+  const r2 = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "ls src", passed: true, exit_code: 0 }] });
+  assert.notEqual(r2.verified, true);
+  // a real check command still honours its `passed` override
+  const r3 = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "npm test", passed: true }] });
+  assert.equal(r3.verified, true);
+});
+test("F6: a cut check sent as passed:false is a non-pass; the wire has no extra field", async () => {
+  const r = await verifyDone({ task: "x", final_message: "done", file_changes: 1, checks: [{ command: "npm test", passed: false, output: "  12 passing (3s)", exit_code: 0 }] });
+  assert.notEqual(r.verified, true);
+  assert.equal(r.evidence.fresh_checks[0].passed, false);
+  const { registerKitTools } = await import("../src/kit/tools.mjs");
+  let schema;
+  registerKitTools({ registerTool: (name, def) => { if (name === "kit_verify_done") schema = def.inputSchema; } }, () => ({}));
+  assert.ok(schema.safeParse({ final_message: "x", checks: [{ command: "npm test", passed: false }] }).success);
+  assert.equal(schema.safeParse({ final_message: "x", checks: [{ command: "npm test", unproven: true }] }).success, false, "strict: no `unproven` key");
+});
+test("N2: executor words are masked only as the program of a stage that holds a quoted body; elsewhere they are plain words", () => {
+  for (const cmd of [
+    "docker compose run --rm app npm test", "docker exec app npm test", "docker run --rm -v $PWD:/app img npm test", "podman run x npm test",
+    "kubectl exec pod -- npm test", "ssh ci npm test", "cd docker && npm test", "cd ssh && npm test", "cd tools/script && npm test",
+    "cd watch; npm test", "cd watch && npm test", "make -C docker test", "pytest -k docker", "pytest docker", "npm test -- docker",
+    "cargo test --package su", "go test ./watch ./...", "npx jest watch", "sudo -E docker run img npm test",
+  ]) assert.equal(runOutcome(cmd, OK, 0), "pass", cmd);
+  for (const cmd of [
+    "docker exec app 'npm test || true'", "ssh ci 'cd repo && npm test'", 'eval "npm test"', "script -c 'npm test'", "su -c 'npm test; true'",
+    "/usr/bin/ssh ci 'npm test || true'", "sudo -E docker exec app 'npm test || true'", "FOO=1 docker exec app 'npm test || true'",
+    "xargs -I{} sh -c 'npm test'", "echo x | ssh ci 'npm test || true'", "podman exec app 'npm test || true'", "kubectl exec pod -- sh -c 'npm test || true'",
+    "docker exec app npm test -- -t 'a (b)'", // conservative by design: an executor program plus any quoted span could hide a body
+  ]) assert.equal(runOutcome(cmd, OK, 0), "unknown", cmd);
+});
+test("P3-f: a backslash-escaped `$` before a quote is not ANSI-C quoting", () => {
+  assert.equal(runOutcome("npm test -- -t \\$'a\\'", OK, 0), "pass");
+  assert.equal(runOutcome("npm test -- -t $'a\\'b'", OK, 0), "pass");
+  assert.equal(runOutcome("npm test -- -t $'a\\'b; echo c'; echo d", OK, 0), "unknown");
+});
+test("F3: an all-&& chain that exits 0 proves every element, so the check passes", () => {
+  for (const [cmd, out] of [
+    ["npm run build && npm test", OK], ["npm ci && npm test", OK], ["make clean && make test", OK],
+    ["cargo build && cargo test", "test result: ok. 5 passed; 0 failed"], ["go build ./... && go test ./...", "ok  \tpkg\t0.1s"],
+    ["npm test && echo OK", OK + "\nOK"], ["npx tsc --noEmit && echo TSC OK", "TSC OK"], ["rm -rf dist && npm run build && npm test", OK],
+    ["npm test &&\n  echo OK", OK + "\nOK"],
+  ]) assert.equal(runOutcome(cmd, out, 0), "pass", cmd);
+  assert.equal(runOutcome("npm run build && npm test", OK, 1), "fail");
+  assert.equal(runOutcome("npm run build && npm test", "  1 failing", 0), "fail");
+});
+test("F3: a ;/newline list reports only its last command: trusted when the check is last, masked when anything follows it", () => {
+  assert.equal(runOutcome("echo hi; npm test", OK, 0), "pass");
+  assert.equal(runOutcome("# run the suite\nnpm test", OK, 0), "pass");
+  assert.equal(runOutcome("npm test\n# done", OK, 0), "pass");
+  assert.equal(runOutcome("cd api; npm test", OK, 0), "pass");
+  assert.equal(runOutcome("npm test ; echo done", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test\necho done", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test; npm run lint", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test; cd api", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test || echo hi", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test &", OK, 0), "unknown");
+  assert.equal(runOutcome("(npm test)", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test $(git diff --name-only)", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test | cat", OK, 0), "unknown");
+});
+test("F4: operators inside quotes are data, not structure", () => {
+  for (const cmd of [
+    `pytest -k "a and (b or c)"`, `pytest -k 'not (slow or db)'`, `npx jest -t "adds (two) numbers"`, `npx vitest run -t "handles a;b"`,
+    `npm test -- -t 'x && y'`, `npm test -- --grep "a|b"`, `npm test -- -t "a & b"`, `cd api && npm test -- -t "(x)"`,
+    `npm test -- -t "say \\"hi\\" (twice)"`, `npm test -- -t 'it''s (fine)'`, `FOO="a b" npm test`, `# don't panic\nnpm test`,
+  ]) assert.equal(runOutcome(cmd, OK, 0), "pass", cmd);
+  // still masked: structure outside the quotes, executable substitutions inside double quotes, an unterminated quote
+  for (const cmd of [`npm test $(git diff --name-only)`, `npm test -- -t "$(git diff)"`, "npm test -- -t \"`id`\"", `npm test -- -t 'oops`, `npm test -- -t "oops`, `npm test "a" ; echo 'b'`]) {
+    assert.equal(runOutcome(cmd, OK, 0), "unknown", cmd);
+  }
+});
+test("F4: a quoted shell body or executor is not hidden from the mask", () => {
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test || echo hi'", OK, 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test; echo hi'", OK, 0), "unknown");
+  assert.equal(runOutcome("/bin/bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "unknown");
+  assert.equal(runOutcome("eval 'npm test || true'", OK, 0), "unknown");
+  assert.equal(runOutcome("ssh host 'npm test; echo done'", OK, 0), "unknown");
+  assert.equal(runOutcome("sh -ec 'npm test || true'", OK, 0), "unknown");
+  assert.equal(runOutcome("bash -o pipefail -c 'npm test | tail -5'", "Error: boom", 0), "pass");
+});
+test("F5: a passing test's own title never reads as a failure; real failure signals still win", () => {
+  assert.equal(runOutcome("npm test", "  ✔ retries after 3 failed attempts\n\n  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test", "  ✓ exited with code 1 on bad flag\n\n  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npm test", "  ✓ exits with code 1 on bad flag\n\n  12 passing (3s)", 0), "pass");
+  assert.equal(runOutcome("npx jest --verbose", "  ✓ handles 2 failed logins\nTests: 12 passed, 12 total", 0), "pass");
+  assert.equal(runOutcome("npm test", "PASS src/a.test.js\n  √ rejects 4 failed requests\n  ok 2 failed over\n  12 passing", 0), "pass");
+  assert.equal(checkSummary("  ✔ retries after 3 failed attempts\n\n  12 passing (3s)"), "pass");
+  // authoritative failure signals are not title lines
+  assert.equal(runOutcome("npm test", "  ✔ retries after 3 failed attempts\n\n  11 passing\n  1 failing", 0), "fail");
+  assert.equal(runOutcome("npx mocha 2>&1 | tail -3", "  1 failing", 0), "fail");
+  assert.equal(runOutcome("npx jest", "  ✓ handles 2 failed logins\nTests: 1 failed, 11 passed, 12 total", 0), "fail");
+  assert.equal(runOutcome("pytest", "=== 1 failed, 11 passed in 0.3s ===", 0), "fail");
+  assert.equal(runOutcome("go test ./...", "ok  \tpkg\t0.1s\nFAIL\tother\t0.2s", 0), "fail");
+  assert.equal(runOutcome("npm test", "  ✔ retries after 3 failed attempts\n  12 passing", 1), "fail");
+  assert.equal(runOutcome("npm test", "  ✓ ok\nFAIL src/b.test.js", 0), "fail");
+});
+test("F7: `||` and a leading `!` mask the status", () => {
+  assert.equal(runOutcome("cd api || npm test", OK, 0), "unknown");
+  assert.equal(runOutcome("export X=1 || npm test", OK, 0), "unknown");
+  assert.equal(runOutcome("! npm test", OK, 0), "unknown");
+  assert.equal(runOutcome("cd api && ! npm test", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test -- -t 'a || b'", OK, 0), "pass");
+});
+test("F8: only tail is a trusted pipe; head can cut the failing line off", () => {
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", OK, 0), "pass");
+  assert.equal(runOutcome("npm test 2>&1 | head -n 5", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test | head -5", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test | head", OK, 0), "unknown");
+});
+test("regression: masked forgeries stay unknown", () => {
+  assert.equal(runOutcome("npm test >/dev/null 2>&1; echo '  12 passing'", "  12 passing", 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | grep -v failing | tail -20", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20 || echo hi", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test |& tail -20", OK, 0), "unknown");
+  assert.equal(runOutcome("npm test 2>&1 | tail -20", OK, 0), "pass");
+});
+
+// ── PR #31 adversarial-review round: the server rules the hook mirrors (data-only; commands are text, never executed) ──
+const O12 = "  12 passing (3s)";
+test("F1: a check the shell never runs is not a pass: mid-line comments, heredoc openers in quotes/comments, inexact closers", () => {
+  for (const c of ["echo ok # ; npm test", "true # && pytest", "echo ok #; npm test"]) assert.equal(commandRunsCheck(c), false, c);
+  assert.equal(commandRunsCheck("echo a#b; npm test"), true, "a mid-word # is not a comment");
+  for (const c of ["mypy . # <<true\necho masked\ntrue", "X='<<true' mypy .\necho masked\ntrue", 'mypy . "<<true"\necho masked\ntrue']) assert.equal(exitIsMasked(c), true, c);
+  for (const c of ["cat <<EOF\nx\n EOF\nnpm test", "cat <<EOF\nx\nEOF \nnpm test", "cat <<-EOF\n\tx\n  EOF\nnpm test", "npm test <<EOF\nbody"]) {
+    assert.equal(commandRunsCheck(c), false, c);
+    assert.equal(exitIsMasked(c), true, c);
+  }
+  assert.equal(runOutcome("cat <<-EOF\n\tx\n\tEOF\nnpm test", O12, 0), "pass");
+  assert.equal(runOutcome("cat <<'EOF' >f\nx\nEOF\nnpm test", O12, 0), "pass");
+});
+test("F1: a terminator in program position masks the exit status; `exec <check>` is the check", () => {
+  for (const c of ["exit 0; npm test", "exit 0 && npm test", "exec true; pytest", "trap 'exit 0' EXIT; mypy .", "return 0; npm test", "kill $$; npm test", "builtin exit 0; npm test", "logout; npm test", "command exit 0; npm test",
+    "\\exit 0; npm test", '"exit" 0; npm test', "e=exit; $e 0; npm test", "if true; then exit 0; fi; npm test"]) {
+    assert.equal(exitIsMasked(c), true, c);
+    assert.equal(runOutcome(c, "", 0), "unknown", c);
+  }
+  assert.equal(runOutcome("exec npm test", O12, 0), "pass");
+});
+test("F6: option-aware wrappers and runners are checks (and passes when attributable); false-pass shapes stay unknown", () => {
+  for (const c of ["uv run pytest", "poetry run pytest", "yarn jest", "yarn vitest", "pnpm exec vitest", "npx -y vitest run", "npx --no-install jest", "nice -n 5 npm test", "sudo -u ci npm test", "stdbuf -oL npm test", "env -i npm test",
+    "command pytest", "exec npm test", "npm run -s test", "npm --prefix x test", "npm -w x test", "pnpm -r test", "make -j4 test", "(cd server && npm test)", "bash -c 'npm test'", "sh -c 'npm test'", "npm run test:unit"]) {
+    assert.equal(commandRunsCheck(c), true, c);
+    assert.equal(runOutcome(c, O12, 0), "pass", c);
+  }
+  for (const c of ["bash -c 'npm test; echo hi'", "sh -c 'npm test || true'", "(npm test)", "(cd api && npm test; echo hi)", "bash -c 'npm test' | tail -5"]) assert.equal(runOutcome(c, "Error: boom", 0), "unknown", c);
+  for (const c of ["docker run --rm img npm test", "sudo -l pytest", "command -v pytest"]) assert.equal(commandRunsCheck(c), false, c);
+});
+test("F7: installs, lookalike scripts and flag-only invocations are not checks; zero-test runs are not passes", () => {
+  for (const c of ["npm ci", "npm run lint:fix", "npm run test-seed-db", "npx tsc-alias", "pytest --help", "tsc --version", "pytest --collect-only", "jest --listTests", "make --dry-run test", "npm test -- -h"]) assert.equal(commandRunsCheck(c), false, c);
+  assert.equal(commandRunsCheck("npm run ci"), true);
+  for (const [c, o] of [["npm test", "No tests found, exiting with code 0"], ["pytest", "collected 0 items"], ["pytest", "0 tests collected"], ["go test ./...", "?   \tpkg\t[no test files]"]]) assert.equal(runOutcome(c, o, 0), "unknown", c);
+});
+test("F12: an over-cap command is classified from its ends and never earns a pass", () => {
+  const long = "npm test " + "x ".repeat(1200);
+  assert.equal(commandRunsCheck(long), true);
+  assert.equal(runOutcome(long, O12, 0), "unknown");
+  assert.equal(exitIsMasked(long), true);
+});
+test("F8: transcript classification gives a pass only to a recognised check or a custom runner, not to a text printer", () => {
+  for (const c of ["tac results.log", "nl results.log", "docker logs ci", "gh run view --log", "kubectl logs pod", "diff a.log b.log", "xxd r.log", "rev r.log", "bat r.log"]) {
+    assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "unknown", c);
+  }
+  for (const c of ["./run-suite.sh", "scripts/ci.sh", "make ci", "npm run ci", "./run.sh | tail -3"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "check-pass", c);
+});
+test("F2: a background Bash run in a transcript tail is not a passing check", () => {
+  const rec = (type, extra) => JSON.stringify({ type, ...extra });
+  const jsonl = (input, reply) => [
+    rec("user", { message: { role: "user", content: "Fix the parser." } }),
+    rec("assistant", { message: { role: "assistant", content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "a.js" } }] } }),
+    rec("user", { toolUseResult: { stdout: "ok" }, message: { content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } }),
+    rec("assistant", { message: { role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input }] } }),
+    rec("user", { toolUseResult: { stdout: reply }, message: { content: [{ type: "tool_result", tool_use_id: "b1", content: reply }] } }),
+  ].join("\n");
+  const checksOf = (input, reply) => turnsOf(parseJsonl(jsonl(input, reply))).at(-1).checks;
+  assert.deepEqual(checksOf({ command: "npm test", run_in_background: true }, "Command running in background with ID: bash_1"), []);
+  assert.deepEqual(checksOf({ command: "npm test" }, "Command running in background with ID: bash_2"), []);
+  assert.equal(checksOf({ command: "npm test" }, O12).length, 1);
+});
+
+// ── PR #31 re-review round (N1, N2, N3, N5): decision-only ──
+test("N1: builtins that stop the shell or change what runs next, before the check, make the status unknown; harmless setup stays trusted", () => {
+  for (const c of ["set -n; npm test", "set -o noexec\nnpm test", "eval exit 0; npm test", "source /dev/stdin <<<'exit 0'; npm test", ". /dev/stdin <<<'exit 0'\nnpm test", "hash -p /bin/true npm; npm test",
+    "shopt -s expand_aliases\nalias npm=true\nnpm test", "(cd . && set -n && mypy .)", "sh -c 'set -n; npm test'", "PATH=/evil; npm test", "export PATH=/evil; npm test", "BASH_ENV=/x; pytest", "ulimit -t 0; npm test", "wait; npm test",
+    "unalias npm; npm test", "enable -n test; npm test", "printf -v PATH x; npm test", "set -o posix -n; npm test"]) {
+    assert.equal(exitIsMasked(c), true, c);
+    assert.equal(runOutcome(c, "", 0), "unknown", c);
+    assert.equal(runOutcome(c, O12, 0) === "pass" && commandRunsCheck(c) && !/\|/.test(c), false, c);
+  }
+  for (const c of ["npm run build && npm test", "cd api && npm test", "rm -rf dist && npm run build && npm test", "npm ci && npm test", "make clean && make test", "cargo build && cargo test", "go build ./... && go test ./...",
+    "echo hi; npm test", "set -euo pipefail; npm test", "export NODE_ENV=test; npm test", "CI=true; pytest", "./gen.sh && npm test", "(cd api && npm test)", "sh -c 'cd api && npm test'"]) {
+    assert.equal(exitIsMasked(c), false, c);
+    assert.equal(runOutcome(c, O12, 0), "pass", c);
+  }
+});
+test("N1: a masked tail-pipe pass summary is not trusted behind a shell-state builtin", () => {
+  for (const c of ["source /dev/stdin <<<'x'; npm test 2>&1 | tail -20", "alias npm=true; npm test | tail", "set -n; npm test | tail -5"]) assert.equal(runOutcome(c, O12, 0), "unknown", c);
+  assert.equal(runOutcome("cd api && npm test 2>&1 | tail -20", O12, 0), "pass");
+});
+test("N2: make's non-running modes are not checks", () => {
+  for (const c of ["make -n test", "make --just-print test", "make --dry-run test", "make -t test", "make --touch test", "make -q test", "make --question test", "make -p test", "make --print-data-base test", "make -nB test", "make -kn test", "make test -n"]) {
+    assert.equal(commandRunsCheck(c), false, c);
+  }
+  for (const c of ["make test", "make -j4 test", "make -C docker test", "make -k test", "make -f Makefile.ci test"]) assert.equal(commandRunsCheck(c), true, c);
+});
+test("N3: --if-present, housekeeping test:* scripts and version/init/list/no-run forms are not checks; all-skipped runs are not passes", () => {
+  for (const c of ["npm run build --if-present", "npm test --if-present", "npm run test:watch", "npm run test:db:reset", "npm run test:update-snapshots", "npm run test:install-browsers", "tsc --init", "tsc -v", "eslint -v", "ruff version",
+    "ruff format .", "jest --showConfig", "pytest --fixtures", "cargo test --no-run", "go test -list ."]) assert.equal(commandRunsCheck(c), false, c);
+  for (const c of ["npm run test:unit", "npm run test:e2e", "npm run test:integration", "npm run test:coverage", "pnpm test:ui", "ruff check .", "ruff ."]) assert.equal(commandRunsCheck(c), true, c);
+  for (const [c, o] of [["npx jest", "Tests:       3 skipped, 3 total"], ["npx vitest run", " Tests  2 skipped (2)"], ["go test ./...", "ok  \tpkg\t0.1s [no tests to run]"], ["pytest", "=== 2 skipped in 0.1s ==="]]) {
+    assert.equal(runOutcome(c, o, 0), "unknown", `${c} / ${o}`);
+  }
+  assert.equal(runOutcome("npx jest", "Tests:       1 skipped, 2 passed, 3 total", 0), "pass");
+});
+test("N5: a custom runner earns a transcript pass only as the last and only non-prefix element", () => {
+  for (const c of ["cat forged.log && ./noop.sh", "cat forged.log; ./noop.sh", "tac forged.log | ./noop.sh", "./a.sh && ./b.sh", "echo done && make ci"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "unknown", c);
+  for (const c of ["./run.sh", "cd x && ./run.sh", "export A=1; scripts/ci.sh", "./run.sh | tail -3", "make ci", "cd x && npm run ci"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "check-pass", c);
 });

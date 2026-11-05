@@ -1,0 +1,7 @@
+{
+  "name": "fixture-bugfix-nodeps",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": { "test": "node --test test/" },
+  "devDependencies": { "@fixture-internal/bugcheck-runner": "^1.0.0" }
+}

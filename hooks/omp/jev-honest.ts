@@ -23,7 +23,8 @@ function normalize(v: unknown): Level | null {
 
 // ── rules (user-authored standing checks) ──────────────────────────────────
 // Three layers merge in id order, later wins: built-in examples (embedded below, since this file is installed
-// standalone with no sibling rules.default.json) -> user global (~/.config/jev/rules.json) -> repo
+// standalone with no sibling rules.default.json) -> user global (rules.json in userConfigDir(): PI_CODING_AGENT_DIR/jev
+// if set, else XDG_CONFIG_HOME/jev, else ~/.config/jev) -> repo
 // (.jev/rules.json in the cwd). A {"id":...,"disabled":true} entry at a later layer removes an earlier layer's
 // same-id rule. Malformed entries are skipped individually; never crashes the hook.
 type Rule = { id: string; when: string; ask: string; evidence: string };
@@ -36,9 +37,18 @@ const DEFAULT_RULES: Rule[] = [
   },
 ];
 const ID_RE = /^[a-z0-9-]{2,48}$/;
-function userRulesPath(): string {
+// Isolation note (mirrors the Claude Code side's userConfigDir() fix): AGENT_DIR above already follows
+// PI_CODING_AGENT_DIR, so a sandboxed omp session expects rules.json/config.json to follow it too — before
+// this fix neither did, so a sandboxed session's rule-add/honestLevel default silently landed in the real
+// operator's ~/.config/jev regardless of PI_CODING_AGENT_DIR. Tiering: PI_CODING_AGENT_DIR (if set) >
+// XDG_CONFIG_HOME (if set) > ~/.config.
+function userConfigDir(): string {
+  if (process.env.PI_CODING_AGENT_DIR) return path.join(process.env.PI_CODING_AGENT_DIR, "jev");
   const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(base, "jev", "rules.json");
+  return path.join(base, "jev");
+}
+function userRulesPath(): string {
+  return path.join(userConfigDir(), "rules.json");
 }
 function repoRulesPath(): string {
   return path.join(process.cwd(), ".jev", "rules.json");
@@ -152,11 +162,10 @@ function rulesSection(): string {
   if (!list.length) return "";
   return `\n\n## Rules\n\nBefore you say any of the following, answer the question with evidence in the same message; if you cannot, say so instead of presenting the outcome:\n\n${list.map(ruleLine).join("\n")}`;
 }
-// Default level: JEV_HONEST_DEFAULT_LEVEL env > ~/.config/jev/config.json {"honestLevel": ...} > off (same 3-step
-// resolution as the Claude Code hooks, so the README's "same levels/semantics" promise actually holds for omp).
+// Default level: JEV_HONEST_DEFAULT_LEVEL env > config.json {"honestLevel": ...} in userConfigDir() > off
+// (same resolution as the Claude Code hooks, so the README's "same levels/semantics" promise actually holds).
 function configPath(): string {
-  const base = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config");
-  return path.join(base, "jev", "config.json");
+  return path.join(userConfigDir(), "config.json");
 }
 function defaultLevel(): Level {
   const env = normalize(process.env.JEV_HONEST_DEFAULT_LEVEL);
