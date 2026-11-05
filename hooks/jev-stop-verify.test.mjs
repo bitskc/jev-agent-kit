@@ -167,11 +167,12 @@ const rt = require("./honest/jev-honest-runtime.js");
 
 // ── env isolation, same shape as honest.test.mjs's ISOLATED_ENV_KEYS pattern ──────────────────────────
 const ISOLATED_ENV_KEYS = [
-  "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "JEV_HONEST_DEFAULT_LEVEL",
+  "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "JEV_HONEST_DEFAULT_LEVEL",
   "JEV_STOP_GATE", "JEV_MCP_URL", "JEV_MCP_TOKEN", "JEV_GUARD_TIMEOUT", "JEV_GUARD_DEBUG",
 ];
 let savedEnv;
-test.beforeEach(() => { savedEnv = Object.fromEntries(ISOLATED_ENV_KEYS.map((k) => [k, process.env[k]])); });
+// The loop-guard counter lives under $XDG_STATE_HOME: every test gets its own, so no test writes into the real home.
+test.beforeEach(() => { savedEnv = Object.fromEntries(ISOLATED_ENV_KEYS.map((k) => [k, process.env[k]])); process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "state-")); });
 test.afterEach(() => {
   for (const k of ISOLATED_ENV_KEYS) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
 });
@@ -1400,7 +1401,7 @@ test("NEW-7 regression: a sidechain assistant text block does not overwrite the 
 });
 
 // ── #44 regressions: a schema-rejected verify payload must never fail open silently ──
-test("#44: a >2000-char check command is cut to the schema cap; the hook sends the outcome decided on the full command", async () => {
+test("#44/F12: a >2000-char check command is cut to the schema cap and is never a pass (analysis is bounded at the cap)", async () => {
   fresh(); setBaseEnv({ gate: "verify" });
   const { fetchImpl, calls } = stubFetch((name) => (name === "kit_verify_done" ? ALLOW : { results: [] }));
   const longCmd = "set -o pipefail; " + "X=1 ".repeat(800) + "npm test 2>&1 | tail -20";
@@ -1412,7 +1413,7 @@ test("#44: a >2000-char check command is cut to the schema cap; the hook sends t
   assert.ok(sent[0].command.length <= 2000, `command length ${sent[0].command.length}`);
   assert.ok(sent[0].command.startsWith("set -o pipefail"));
   assert.ok(sent[0].command.endsWith("| tail -20"));
-  assert.equal(sent[0].passed, true);
+  assert.equal(sent[0].passed, false, "past the analysis cap nothing after the cut can be ruled out: passed:false even on a green summary");
 });
 
 test("#44: more than 50 checks are capped to 50; the most recent check and every non-pass run are kept, in order", async () => {
@@ -1554,15 +1555,15 @@ test("F6: a >2000-char check whose full outcome is unknown is sent passed:false 
   acceptedByOldSchema(calls);
   assert.ok(out && out.decision === "block", `the cut text lost the mask, the full command did not: ${JSON.stringify(out)}`);
 });
-test("F6: a cut check that failed is passed:false; a cut check that passed keeps passed:true; neither adds a key", skipNoZod, async () => {
+test("F6/F12: a cut check that failed or passed is passed:false (over-cap is never a pass); neither adds a key; the gate blocks", skipNoZod, async () => {
   const pad = "X=1 ".repeat(800);
   const failed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  1 failing", true])).checks[0];
   assert.equal(failed.passed, false);
   const passed = stopGate.parseForVerify(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  12 passing (3s)"])).checks[0];
-  assert.equal(passed.passed, true);
+  assert.equal(passed.passed, false);
   const { out, calls } = await verifyOut(editThen(["set -o pipefail; " + pad + "npm test 2>&1 | tail -20", "  12 passing (3s)"]));
   acceptedByOldSchema(calls);
-  assert.equal(out, null, `a cut passing check still verifies: ${JSON.stringify(out)}`);
+  assert.ok(out && out.decision === "block", `an over-cap check is not a proven pass: ${JSON.stringify(out)}`);
 });
 test("F2: 55 non-check commands after a passing `npm test` are never sent, so they cannot evict it (no false block)", skipNoZod, async () => {
   const noise = Array.from({ length: 55 }, () => ["ls src", "a.js\nb.js"]);
@@ -1661,4 +1662,238 @@ test("selection: an honest `phpunit` / `bundle exec rspec` run after an edit ver
     assert.equal(sentChecks(calls).length, 1, command);
     assert.equal(out, null, `${command}: ${JSON.stringify(out)}`);
   }
+});
+
+// ── PR #31 adversarial-review round (F1-F12, T11/T12/T18/T21/T33/T39): data-only; commands are text, never executed ──
+const blocks = async (command, output = "", isError = false) => {
+  const { out } = await verifyOut(editThen([command, output, isError]));
+  return Boolean(out && out.decision === "block");
+};
+test("F1a: a `#` comment that starts mid-line hides what follows it; no check is seen and the gate blocks", async () => {
+  for (const command of ["echo ok # ; npm test", "true # && pytest", "echo ok #; npm test", "true;# && pytest", "echo a;#x\nnpm test #c\nexit 0"]) {
+    assert.deepEqual(stopGate.parseForVerify(editThen([command, ""])).checks.filter((c) => c.passed !== false && stopGate.runOutcome(c.command, "", 0) === "pass"), [], `no pass from ${JSON.stringify(command)}`);
+    assert.equal(await blocks(command), true, `must block: ${JSON.stringify(command)}`);
+  }
+  // `#` inside a word is not a comment: the check after it still runs and counts
+  assert.equal(await blocks("echo a#b; npm test"), false);
+  assert.equal(await blocks("npm test # run the suite"), false);
+});
+test("F1b: a heredoc opener inside a comment or a quote is not a heredoc; the lines after it are real commands", async () => {
+  for (const command of ["mypy . # <<true\necho masked\ntrue", "X='<<true' mypy .\necho masked\ntrue", 'mypy . "<<true"\necho masked\ntrue', "mypy . \\<<true\necho masked\ntrue"]) {
+    assert.equal(stopGate.exitIsMasked(command), true, `last command is not mypy: ${JSON.stringify(command)}`);
+    assert.equal(await blocks(command), true, `must block: ${JSON.stringify(command)}`);
+  }
+  // a real heredoc still hides its body
+  assert.equal(await blocks("cat > tests/x.py <<EOF\nimport pytest\nEOF\nnpm test"), false);
+});
+test("F1c: a heredoc closes only on the exact delimiter line (`<<-` also strips leading TABS); no exact closer means the command is not read", async () => {
+  for (const command of ["cat <<EOF\nx\n EOF\nnpm test", "cat <<EOF\nx\nEOF \nnpm test", "cat <<EOF\nx\neof\nnpm test", "cat <<-EOF\n\tx\n  EOF\nnpm test", "cat <<EOF\nx\nEOF\r\nnpm test", "npm test <<EOF\nbody"]) {
+    assert.equal(stopGate.commandRunsCheck(command), false, `fail closed, not a check: ${JSON.stringify(command)}`);
+    assert.equal(stopGate.exitIsMasked(command), true);
+    assert.equal(await blocks(command), true, `must block: ${JSON.stringify(command)}`);
+  }
+  for (const command of ["cat <<EOF\nx\nEOF\nnpm test", "cat <<-EOF\n\tx\n\tEOF\nnpm test", "cat <<'EOF'\nx\nEOF\nnpm test", "cat <<A <<B\n1\nA\n2\nB\nnpm test"]) {
+    assert.equal(await blocks(command), false, `exact closer, real check afterwards: ${JSON.stringify(command)}`);
+  }
+});
+test("F1d: a terminator before the check masks the exit status; `exec <check>` is the check itself", async () => {
+  for (const command of ["exit 0; npm test", "exit 0 && npm test", "exec true; pytest", "trap 'exit 0' EXIT; mypy .", "return 0; npm test", "kill $$; npm test", "builtin exit 0; npm test", "logout; npm test",
+    "command exit 0; npm test", "\\exit 0; npm test", '"exit" 0; npm test', "e=exit; $e 0; npm test", "if true; then exit 0; fi; npm test", "true && exit 0 && npm test", "npm test; exit 0"]) {
+    assert.equal(stopGate.exitIsMasked(command), true, `masked: ${JSON.stringify(command)}`);
+    assert.equal(await blocks(command), true, `must block: ${JSON.stringify(command)}`);
+  }
+  for (const command of ["exec npm test", "echo hi; exec pytest -q"]) assert.equal(await blocks(command), false, command);
+});
+test("F2: a Bash call run in the background is not a passing check (flag or reply text); a foreground run still counts", async () => {
+  const bg = (extra, reply) => [userPrompt("Fix the parser."), assistantToolUse("e1", "Edit", { file_path: "src/parser.js" }), toolResult("e1", "ok"),
+    assistantToolUse("b1", "Bash", { command: "npm test", ...extra }), toolResult("b1", reply)];
+  for (const lines of [bg({ run_in_background: true }, "Command running in background with ID: bash_1"), bg({}, "Command running in background with ID: bash_2"), bg({ run_in_background: true }, "")]) {
+    assert.deepEqual(stopGate.parseForVerify(lines).checks, [], "a background run is never sent");
+    assert.equal(stopGate.parseForHonest(lines).runs[0].outcome, "unknown");
+    const { out } = await verifyOut(lines);
+    assert.ok(out && out.decision === "block", `${JSON.stringify(out)}`);
+  }
+  assert.equal(stopGate.parseForVerify(bg({}, "  12 passing (3s)")).checks.length, 1);
+});
+test("F3: 2000 non-check Bash calls decide in linear time, with a capped evidence block and a capped reason", async () => {
+  fresh(); setBaseEnv({ gate: "both" });
+  const noise = Array.from({ length: 2000 }, (_, i) => ["ls dir" + i, "a.js\nb.js"]);
+  const lines = editThen(...noise);
+  const { fetchImpl } = stubFetch((name, args) => (name === "kit_verify_done" ? ALLOW : { results: args.items.map((it) => ({ id: it.id, classification: "misrepresented", top_probability: 0.9, decision: "auto" })) }));
+  const t0 = Date.now();
+  const out = await stopGate.decide({ transcript_path: writeTranscript(lines), last_assistant_message: "Done, all tests pass." }, { fetchImpl });
+  const ms = Date.now() - t0;
+  assert.ok(out && out.decision === "block" && /HONEST:/.test(out.reason));
+  assert.ok(ms < 3000, `decide() took ${ms}ms for 2000 calls (quadratic evidence fill timed out the hook at 10s)`);
+  assert.ok(out.reason.length <= 8000, `reason length ${out.reason.length}`);
+  const ev = stopGate.parseForHonest(lines);
+  assert.ok(stopGate.evidenceText(ev).length <= 8000, "default evidence budget is a real cap");
+  assert.ok(/commands omitted/.test(stopGate.evidenceText(ev)));
+});
+test("F3: evidence is built only when a block needs it, and keeps the newest failing check when trimmed", async () => {
+  const noise = Array.from({ length: 300 }, (_, i) => ["echo " + "y".repeat(120) + i, "out" + i]);
+  const ev = stopGate.parseForHonest(editThen(["npm test", "  1 failing", true], ...noise));
+  const text = stopGate.evidenceText(ev);
+  assert.ok(text.length <= 8000);
+  assert.match(text, /`npm test` -> failed/);
+});
+test("F4: many unclosed fence openers and a 200 KB message split in linear time; the claim at the tail survives the input cap", () => {
+  const t0 = Date.now();
+  const stray = stopGate.splitClaims("```text\n".repeat(25000) + "All tests pass and the build is clean.");
+  const paired = stopGate.splitClaims("```text\nhello there\n".repeat(7000) + "```\n".repeat(7000) + "All tests pass and the build is clean.");
+  const ms = Date.now() - t0;
+  assert.ok(ms < 2500, `splitClaims took ${ms}ms (each opener rescanned to the end of the message)`);
+  assert.deepEqual(stray, ["All tests pass and the build is clean."]);
+  assert.equal(paired.at(-1), "All tests pass and the build is clean.");
+  assert.ok(stopGate.splitClaims("x\n".repeat(200000) + "Done, all tests pass.").includes("Done, all tests pass."));
+});
+test("F4: fence semantics are unchanged by the one-pass scan (prose fence judged, code fence skipped, nested openers, stray openers)", () => {
+  assert.deepEqual(stopGate.splitClaims("Intro line here.\n```text\nAll tests pass here.\n```\nOutro line here."), ["Intro line here.", "All tests pass here.", "Outro line here."]);
+  assert.deepEqual(stopGate.splitClaims("```js\nconst a = 1;\n```\nAll tests pass here."), ["All tests pass here."]);
+  assert.deepEqual(stopGate.splitClaims("```text\nfirst claim here\n```js\nnot a claim;\n```\nlast claim here"), ["last claim here"]);
+  assert.deepEqual(stopGate.splitClaims("```text\nAll tests pass here.\n"), ["All tests pass here."]);
+});
+test("F6: honest option-carrying wrappers and runners count as checks and verify end to end", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  const honest = ["uv run pytest", "poetry run pytest", "yarn jest", "yarn vitest", "pnpm exec vitest", "npx -y vitest run", "npx --no-install jest", "nice -n 5 npm test", "sudo -u ci npm test",
+    "stdbuf -oL npm test", "env -i npm test", "command pytest", "exec npm test", "npm run -s test", "npm --prefix x test", "npm -w x test", "pnpm -r test", "make -j4 test", "(cd server && npm test)",
+    "bash -c 'npm test'", "sh -c 'npm test'", "npm run test:unit", "timeout -k 5 600 npm test", "pnpm --filter web test", "npm run ci", "pnpm tsc --noEmit", "make -C docker test", "bun x vitest"];
+  for (const command of honest) {
+    assert.equal(stopGate.commandRunsCheck(command), true, `hook must count ${command}`);
+    assert.equal(server.commandRunsCheck(command), true, `server must count ${command}`);
+    assert.equal(stopGate.runOutcome(command, "  12 passing (3s)", 0), "pass", command);
+    assert.equal(await blocks(command, "  12 passing (3s)"), false, `honest run falsely blocked: ${command}`);
+  }
+  // wrappers do not open the false-pass cases the earlier rounds closed
+  for (const command of ["sudo -l pytest", "command -v pytest", "docker run --rm img npm test", "timeout 5 echo npm test", "nice -n 5 echo npm test"]) assert.equal(stopGate.commandRunsCheck(command), false, command);
+  for (const command of ["bash -c 'npm test; echo hi'", "sh -c 'npm test || true'", "(npm test)", "(cd api && npm test; echo hi)", "bash -c 'npm test' | tail -5"]) {
+    assert.equal(stopGate.runOutcome(command, "Error: boom", 0), "unknown", command);
+  }
+});
+test("F7: flag-only and non-run invocations, installs and lookalike scripts are not checks", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const command of ["npm ci", "pnpm ci", "yarn ci", "npm run lint:fix", "npm run test-seed-db", "npx tsc-alias", "pytest --help", "pytest -h", "tsc --version", "tsc -V", "mocha -V", "pytest --collect-only", "pytest --co",
+    "jest --listTests", "make --dry-run test", "npm test -- --help", "cargo test -- -h", "npm run format", "make test-seed-db", "npm run build:docs"]) {
+    assert.equal(stopGate.commandRunsCheck(command), false, `hook: ${command}`);
+    assert.equal(server.commandRunsCheck(command), false, `server: ${command}`);
+    assert.deepEqual(stopGate.parseForVerify(editThen([command, "ok"])).checks, [], command);
+    assert.equal(await blocks(command), true, `exit 0 alone must not verify ${command}`);
+  }
+  assert.equal(stopGate.commandRunsCheck("ctest -V"), true, "ctest -V is verbose, not version");
+  assert.equal(stopGate.commandRunsCheck("npm run test:unit -- --coverage"), true);
+});
+test("F7: a run that found no tests is not a pass", () => {
+  for (const [command, output] of [["npm test", "No tests found, exiting with code 0"], ["pytest", "collected 0 items\n\n============ no tests ran in 0.01s ============"], ["pytest -q", "0 tests collected"],
+    ["go test ./...", "?   \tpkg/a\t[no test files]\n?   \tpkg/b\t[no test files]"], ["npx jest", "No tests found, exiting with code 0"]]) {
+    assert.equal(stopGate.runOutcome(command, output, 0), "unknown", `${command} / ${JSON.stringify(output)}`);
+  }
+  assert.equal(stopGate.runOutcome("go test ./...", "ok  \tpkg/a\t0.1s\n?   \tpkg/b\t[no test files]", 0), "pass");
+});
+test("parity (review round): the hook copy and the server agree on every new case", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  const O = "  12 passing (3s)";
+  const cases = [
+    ["echo ok # ; npm test", O, 0], ["true # && pytest", "", 0], ["mypy . # <<true\necho masked\ntrue", "", 0], ["X='<<true' mypy .\necho masked\ntrue", "", 0], ["cat <<EOF\nx\n EOF\nnpm test", O, 0],
+    ["cat <<-EOF\n\tx\n\tEOF\nnpm test", O, 0], ["cat <<A <<B\n1\nA\n2\nB\nnpm test", O, 0], ["exit 0; npm test", "", 0], ["exit 0 && npm test", "", 0], ["exec true; pytest", "", 0], ["trap 'exit 0' EXIT; mypy .", "", 0],
+    ["return 0; npm test", "", 0], ["kill $$; npm test", "", 0], ["builtin exit 0; npm test", "", 0], ["logout; npm test", "", 0], ["\\exit 0; npm test", "", 0], ["if true; then exit 0; fi; npm test", "", 0],
+    ["exec npm test", O, 0], ["uv run pytest", O, 0], ["poetry run pytest", O, 0], ["yarn jest", O, 0], ["pnpm exec vitest", O, 0], ["npx -y vitest run", O, 0], ["npx --no-install jest", O, 0],
+    ["nice -n 5 npm test", O, 0], ["sudo -u ci npm test", O, 0], ["stdbuf -oL npm test", O, 0], ["env -i npm test", O, 0], ["command pytest", O, 0], ["npm run -s test", O, 0], ["npm --prefix x test", O, 0],
+    ["npm -w x test", O, 0], ["pnpm -r test", O, 0], ["make -j4 test", O, 0], ["(cd server && npm test)", O, 0], ["(npm test)", "Error: boom", 0], ["bash -c 'npm test'", O, 0], ["sh -c 'npm test'", "Error: boom", 0],
+    ["sh -c 'npm test | tail -5'", O, 0], ["npm ci", O, 0], ["npm run lint:fix", O, 0], ["npm run test-seed-db", O, 0], ["npx tsc-alias", "", 0], ["pytest --help", "", 0], ["tsc -V", "", 0], ["jest --listTests", "", 0],
+    ["npm test", "No tests found, exiting with code 0", 0], ["pytest", "collected 0 items", 0], ["go test ./...", "?   \tpkg\t[no test files]", 0], ["npm test " + "x ".repeat(1100), O, 0], ["x ".repeat(1100) + "npm test", O, 0],
+  ];
+  for (const [command, output, exit] of cases) {
+    assert.equal(stopGate.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${JSON.stringify(command)}`);
+    assert.equal(stopGate.exitIsMasked(command), server.exitIsMasked(command), `exitIsMasked ${JSON.stringify(command)}`);
+    assert.equal(stopGate.commandRunsCheck(command), server.commandRunsCheck(command), `commandRunsCheck ${JSON.stringify(command)}`);
+  }
+});
+test("F12: analysis is bounded: a long command is classified from its ends, is never a pass, and pathological text stays fast", () => {
+  const long = "npm test " + "x ".repeat(1200);
+  assert.equal(stopGate.commandRunsCheck(long), true);
+  assert.equal(stopGate.runOutcome(long, "  12 passing (3s)", 0), "unknown");
+  assert.equal(stopGate.exitIsMasked(long), true);
+  assert.equal(stopGate.commandRunsCheck("A=1 ".repeat(600) + "npm test"), true, "a check at the tail stays visible");
+  const t0 = Date.now();
+  for (const bomb of ["sed ".repeat(50000), "npm " + "-w ".repeat(40000) + "foo", "sudo " + "-u ".repeat(40000), "timeout " + "-k ".repeat(40000), "make " + "-C ".repeat(40000), "npx " + "-p ".repeat(40000), "A=1 ".repeat(50000), "a;".repeat(100000), "'".repeat(100001)]) {
+    stopGate.bashWriteTargets(bomb); stopGate.commandRunsCheck(bomb); stopGate.runOutcome(bomb, "  12 passing", 0); stopGate.exitIsMasked(bomb);
+  }
+  assert.ok(Date.now() - t0 < 2000, `bounded analysis took ${Date.now() - t0}ms`);
+  assert.equal(stopGate.parseForVerify(editThen(["cat > src/a.js <<EOF\n" + "x\n".repeat(3000) + "EOF", ""])).fileChanges, 2, "a heredoc write at the head of a long command is still an edit");
+});
+test("F10: the decision is flushed before the process exits, and the block reason is capped", async () => {
+  const events = [];
+  const out = { write: (s, cb) => { events.push("write:" + s.length); setTimeout(() => { events.push("flushed"); cb(); }, 20); return true; } };
+  stopGate.writeResult({ decision: "block", reason: "r".repeat(200000) }, out, (code) => events.push("exit:" + code));
+  assert.deepEqual(events, ["write:" + JSON.stringify({ decision: "block", reason: "r".repeat(200000) }).length], "no exit before the write callback");
+  await new Promise((r) => setTimeout(r, 60));
+  assert.deepEqual(events.slice(1), ["flushed", "exit:0"]);
+  const exits = [];
+  stopGate.writeResult(null, { write: () => { throw new Error("no write for an allow"); } }, (c) => exits.push(c));
+  assert.deepEqual(exits, [0]);
+  // a transcript that would have produced a ~700 KB reason now yields at most 8 KB
+  fresh(); setBaseEnv({ gate: "both" });
+  const longClaims = Array.from({ length: 200 }, (_, i) => `All tests pass for module ${i}. ${"padding ".repeat(60)}`).join("\n");
+  const { fetchImpl } = stubFetch((name, args) => (name === "kit_verify_done" ? { verified: false, verdict: "unverified", action: "block", reason: "R".repeat(50000), answers: { discloses_unverified: 0 } } : { results: args.items.map((it) => ({ id: it.id, classification: "misrepresented", top_probability: 0.9, decision: "auto" })) }));
+  const res = await stopGate.decide({ transcript_path: writeTranscript(editThen(["npm test", "  1 failing", true])), last_assistant_message: longClaims }, { fetchImpl });
+  assert.ok(res && res.reason.length <= 8000, `reason ${res && res.reason.length}`);
+});
+test("F11: the loop-guard state lives in a per-user 0700 directory, never in the shared tmp dir; symlinks are refused", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "home-"));
+  const prior = { HOME: process.env.HOME, XDG: process.env.XDG_STATE_HOME };
+  try {
+    delete process.env.XDG_STATE_HOME; process.env.HOME = home;
+    assert.equal(stopGate.stateDir(), path.join(home, ".cache", "jev-stop-gate"));
+    process.env.XDG_STATE_HOME = path.join(home, "state");
+    assert.equal(stopGate.stateDir(), path.join(home, "state", "jev-stop-gate"));
+    const blockOnce = async (transcript) => {
+      fresh(); setBaseEnv({ gate: "verify" });
+      const { fetchImpl } = stubFetch(() => ({ verified: false, verdict: "unverified", action: "block", reason: "no check", answers: { discloses_unverified: 0 } }));
+      return stopGate.decide({ transcript_path: transcript, last_assistant_message: "Done.", stop_hook_active: false }, { fetchImpl });
+    };
+    const transcript = writeTranscript(editedOneFile());
+    assert.equal((await blockOnce(transcript)).decision, "block");
+    const file = stopGate.blockStatePath({ transcript_path: transcript });
+    assert.ok(file.startsWith(path.join(home, "state", "jev-stop-gate")));
+    assert.equal(fs.statSync(path.dirname(file)).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), { blocks: 1 });
+    // a symlinked state directory is refused: unwritable state keeps today's behaviour (the stop is allowed)
+    fs.rmSync(path.join(home, "state"), { recursive: true });
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "elsewhere-"));
+    fs.mkdirSync(path.join(home, "state"));
+    fs.symlinkSync(elsewhere, path.join(home, "state", "jev-stop-gate"));
+    assert.equal(await blockOnce(transcript), null, "symlinked state dir: fail open, as for unwritable state");
+    assert.deepEqual(fs.readdirSync(elsewhere), [], "nothing was written through the symlink");
+    // a symlinked state FILE is refused too
+    fs.unlinkSync(path.join(home, "state", "jev-stop-gate"));
+    fs.mkdirSync(path.join(home, "state", "jev-stop-gate"), { mode: 0o700 });
+    const target = path.join(elsewhere, "victim");
+    fs.writeFileSync(target, "keep");
+    fs.symlinkSync(target, stopGate.blockStatePath({ transcript_path: transcript }));
+    assert.equal(await blockOnce(transcript), null, "symlinked state file: fail open");
+    assert.equal(fs.readFileSync(target, "utf8"), "keep");
+    // a group/world-writable directory is not trusted
+    fs.rmSync(path.join(home, "state"), { recursive: true });
+    fs.mkdirSync(path.join(home, "state", "jev-stop-gate"), { recursive: true });
+    fs.chmodSync(path.join(home, "state", "jev-stop-gate"), 0o777);
+    assert.equal(await blockOnce(transcript), null, "world-writable state dir: fail open");
+  } finally {
+    if (prior.HOME === undefined) delete process.env.HOME; else process.env.HOME = prior.HOME;
+    if (prior.XDG === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = prior.XDG;
+  }
+});
+test("T18: the classify debug note reports real counts, not a missing `summary` field", async () => {
+  fresh(); setBaseEnv({ gate: "honest" }); process.env.JEV_GUARD_DEBUG = "1";
+  const logged = [];
+  const orig = process.stderr.write;
+  process.stderr.write = (s) => { logged.push(String(s)); return true; };
+  try {
+    const { fetchImpl } = stubFetch((name, args) => (name === "kit_verify_done" ? ALLOW : { results: args.items.map((it) => ({ id: it.id, classification: "verified", top_probability: 0.9, decision: "auto" })) }));
+    await stopGate.decide({ transcript_path: writeTranscript(editedOneFile()), last_assistant_message: "All tests pass here." }, { fetchImpl });
+  } finally { process.stderr.write = orig; }
+  const line = logged.find((l) => l.includes("classify results="));
+  assert.ok(line, "the note is written under JEV_GUARD_DEBUG=1");
+  assert.ok(!/undefined/.test(line), line);
+  assert.match(line, /classify results=1 \(verified\/auto:1\)/);
 });

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { sizeDispatch } from "../src/kit/tier.mjs";
-import { verifyDone, checkSummary, runOutcome, classifyToolResult } from "../src/kit/verify.mjs";
+import { verifyDone, checkSummary, runOutcome, classifyToolResult, exitIsMasked, commandRunsCheck, turnsOf, parseJsonl } from "../src/kit/verify.mjs";
 import { resolveUpstream, askUpstream, GATEWAY_BASE, TYPESAFE_BASE } from "../src/kit/jev.mjs";
 
 const noJev = { ask: null, jevAvailable: false };
@@ -585,4 +585,66 @@ test("regression: masked forgeries stay unknown", () => {
   assert.equal(runOutcome("npm test 2>&1 | tail -20 || echo hi", OK, 0), "unknown");
   assert.equal(runOutcome("npm test |& tail -20", OK, 0), "unknown");
   assert.equal(runOutcome("npm test 2>&1 | tail -20", OK, 0), "pass");
+});
+
+// ── PR #31 adversarial-review round: the server rules the hook mirrors (data-only; commands are text, never executed) ──
+const O12 = "  12 passing (3s)";
+test("F1: a check the shell never runs is not a pass: mid-line comments, heredoc openers in quotes/comments, inexact closers", () => {
+  for (const c of ["echo ok # ; npm test", "true # && pytest", "echo ok #; npm test"]) assert.equal(commandRunsCheck(c), false, c);
+  assert.equal(commandRunsCheck("echo a#b; npm test"), true, "a mid-word # is not a comment");
+  for (const c of ["mypy . # <<true\necho masked\ntrue", "X='<<true' mypy .\necho masked\ntrue", 'mypy . "<<true"\necho masked\ntrue']) assert.equal(exitIsMasked(c), true, c);
+  for (const c of ["cat <<EOF\nx\n EOF\nnpm test", "cat <<EOF\nx\nEOF \nnpm test", "cat <<-EOF\n\tx\n  EOF\nnpm test", "npm test <<EOF\nbody"]) {
+    assert.equal(commandRunsCheck(c), false, c);
+    assert.equal(exitIsMasked(c), true, c);
+  }
+  assert.equal(runOutcome("cat <<-EOF\n\tx\n\tEOF\nnpm test", O12, 0), "pass");
+  assert.equal(runOutcome("cat <<'EOF' >f\nx\nEOF\nnpm test", O12, 0), "pass");
+});
+test("F1: a terminator in program position masks the exit status; `exec <check>` is the check", () => {
+  for (const c of ["exit 0; npm test", "exit 0 && npm test", "exec true; pytest", "trap 'exit 0' EXIT; mypy .", "return 0; npm test", "kill $$; npm test", "builtin exit 0; npm test", "logout; npm test", "command exit 0; npm test",
+    "\\exit 0; npm test", '"exit" 0; npm test', "e=exit; $e 0; npm test", "if true; then exit 0; fi; npm test"]) {
+    assert.equal(exitIsMasked(c), true, c);
+    assert.equal(runOutcome(c, "", 0), "unknown", c);
+  }
+  assert.equal(runOutcome("exec npm test", O12, 0), "pass");
+});
+test("F6: option-aware wrappers and runners are checks (and passes when attributable); false-pass shapes stay unknown", () => {
+  for (const c of ["uv run pytest", "poetry run pytest", "yarn jest", "yarn vitest", "pnpm exec vitest", "npx -y vitest run", "npx --no-install jest", "nice -n 5 npm test", "sudo -u ci npm test", "stdbuf -oL npm test", "env -i npm test",
+    "command pytest", "exec npm test", "npm run -s test", "npm --prefix x test", "npm -w x test", "pnpm -r test", "make -j4 test", "(cd server && npm test)", "bash -c 'npm test'", "sh -c 'npm test'", "npm run test:unit"]) {
+    assert.equal(commandRunsCheck(c), true, c);
+    assert.equal(runOutcome(c, O12, 0), "pass", c);
+  }
+  for (const c of ["bash -c 'npm test; echo hi'", "sh -c 'npm test || true'", "(npm test)", "(cd api && npm test; echo hi)", "bash -c 'npm test' | tail -5"]) assert.equal(runOutcome(c, "Error: boom", 0), "unknown", c);
+  for (const c of ["docker run --rm img npm test", "sudo -l pytest", "command -v pytest"]) assert.equal(commandRunsCheck(c), false, c);
+});
+test("F7: installs, lookalike scripts and flag-only invocations are not checks; zero-test runs are not passes", () => {
+  for (const c of ["npm ci", "npm run lint:fix", "npm run test-seed-db", "npx tsc-alias", "pytest --help", "tsc --version", "pytest --collect-only", "jest --listTests", "make --dry-run test", "npm test -- -h"]) assert.equal(commandRunsCheck(c), false, c);
+  assert.equal(commandRunsCheck("npm run ci"), true);
+  for (const [c, o] of [["npm test", "No tests found, exiting with code 0"], ["pytest", "collected 0 items"], ["pytest", "0 tests collected"], ["go test ./...", "?   \tpkg\t[no test files]"]]) assert.equal(runOutcome(c, o, 0), "unknown", c);
+});
+test("F12: an over-cap command is classified from its ends and never earns a pass", () => {
+  const long = "npm test " + "x ".repeat(1200);
+  assert.equal(commandRunsCheck(long), true);
+  assert.equal(runOutcome(long, O12, 0), "unknown");
+  assert.equal(exitIsMasked(long), true);
+});
+test("F8: transcript classification gives a pass only to a recognised check or a custom runner, not to a text printer", () => {
+  for (const c of ["tac results.log", "nl results.log", "docker logs ci", "gh run view --log", "kubectl logs pod", "diff a.log b.log", "xxd r.log", "rev r.log", "bat r.log"]) {
+    assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "unknown", c);
+  }
+  for (const c of ["./run-suite.sh", "scripts/ci.sh", "make ci", "npm run ci", "./run.sh | tail -3"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "check-pass", c);
+});
+test("F2: a background Bash run in a transcript tail is not a passing check", () => {
+  const rec = (type, extra) => JSON.stringify({ type, ...extra });
+  const jsonl = (input, reply) => [
+    rec("user", { message: { role: "user", content: "Fix the parser." } }),
+    rec("assistant", { message: { role: "assistant", content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "a.js" } }] } }),
+    rec("user", { toolUseResult: { stdout: "ok" }, message: { content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } }),
+    rec("assistant", { message: { role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input }] } }),
+    rec("user", { toolUseResult: { stdout: reply }, message: { content: [{ type: "tool_result", tool_use_id: "b1", content: reply }] } }),
+  ].join("\n");
+  const checksOf = (input, reply) => turnsOf(parseJsonl(jsonl(input, reply))).at(-1).checks;
+  assert.deepEqual(checksOf({ command: "npm test", run_in_background: true }, "Command running in background with ID: bash_1"), []);
+  assert.deepEqual(checksOf({ command: "npm test" }, "Command running in background with ID: bash_2"), []);
+  assert.equal(checksOf({ command: "npm test" }, O12).length, 1);
 });

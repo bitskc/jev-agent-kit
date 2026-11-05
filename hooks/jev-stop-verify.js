@@ -76,10 +76,21 @@ const SCRATCH_TARGET_RE = /^(?:\/tmp\/|\/var\/tmp\/|\/dev\/|\$TMPDIR|&)/;
 // /tmp/wt-<name>/ is a git worktree checkout (this repo's convention): project files, never scratch.
 const WORKTREE_PATH_RE = /(?:^|\/)wt-[^/\s]+\//;
 const isScratchTarget = (t) => SCRATCH_TARGET_RE.test(t) && !WORKTREE_PATH_RE.test(t);
+// A command longer than ANALYSIS_CAP is analysed from its first and last ANALYSIS_CAP/2 characters (the redirect that
+// opens a heredoc write sits at the head, a trailing `cp`/`mv` or the check itself at the tail; the tail is cut forward
+// to a token boundary), so the regex work per Bash call is bounded. Mirror of verify.mjs boundedCommand.
+function boundedCommand(command) {
+  const s = String(command == null ? '' : command);
+  if (s.length <= ANALYSIS_CAP) return s;
+  const half = ANALYSIS_CAP / 2;
+  const tail = s.slice(s.length - half);
+  const ws = tail.search(/\s/);
+  return s.slice(0, half) + '\n' + (ws === -1 ? tail : tail.slice(ws));
+}
 // Returns one label per project-file write found; empty means the command wrote nothing project-side.
 function bashWriteTargets(command) {
   const labels = [];
-  for (const raw of String(command || '').split(/\|\||&&|[;|&\n]/)) {
+  for (const raw of boundedCommand(command).split(/\|\||&&|[;|&\n]/)) {
     const seg = raw.trim();
     if (!seg) continue;
     const bare = seg.replace(/'[^']*'|"[^"]*"/g, '""'); // quoted text is data, not a path or an operator
@@ -101,18 +112,6 @@ function bashWriteTargets(command) {
 // unit, so `npm test 2>&1 | tee test.log` is a check that also writes a log. A check in the same call is evidence for
 // that call's own edit unless a LATER chain element writes after it (`npm test && cp broken.js src/a.js` is not).
 const CHAIN_SPLIT_RE = /&&|\|\||[;\n]|(?<![&>\d])&(?![&>])/;
-// Heredoc bodies are data, never commands: the lines between `<<WORD` and the closing WORD line are dropped first.
-function stripHeredocBodies(command) {
-  const out = [];
-  let end = null;
-  for (const line of String(command || '').split('\n')) {
-    if (end !== null) { if (line.trim() === end) end = null; continue; }
-    out.push(line);
-    const m = line.match(/<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/);
-    if (m) end = m[2];
-  }
-  return out.join('\n');
-}
 // Mirror of server/src/kit/verify.mjs outcome rules (checkSummary, runOutcome). Parity is enforced by a test.
 // Failure text a runner prints. Matched before any pass signal and regardless of exit status.
 const FAILURE_MARKER = /\b[1-9]\d* (?:failing|failed)\b|--- FAIL:|^FAIL\b|\bFAILED \((?:failures|errors)=[1-9]|^(?:=+ )?FAILURES(?: =+)?\s*$|[✗✖]\s|^\s*AssertionError\b/m;
@@ -120,8 +119,42 @@ const EXIT_MENTION = /\bexit(?:ed)? (?:with )?(?:code|status)[: ]*[1-9]\d*\b/i;
 // A runner's passing-test title line (mocha/jest `✓`/`✔`/`√`, jest `PASS`, TAP `ok`): its words are test names, not results.
 const PASSING_TITLE = /^\s*(?:[✓✔√]|PASS\b|ok\b)/;
 // Same regex as server/src/kit/verify.mjs CHECK_COMMAND (parity-tested): decides which list group holds the check.
-const CHECK_COMMAND = /\b(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check|lint|typecheck|build|verify|ci)\b|(?:npx|pnpm|bunx)\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)\b|(?:python3?|pypy3?)\s+-m\s+(?:pytest|unittest)\b|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build))\b/;
-const EXEC_PREFIX = /^(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup|timeout\s+\S+|xvfb-run(?:\s+-\S+)*|bundle\s+exec)\s+)*/;
+// Analysis never reads past this many characters of one command (see the server copy): a longer command is classified
+// from its head and can never earn a pass.
+const ANALYSIS_CAP = 2000;
+const NPM_OPT = String.raw`(?:\s+(?:(?:-w|-C|-F|--prefix|--workspace|--filter|--dir|--cwd)\s+\S+|-{1,2}(?!(?:w|C|F|prefix|workspace|filter|dir|cwd)(?:\s|$))[A-Za-z][\w-]*(?:=\S+)?))*`;
+// Only `test` takes a `:suffix` (`npm run test:unit`); `lint:fix`, `build:docs`, `test-seed-db` are not checks, and `npm ci`
+// is an install (`ci` counts only as a script: `npm run ci`).
+const SCRIPT_VERB = String.raw`(?:test(?::[\w-]+)*|check|lint|typecheck|build|verify)`;
+const RUNNER_OPT = String.raw`(?:\s+(?:(?:-p|--package)(?:=|\s+)\S+|--?(?!(?:p|package)(?:\s|$))[A-Za-z][\w-]*|--))*`;
+const MAKE_OPT = String.raw`(?:\s+(?:(?:-C|-f|-I|--directory|--file)(?:\s+|=)\S+|-j\s*\d+|-(?!(?:C|f|I)(?:\s|$))[A-Za-z]+|--(?!(?:directory|file)(?:\s|$))[a-z][\w-]*(?:=\S+)?|[A-Za-z_]\w*=\S*))*`;
+const PM_CHECK = String.raw`(?:npm|pnpm|yarn|bun)${NPM_OPT}\s+(?:(?:run(?:-script)?${NPM_OPT}\s+)?${SCRIPT_VERB}|run(?:-script)?${NPM_OPT}\s+ci)`;
+const PKG_RUNNER_CHECK = String.raw`(?:npx|bunx|pnpm(?:\s+(?:exec|dlx))?|yarn(?:\s+dlx)?|npm\s+(?:exec|x)|bun\s+x)${RUNNER_OPT}\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)`;
+const OTHER_CHECK = String.raw`(?:python3?|pypy3?)\s+-m\s+(?:pytest|unittest)|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make${MAKE_OPT}\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build)`;
+const CHECK_COMMAND = new RegExp(String.raw`\b(?:${PM_CHECK}|${PKG_RUNNER_CHECK}|${OTHER_CHECK})(?=\s|$|[&<>)])`);
+// Prefix elements: one parse per token, so a long run of dashes cannot make the regex backtrack exponentially.
+const PREFIX_ELEMENTS = [
+  String.raw`[A-Za-z_]\w*=\S*`,
+  String.raw`sudo(?:\s+(?:-[ugCDRTUrtp]\s+\S+|--|-(?![lvkKVhe-]|[ugCDRTUrtp](?:\s|$))[A-Za-z]\S*|--[a-z][\w-]*=\S*))*`,
+  String.raw`env(?:\s+(?:-[uCS]\s+\S+|--|-(?![uCS](?:\s|$))[A-Za-z]\S*))*`,
+  String.raw`time(?:\s+-\S+)*`,
+  'nohup',
+  String.raw`nice(?:\s+(?:-n\s*-?\d+|-\d+|--adjustment=-?\d+))*`,
+  String.raw`stdbuf(?:\s+-[ioe]\s*\S+)+`,
+  String.raw`timeout(?:\s+(?:(?:-k|-s|--kill-after|--signal)(?:=|\s+)\S+|--?(?!(?:k|s|kill-after|signal)(?:\s|$))[A-Za-z][\w-]*(?:=\S+)?))*\s+\S+`,
+  String.raw`xvfb-run(?:\s+-\S+)*`,
+  String.raw`bundle\s+exec`,
+  String.raw`command(?:\s+-p)?`,
+  String.raw`(?:uv|poetry|pipenv|pdm)\s+run(?:\s+-\S+)*`,
+].join('|');
+const EXEC_PREFIX = new RegExp(String.raw`^(?:(?:${PREFIX_ELEMENTS})\s+)*`);
+// `exec <program>` replaces the shell with the program: its status IS the program's, so `exec npm test` is the check.
+const EXEC_BUILTIN = /^exec(?:\s+-\S+)*\s+(?=\S)/;
+const NON_RUN_FLAG = /(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--listTests|--dry-run)(?=\s|$|=)/;
+// `ctest -V` is verbose, not version.
+const isNonRun = (s) => NON_RUN_FLAG.test(/^(?:\S*\/)?ctest(?=\s)/.test(s) ? s.replace(/(?:^|\s)-V(?=\s|$)/g, ' ') : s);
+// What Claude Code answers a Bash call started with run_in_background: the command has not finished.
+const BACKGROUND_RESULT = /^\s*Command running in background\b/i;
 function hidesNestedCode(norm) {
   if (NESTED_SHELL_C.test(norm)) return true;
   for (const el of listGroups(norm).flat()) {
@@ -136,7 +169,7 @@ function hidesNestedCode(norm) {
 // ── check detection, mirror of server/src/kit/verify.mjs (parity-tested). A check counts only in executable
 // position: the program of a pipeline stage after prefix elements. A check verb anywhere else — a commit
 // message, an `echo` payload, a filename, a flag argument, inside a quoted string — is text, never a check.
-const CHECK_ANCHORED = new RegExp('^(?:(?:\\S*/)?(?:' + CHECK_COMMAND.source.replace(/^\\b/, '') + ')|make(?:\\s+-C\\s+\\S+)+\\s+(?:test|check|lint|build)\\b)');
+const CHECK_ANCHORED = new RegExp('^' + CHECK_COMMAND.source.replace(/^\\b/, ''));
 // `docker exec app npm test`, `kubectl exec pod -- npm test`, `docker compose run app npm test`, `chroot /r npm test`:
 // for these executors the first non-flag argument is a target and everything after it is the real command line.
 // `docker run` is NOT here — where its image ends and the command begins cannot be told apart reliably.
@@ -145,27 +178,29 @@ const INNER_CMD = /^(?:\S*\/)?(?:(?:docker|podman|kubectl)\s+exec|(?:docker|podm
 // when such an executor IS the whole command, the quoted tail is the real command line; recursing into it keeps
 // `bash -o pipefail -c 'npm test'` a check while `docker exec app 'echo npm test'` is not (the body is parsed,
 // not substring-matched).
-const QUOTED_BODY_WHOLE = /^\s*(?:(?:[A-Za-z_]\w*=\S*|sudo(?:\s+-\S+)*|env|time|nohup|timeout\s+\S+|xvfb-run(?:\s+-\S+)*|bundle\s+exec)\s+)*(?:\S*\/)?(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|eval|exec|ssh\s+\S+|su\s+\S+|xargs|watch|script\s+\S*|parallel|docker|podman|kubectl|nsenter|chroot\s+\S+|runuser)(?:\s+\S+)*?\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")\s*$/;
+const QUOTED_BODY_WHOLE = new RegExp(String.raw`^\s*(?:(?:${PREFIX_ELEMENTS})\s+)*(?:\S*\/)?(?:(?:ba|z|da|k)?sh\s+(?:\S+\s+)*?-\w*c\b|eval|exec|ssh\s+\S+|su\s+\S+|xargs|watch|script\s+\S*|parallel|docker|podman|kubectl|nsenter|chroot\s+\S+|runuser)(?:\s+\S+)*?\s+(?:'([^']*)'|"((?:[^"\\]|\\.)*)")\s*$`);
 // One pipeline stage (quote-blanked): does its program run a check? A stage-first match after prefix elements,
 // or a check in the tail of an executor whose argument IS a command line (`docker exec app npm test`).
 function stageCheckCommand(seg) {
-  const s = seg.trim().replace(EXEC_PREFIX, '');
+  let s = seg.trim();
+  for (let k = 0; k < 2; k++) s = s.replace(EXEC_PREFIX, '').replace(EXEC_BUILTIN, '');
   const [executable, ...args] = s.split(/\s+/);
   const program = executable.includes('/') ? executable.slice(executable.lastIndexOf('/') + 1) + (args.length ? ' ' + args.join(' ') : '') : s;
   const direct = CHECK_ANCHORED.exec(program);
-  if (direct) return direct[0];
-  const make = /^make\s+-C\s+\S+\s+(?:test|check|lint|build)\b/.exec(s);
-  if (make) return make[0];
+  if (direct) return isNonRun(s) ? null : direct[0];
   const inner = INNER_CMD.exec(s);
   return inner && inner[1] ? stageCheckCommand(inner[1]) : null;
 }
 // Extract an anchored check invocation so a long command can be shortened without cutting away the evidence
-// that the command actually ran a check. The full command still determines its outcome before truncation.
+// that the command actually ran a check. A command over ANALYSIS_CAP is read from its ends and can never pass.
 function checkCommandSnippet(command) {
-  const raw = stripHeredocBodies(command);
-  const whole = QUOTED_BODY_WHOLE.exec(raw);
+  const sc = scanShell(boundedCommand(command));
+  if (!sc.ok) return null;
+  const whole = QUOTED_BODY_WHOLE.exec(sc.raw);
   if (whole) return checkCommandSnippet(whole[1] ?? whole[2]);
-  const norm = stripQuoted(raw) ?? raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
+  const sub = loneSubshellBody(sc);
+  if (sub !== null) return checkCommandSnippet(sub);
+  const norm = sc.norm ?? sc.raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''");
   for (const el of listGroups(norm).flat()) {
     for (const stage of el.split(BARE_PIPE)) {
       const snippet = stageCheckCommand(stage);
@@ -198,6 +233,24 @@ function onlyPrintsText(norm) {
  * pipefail on; a pipe outside the wrapper, or anything after it, masks.
  */
 const PREFIX_SEGMENT = /^\s*(?:(?:cd|pushd|popd|export|set|unset|source|\.)(?=\s|$)|(?:[A-Za-z_]\w*=\S*\s*)+$)/;
+// A program that decides the shell's exit status without being the check (see the server copy): a terminator
+// (`exit 0; npm test`, `trap 'exit 0' EXIT; mypy .`, `exec true; pytest`, `return`, `kill`, `builtin`, `logout`), a
+// compound-command keyword, or a program name hidden by quotes, an escape or a bare variable. `exec npm test` is the check.
+const ESC = '\u0001';
+const MASKING_WORD = /^(?:exit|return|exec|trap|kill|builtin|logout|if|then|else|elif|fi|while|until|do|done|for|case|esac|select|coproc|function)(?=\s|$)/;
+function masksStatus(stage) {
+  const s = stage.trim().replace(EXEC_PREFIX, '');
+  const word = s.split(/\s+/, 1)[0];
+  if (word.includes("''") || word.includes(ESC) || /^\$\{?\w+\}?$/.test(word)) return true;
+  return /^exec(?=\s|$)/.test(s) ? stageCheckCommand(s) === null : MASKING_WORD.test(s);
+}
+const SHELL_C_WHOLE = /^(?:ba|z|da|k)?sh(?:\s+-[A-Za-np-z]+)*\s+-[A-Za-np-z]*c\s+(?:'([^']*)'|"((?:[^"\\$`]|\\.)*)")$/;
+const CD_THEN = /^\s*(?:cd|pushd)\s[^;&|]*&&/;
+function loneSubshellBody(sc) {
+  if (sc.norm === null || !/^\s*\([^()]*\)\s*$/.test(sc.norm)) return null;
+  const r = sc.raw.trim();
+  return r.startsWith('(') && r.endsWith(')') ? r.slice(1, -1) : null;
+}
 const UNATTRIBUTABLE = /[(){}`]|(?<![&<>])&(?![&>])/;
 const BARE_PIPE = /(?<!\|)\|(?!\|)/;
 // A nested shell (`sh -c`, also path-qualified, ksh, zsh, dash, any flag order): its quoted body is hidden from the
@@ -212,40 +265,103 @@ const SET_PIPEFAIL_OP = /(?:^|\s)([-+])[A-Za-z]*o\s+pipefail(?=\s|$)/g;
 const BASH_PIPEFAIL_WRAPPER = /^bash\s+-o\s+pipefail\s+-c\b/;
 const PIPEFAIL_WRAPPER_WHOLE = /^bash\s+-o\s+pipefail\s+-c\s+(?:'([^']*)'|"((?:[^"\\$`]|\\.)*)")$/;
 /**
- * One quote-aware scan shared by every structure test. Returns the command with each quoted span replaced by `''`,
- * each backslash-escaped character outside quotes by `_`, and whole-line `#` comments removed; or null when the text
- * cannot be read safely (an unterminated quote, or `$(` / a backtick inside double quotes, which still execute).
- * Single quotes hold no escapes; double quotes honour `\"`; `$'...'` honours backslash escapes.
+ * One quote-, comment- and heredoc-aware scan shared by every structure test (mirror of server/src/kit/verify.mjs
+ * scanShell, parity-tested). Returns raw (comments and heredoc bodies removed, quotes intact), norm (quoted spans
+ * blanked to `''`, escaped characters to ESC, heredoc delimiters to `_`; null when unreadable) and ok (false when a
+ * heredoc opener has no exact closing line: the command is then not read at all).
  */
-function stripQuoted(command) {
-  let out = "";
-  let lineStart = true;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (ch === "\n") { out += ch; lineStart = true; continue; }
-    if (lineStart && ch === "#") { const nl = command.indexOf("\n", i); if (nl === -1) break; i = nl - 1; continue; }
-    if (ch !== " " && ch !== "\t") lineStart = false;
-    if (ch === "\\") { if (i + 1 < command.length) { out += command[i + 1] === "\n" ? " " : "_"; i++; } continue; }
+function readHeredocOpener(s, at) {
+  let j = at + 2;
+  let strip = false;
+  if (s[j] === '-') { strip = true; j++; }
+  while (s[j] === ' ' || s[j] === '\t') j++;
+  const start = j;
+  let delim = '';
+  while (j < s.length && !/[\s;&|()<>]/.test(s[j])) {
+    const c = s[j];
+    if (c === "'") { const e = s.indexOf("'", j + 1); if (e === -1) return null; delim += s.slice(j + 1, e); j = e + 1; }
+    else if (c === '"') {
+      let e = j + 1;
+      while (e < s.length && s[e] !== '"') { if (s[e] === '\\' && e + 1 < s.length) e++; delim += s[e]; e++; }
+      if (e >= s.length) return null;
+      j = e + 1;
+    }
+    else if (c === '\\') { if (j + 1 >= s.length) return null; delim += s[j + 1]; j += 2; }
+    else { delim += c; j++; }
+  }
+  return j > start ? { end: j, delim, strip } : null;
+}
+function scanShell(command) {
+  const s = String(command == null ? '' : command);
+  const n = s.length;
+  let raw = '';
+  let norm = '';
+  let normOk = true;
+  let wordStart = true;
+  let ok = true;
+  const pending = [];
+  let i = 0;
+  while (i < n) {
+    const ch = s[i];
+    if (ch === '\n') {
+      raw += ch; norm += ch; wordStart = true; i++;
+      for (const h of pending) {
+        let found = false;
+        while (i < n && !found) {
+          const nl = s.indexOf('\n', i);
+          const line = nl === -1 ? s.slice(i) : s.slice(i, nl);
+          i = nl === -1 ? n : nl + 1;
+          found = (h.strip ? line.replace(/^\t+/, '') : line) === h.delim;
+        }
+        if (!found) ok = false;
+      }
+      pending.length = 0;
+      continue;
+    }
+    if (ch === '#' && wordStart) { const nl = s.indexOf('\n', i); i = nl === -1 ? n : nl; continue; }
+    if (ch === '\\') {
+      if (i + 1 < n) {
+        raw += ch + s[i + 1];
+        norm += s[i + 1] === '\n' ? ' ' : ESC;
+        if (s[i + 1] !== '\n') wordStart = false;
+      }
+      i += 2;
+      continue;
+    }
     if (ch === "'") {
-      const ansiC = out.endsWith("$"); // a plain `$` just before the quote; `\$'` leaves `_` in out
+      const ansiC = norm.endsWith('$'); // a plain `$` just before the quote; `\$'` leaves ESC in norm
       let j = i + 1;
-      while (j < command.length && command[j] !== "'") j += ansiC && command[j] === "\\" ? 2 : 1;
-      if (j >= command.length) return null;
-      out += "''"; i = j; continue;
+      while (j < n && s[j] !== "'") j += ansiC && s[j] === '\\' ? 2 : 1;
+      if (j >= n) { raw += s.slice(i); normOk = false; break; }
+      raw += s.slice(i, j + 1); norm += "''"; wordStart = false; i = j + 1;
+      continue;
     }
     if (ch === '"') {
       let j = i + 1;
-      while (j < command.length && command[j] !== '"') {
-        if (command[j] === "\\") j += 2;
-        else if (command[j] === "`" || (command[j] === "$" && command[j + 1] === "(")) return null;
-        else j += 1;
+      while (j < n && s[j] !== '"') {
+        if (s[j] === '\\') j += 2;
+        else { if (s[j] === '`' || (s[j] === '$' && s[j + 1] === '(')) normOk = false; j += 1; }
       }
-      if (j >= command.length) return null;
-      out += "''"; i = j; continue;
+      if (j >= n) { raw += s.slice(i); normOk = false; break; }
+      raw += s.slice(i, j + 1); norm += "''"; wordStart = false; i = j + 1;
+      continue;
     }
-    out += ch;
+    if (ch === '<' && s[i + 1] === '<') {
+      if (s[i + 2] === '<') { raw += '<<<'; norm += '<<<'; wordStart = true; i += 3; continue; }
+      const h = readHeredocOpener(s, i);
+      if (h) { pending.push(h); raw += s.slice(i, h.end); norm += '<<_'; wordStart = false; i = h.end; continue; }
+    }
+    raw += ch; norm += ch;
+    wordStart = ch === ' ' || ch === '\t' || ';&|()<>'.includes(ch);
+    i++;
   }
-  return out;
+  if (pending.length) ok = false;
+  return { raw, norm: normOk ? norm : null, ok };
+}
+// The quote-blanked, comment- and heredoc-free text, or null when it cannot be read.
+function blankCommand(command) {
+  const sc = scanShell(command);
+  return sc.ok ? sc.norm : null;
 }
 /** Splits blanked text into `;`/newline-separated groups of `&&`-joined elements (`&&` then newline continues the chain). */
 function listGroups(norm) {
@@ -269,16 +385,25 @@ function pipefailOn(norm, preset) {
   return on;
 }
 function exitIsMasked(command, pipefail = false) {
-  const trimmed = command.trim();
-  if (BASH_PIPEFAIL_WRAPPER.test(trimmed)) {
-    const whole = PIPEFAIL_WRAPPER_WHOLE.exec(trimmed);
+  if (command.length > ANALYSIS_CAP) return true;
+  const sc = scanShell(command);
+  if (!sc.ok || sc.norm === null) return true;
+  const body = sc.raw.trim();
+  if (BASH_PIPEFAIL_WRAPPER.test(body)) {
+    const whole = PIPEFAIL_WRAPPER_WHOLE.exec(body);
     return whole ? exitIsMasked(whole[1] ?? whole[2], true) : true;
   }
-  const norm = stripQuoted(stripHeredocBodies(command));
-  if (norm === null || UNATTRIBUTABLE.test(norm) || norm.includes("||") || hidesNestedCode(norm)) return true;
+  // A whole-command `sh -c 'body'` (no `-o`, no other words) is its body's status; a fresh shell has pipefail off.
+  const shell = SHELL_C_WHOLE.exec(body);
+  if (shell) return exitIsMasked(shell[1] ?? shell[2], false);
+  const sub = loneSubshellBody(sc);
+  if (sub !== null && CD_THEN.test(sub)) return exitIsMasked(sub, pipefail);
+  const norm = sc.norm;
+  if (UNATTRIBUTABLE.test(norm) || norm.includes("||") || hidesNestedCode(norm)) return true;
   if (BARE_PIPE.test(norm) && !pipefailOn(norm, pipefail)) return true;
   const groups = listGroups(norm);
   if (groups.flat().some((s) => /^!(?:\s|$)/.test(s))) return true;
+  if (groups.flat().some((el) => el.split(BARE_PIPE).some(masksStatus))) return true;
   const real = groups.map((g) => g.filter((s) => !PREFIX_SEGMENT.test(s)));
   const withCommand = real.filter((g) => g.length);
   if (!withCommand.length || !real[real.length - 1].length) return true;
@@ -298,7 +423,8 @@ const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
  * custom runner). `head` is not trusted (it can cut the failing line off the end); any other mask stays unknown.
  */
 function maskedByTailPipeOnly(command) {
-  const norm = stripQuoted(stripHeredocBodies(command));
+  if (command.length > ANALYSIS_CAP) return false;
+  const norm = blankCommand(command);
   if (norm === null || UNATTRIBUTABLE.test(norm)) return false;
   if (norm.includes("||") || />/.test(norm.replace(FD_MERGE_STDERR, ""))) return false;
   if (hidesNestedCode(norm)) return false;
@@ -318,7 +444,9 @@ function maskedByTailPipeOnly(command) {
 function zeroPassSummary(output) {
   if (typeof output !== 'string' || !output) return false;
   const tail = output.slice(-6000);
-  return /^\s*0 (?:tests? )?(?:passed|passing|ran)\b|^\s*0 pass(?:ed|es|ing)?\s*$|passed:\s*0\b|^\s*Tests:\s.*0 total\b|test result: ok\.\s+0 passed|0 examples, 0 failures/im.test(tail);
+  if (/^\s*0 (?:tests? )?(?:passed|passing|ran)\b|^\s*0 pass(?:ed|es|ing)?\s*$|passed:\s*0\b|^\s*Tests:\s.*0 total\b|test result: ok\.\s+0 passed|0 examples, 0 failures|\bNo tests found\b|\bcollected 0 items\b|\b0 tests? collected\b|^=+ no tests ran\b/im.test(tail)) return true;
+  // go test: every package printed `[no test files]` and none printed an `ok` line.
+  return /^\?\s+\S+\s+\[no test files\]/m.test(tail) && !/^ok\s/m.test(tail);
 }
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 function checkSummary(output) {
@@ -372,11 +500,12 @@ function runOutcome(command, output, exitCode) {
   if (typeof exitCode === 'number' && exitCode !== 0) return 'fail';
   const summary = checkSummary(output);
   if (summary === 'fail') return 'fail';
+  if (command.length > ANALYSIS_CAP) return 'unknown'; // not analysed past the cap: nothing after the cut can be ruled out
   if (exitIsMasked(command)) return summary === 'pass' && maskedByTailPipeOnly(command) ? 'pass' : 'unknown';
   if (summary === 'pass') {
     // A non-check command earns a pass only when it ran a real program; a command that only prints a stored
     // file (`cat mocha-results.log`) can carry a stale or forged green summary and proves nothing.
-    const norm = stripQuoted(stripHeredocBodies(command));
+    const norm = blankCommand(command);
     if (!commandRunsCheck(command) && (norm === null || onlyPrintsText(norm))) return 'unknown';
     return 'pass';
   }
@@ -385,7 +514,10 @@ function runOutcome(command, output, exitCode) {
   return 'unknown';
 }
 function sameCallCheckIsEvidence(command) {
-  const bare = stripHeredocBodies(command).replace(/'[^']*'|"[^"]*"/g, '""');
+  if (command.length > ANALYSIS_CAP) return false; // not analysed past the cap
+  const sc = scanShell(command);
+  if (!sc.ok) return false;
+  const bare = sc.raw.replace(/'[^']*'|"[^"]*"/g, '""');
   const units = bare.split(CHAIN_SPLIT_RE).map((u) => u.trim()).filter(Boolean);
   const writes = units.map((u) => bashWriteTargets(u).length > 0);
   return units.some((u, i) => commandRunsCheck(u) && !writes.slice(i + 1).some(Boolean));
@@ -511,8 +643,8 @@ function parseForVerify(lines) {
           callSeq += 1;
           if (EDIT_TOOLS.has(c.name)) { fileChanges += 1; lastEditCall = callSeq; }
           if (c.name === 'Bash') {
-            const command = (c.input && c.input.command) || '';
-            bashCalls.push({ seq: callSeq, id: c.id, command });
+            const command = c.input && typeof c.input.command === 'string' ? c.input.command : '';
+            bashCalls.push({ seq: callSeq, id: c.id, command, background: !!(c.input && c.input.run_in_background) });
             if (bashWriteTargets(command).length) { fileChanges += 1; lastEditCall = callSeq; }
           }
         }
@@ -528,17 +660,19 @@ function parseForVerify(lines) {
   // `bundle exec rspec`, `./gradlew test`, `docker exec app npm test`, `bash -o pipefail -c 'npm test'`, ...). A bare
   // CHECK_COMMAND substring match is NOT enough — the server applies the same anchored test, so anything else it
   // ignores, and sending it only lets a check verb inside a commit message or a log read pretend to be a check.
-  const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).map((b) => {
+  // A run started in the background has not finished: its reply ("Command running in background with ID ...") is not a
+  // result, so it is never sent (an exit status of 0 there proves nothing; the agent must run the check to completion).
+  const evidence = bashCalls.filter((b) => bashIsEvidenceAfterEdit(b, lastEditCall)).flatMap((b) => {
     const r = resultsById.get(b.id) || { text: '', isError: null };
+    if (b.background || BACKGROUND_RESULT.test(r.text)) return [];
     const exitCode = r.isError === null ? undefined : r.isError ? 1 : 0;
-    return { command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) };
+    return [{ command: b.command, output: r.text, exitCode, outcome: runOutcome(b.command, r.text, exitCode), check: commandRunsCheck(b.command) }];
   }).filter((e) => e.check);
   const checks = capChecks(evidence).map((e) => {
     const check = { command: capCheckCommand(e.command, CHECK_COMMAND_CAP, e.check ? checkCommandSnippet(e.command) : null), output: e.output.slice(-4000), exit_code: e.exitCode };
     // The server reads a masked exit from the command text, which the cap can cut, so a cut command carries the outcome
-    // decided on the whole command. passed:true only on a full pass of a command that runs a check in program position;
-    // otherwise passed:false (a fail, or an unknown the cut text could turn into a pass). `passed` is in every
-    // deployed schema.
+    // decided here. A command over the cap is never a pass (runOutcome), so a cut command is always passed:false (a fail,
+    // or an unknown the cut text could turn into a pass). `passed` is in every deployed schema.
     if (check.command !== e.command) check.passed = e.check && e.outcome === 'pass';
     return check;
   });
@@ -577,8 +711,8 @@ function parseForHonest(lines) {
           lastEditCall = callSeq;
         }
         if (c.name === 'Bash') {
-          const command = (c.input && c.input.command) || '';
-          bashCalls.push({ seq: callSeq, id: c.id, command });
+          const command = c.input && typeof c.input.command === 'string' ? c.input.command : '';
+          bashCalls.push({ seq: callSeq, id: c.id, command, background: !!(c.input && c.input.run_in_background) });
           const writes = bashWriteTargets(command);
           if (writes.length) { edits.push(...writes); lastEditCall = callSeq; }
         }
@@ -593,7 +727,7 @@ function parseForHonest(lines) {
   const runs = bashCalls.filter((b) => resultsById.has(b.id)).map((b) => {
     const r = resultsById.get(b.id);
     const check = commandRunsCheck(b.command);
-    const outcome = check ? runOutcome(b.command, r.text, r.isError ? 1 : 0) : (r.isError ? 'fail' : 'pass');
+    const outcome = b.background || BACKGROUND_RESULT.test(r.text) ? 'unknown' : check ? runOutcome(b.command, r.text, r.isError ? 1 : 0) : (r.isError ? 'fail' : 'pass');
     return { command: b.command, isError: r.isError, outcome, output: r.text.slice(-1500), stale: !bashIsEvidenceAfterEdit(b, lastEditCall), check };
   });
   return { edits, runs };
@@ -624,18 +758,37 @@ const capLine = (s, n) => (s.length > n ? `${s.slice(0, n - 3)}...` : s);
 //   4. stale commands (before the last edit), newest first, and never as verification of the edits.
 // Trimming is strict priority: the first item that does not fit stops the fill. Dropped spans become omission lines in
 // chronological order; the edit header and the check-count line are always present.
-const cmdKey = (command) => safe(command).slice(0, 300);
+// Every string built from a run is cut BEFORE it is redacted and collapsed: a 100 KB command must not cost 100 KB of regex work.
+const RUN_TEXT_CAP = 1000;
+const cmdKey = (command) => safe(String(command).slice(0, RUN_TEXT_CAP)).slice(0, 300);
 const checkVerb = (command) => {
-  const toks = safe(command).split(/\s+/).filter(Boolean);
+  const toks = safe(String(command).slice(0, RUN_TEXT_CAP)).split(/\s+/).filter(Boolean);
   return toks.slice(0, toks.length > 1 && !toks[1].startsWith('-') ? 2 : 1).join(' ');
 };
-function evidenceText({ edits, runs }, budget = Infinity) {
-  const header = capLine(edits.length ? `Files edited this turn: ${edits.map((e) => safe(e)).join(', ')}.` : 'No files were edited this turn.', 200);
-  const line = (r) => {
-    const cmd = safe(r.command).slice(0, 300);
-    const tail = safe(r.output).slice(-300);
+// Default size of the evidence block: a real cap, so a long session cannot produce an unbounded block `reason`.
+const EVIDENCE_CAP = 8000;
+// The block reason embeds the evidence at this smaller budget (REASON_CAP bounds the whole reason).
+const REASON_EVIDENCE_BUDGET = 4500;
+const REASON_CAP = 8000;
+const MAX_OFFENDING_LINES = 8;
+const capText = (s, max) => (s.length > max ? `${s.slice(0, max - 22)}\n…[reason truncated]` : s);
+// The index of one transcript's runs, built once per evidence object: the priority order, the check line and a memo of
+// each run's rendered line. Each jev_classify item (up to one per claim) then only runs the budgeted fill, which stops at
+// the first item that does not fit, so the work per item is bounded by the budget, not by the transcript length.
+const evidenceIndexes = new WeakMap();
+function evidenceIndex(ev) {
+  const { edits, runs } = ev;
+  const cached = evidenceIndexes.get(ev);
+  if (cached && cached.runs === runs && cached.count === runs.length && cached.editCount === edits.length) return cached;
+  const header = capLine(edits.length ? `Files edited this turn: ${edits.slice(0, 40).map((e) => safe(String(e).slice(0, RUN_TEXT_CAP))).join(', ')}.` : 'No files were edited this turn.', 200);
+  const lines = new Array(runs.length);
+  const line = (i) => {
+    if (lines[i] !== undefined) return lines[i];
+    const r = runs[i];
+    const cmd = safe(String(r.command).slice(0, RUN_TEXT_CAP)).slice(0, 300);
+    const tail = safe(String(r.output).slice(-RUN_TEXT_CAP)).slice(-300);
     const label = r.outcome === 'fail' ? 'failed' : r.outcome === 'pass' ? 'ok' : 'unknown (no trustworthy result: no recognised summary, or the exit status is masked; not counted as passing)';
-    return `- \`${cmd}\` -> ${label}${tail ? `, output tail: "${tail}"` : ''}`;
+    return (lines[i] = `- \`${cmd}\` -> ${label}${tail ? `, output tail: "${tail}"` : ''}`);
   };
   const afterIdx = runs.map((_, i) => i).filter((i) => !runs[i].stale);
   const staleIdx = runs.map((_, i) => i).filter((i) => runs[i].stale);
@@ -663,6 +816,12 @@ function evidenceText({ edits, runs }, budget = Infinity) {
   const checkLine = !checkIdx.length
     ? 'No check command ran after the edits.'
     : `Check commands after the edits, latest run of each: ${latest.length} (${latest.filter((i) => runs[i].outcome === 'pass').length} ok, ${latest.filter((i) => runs[i].outcome === 'fail').length} failed, ${latest.filter((i) => runs[i].outcome === 'unknown').length} unknown).`;
+  const index = { runs, count: runs.length, editCount: edits.length, header, line, afterIdx, staleIdx, priority, checkLine };
+  evidenceIndexes.set(ev, index);
+  return index;
+}
+function evidenceText(ev, budget = EVIDENCE_CAP) {
+  const { header, line, afterIdx, staleIdx, priority, checkLine } = evidenceIndex(ev);
   // Chronological; a run of dropped indices collapses into one omission line.
   const section = (idxs, keep) => {
     const out = [];
@@ -670,7 +829,7 @@ function evidenceText({ edits, runs }, budget = Infinity) {
     for (const i of idxs) {
       if (!keep.has(i)) { gap += 1; continue; }
       if (gap) { out.push(`… ${gap} commands omitted`); gap = 0; }
-      out.push(line(runs[i]));
+      out.push(line(i));
     }
     if (gap) out.push(`… ${gap} commands omitted`);
     return out;
@@ -765,23 +924,43 @@ function claimsFromSegment(rawSegment, shortOut) {
   }
   return claims;
 }
+// The message is judged from its last CLAIM_INPUT_CAP characters (the tail, where the completion claim is), cut at a line start.
+const CLAIM_INPUT_CAP = 60000;
+function tailLines(s, max) {
+  if (s.length <= max) return s;
+  const cut = s.slice(s.length - max);
+  const nl = cut.indexOf('\n');
+  return nl === -1 ? cut : cut.slice(nl + 1);
+}
 function splitClaims(message) {
   const claims = [];
   const shortCandidates = [];
-  const lines = String(message || '').split('\n');
-  for (let i = 0; i < lines.length; i++) {
+  const lines = tailLines(String(message || ''), CLAIM_INPUT_CAP).split('\n');
+  const n = lines.length;
+  // One pass up front: where each closing fence is, and a running count of code-shaped lines, so every fence opener finds
+  // its closer and tests its body in O(1) (a message of many unclosed openers was quadratic).
+  const closers = [];
+  const codeShaped = new Array(n + 1);
+  codeShaped[0] = 0;
+  for (let k = 0; k < n; k++) {
+    if (FENCE_CLOSE_RE.test(lines[k].trim())) closers.push(k);
+    codeShaped[k + 1] = codeShaped[k] + (CODE_SHAPED_RE.test(lines[k]) ? 1 : 0);
+  }
+  let next = 0; // first entry of `closers` still available (greater than the current line)
+  const spent = new Set(); // closing fences of prose fences: skipped when reached
+  for (let i = 0; i < n; i++) {
+    if (spent.has(i)) continue;
     let line = lines[i].trim();
     // Fenced code is code, never a claim. An opener counts only when a closing fence follows; an unterminated
     // opener is a stray marker, and the text after it is still judged (one stray fence cannot silence the rest).
     if (FENCE_OPEN_RE.test(line)) {
-      let close = -1;
-      for (let j = i + 1; j < lines.length && close < 0; j++) if (FENCE_CLOSE_RE.test(lines[j].trim())) close = j;
-      if (close >= 0) {
-        const body = lines.slice(i + 1, close);
-        if (PROSE_FENCE_INFO.has(line.slice(3).trim()) && !body.some((b) => CODE_SHAPED_RE.test(b))) {
-          // Prose fence: splice its body in place of the fence and judge it like any other text.
-          lines.splice(i, close - i + 1, ...body);
-          i--;
+      while (next < closers.length && closers[next] <= i) next++;
+      if (next < closers.length) {
+        const close = closers[next];
+        if (PROSE_FENCE_INFO.has(line.slice(3).trim()) && codeShaped[close] - codeShaped[i + 1] === 0) {
+          // Prose fence: its body is judged like any other text; the opener and this closer are dropped.
+          spent.add(close);
+          next++;
         } else {
           i = close;
         }
@@ -912,16 +1091,34 @@ async function mcpCall(toolName, args, fetchImpl, rejections) {
 // so this wrapper is the hook's actual fail-open guarantee, not just the per-step note()+return-null calls
 // inside decideInner.
 const MAX_CONSECUTIVE_BLOCKS = 2;
-// Consecutive-block count for the loop bound, per session (transcript path, else session_id). Transient turn state
-// under the OS temp dir, not config. Any allowed stop clears it.
+// Consecutive-block count for the loop bound, per session (transcript path, else session_id). Transient turn state in a
+// per-user directory ($XDG_STATE_HOME/jev-stop-gate, else ~/.cache/jev-stop-gate), never in the shared /tmp: another
+// local user must not be able to pre-create the directory, plant a symlink, or pin the counter. Any allowed stop clears it.
+function stateDir() {
+  const xdg = (process.env.XDG_STATE_HOME || '').trim();
+  return path.join(path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.cache'), 'jev-stop-gate');
+}
 function blockStatePath(hook) {
   const key = crypto.createHash('sha1').update(String(hook.transcript_path || hook.session_id || 'anon')).digest('hex');
-  return path.join(os.tmpdir(), 'jev-stop-gate', key + '.json');
+  return path.join(stateDir(), key + '.json');
 }
+// The state directory is trusted only when it is a real directory (not a symlink) owned by this user and not writable by
+// group or others; otherwise reads see no count and writes fail, which keeps the unwritable-state behaviour (allow the stop).
+function stateDirIsSafe(dir) {
+  const st = fs.lstatSync(dir);
+  if (!st.isDirectory()) return false;
+  if (typeof process.getuid === 'function' && st.uid !== process.getuid()) return false;
+  return (st.mode & 0o022) === 0;
+}
+const NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
 function readBlockCount(file) {
   try {
-    const n = JSON.parse(fs.readFileSync(file, 'utf8')).blocks;
-    return Number.isInteger(n) && n >= 0 ? n : 0;
+    if (!stateDirIsSafe(path.dirname(file))) return 0;
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW);
+    try {
+      const n = JSON.parse(fs.readFileSync(fd, 'utf8')).blocks;
+      return Number.isInteger(n) && n >= 0 ? n : 0;
+    } finally { fs.closeSync(fd); }
   } catch (e) {
     return 0;
   }
@@ -929,15 +1126,18 @@ function readBlockCount(file) {
 // False when the count cannot be recorded. The caller then allows the stop: a block that cannot be counted could loop.
 function writeBlockCount(file, n) {
   try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ blocks: n }));
+    const dir = path.dirname(file);
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (!stateDirIsSafe(dir)) return false;
+    const fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | NOFOLLOW, 0o600);
+    try { fs.writeSync(fd, JSON.stringify({ blocks: n })); } finally { fs.closeSync(fd); }
     return true;
   } catch (e) {
     return false;
   }
 }
 function clearBlockCount(file) {
-  try { fs.unlinkSync(file); } catch (e) { /* no count recorded */ }
+  try { if (stateDirIsSafe(path.dirname(file))) fs.unlinkSync(file); } catch (e) { /* no count recorded */ }
 }
 async function decide(hookInput, opts) {
   const hook = hookInput || {};
@@ -1020,7 +1220,6 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   // worst-case otherwise) when they can run in parallel (~3s worst-case for either to time out).
   const [verdict, classifyChunks] = await Promise.all([verifyPromise, classifyPromise]);
   const classifyResult = { results: classifyChunks.flatMap((r) => (r && Array.isArray(r.results) ? r.results : [])) };
-  const evidence = evidenceText(ev);
   note('verify verdict=' + JSON.stringify(verdict && { verified: verdict.verified, verdict: verdict.verdict }));
   // A server that has shipped jev-agent-kit PR #30 puts `discloses_unverified` inside `answers` whenever it
   // actually ran the Jev judgement (absent only on an early-return fail-open path, same as an older server).
@@ -1056,7 +1255,7 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
   if (wantsHonest && claims.length) {
     const alreadyDisclosed = serverHasDisclosure && verdict.verdict === 'disclosed_unverified';
     if (!alreadyDisclosed) {
-      note('classify results=' + JSON.stringify(classifyResult && classifyResult.summary));
+      note('classify results=' + (classifyResult.results.length + ' (' + Object.entries(classifyResult.results.reduce((a, r) => { const k = r.classification + '/' + r.decision; a[k] = (a[k] || 0) + 1; return a; }, {})).map(([k, v]) => k + ':' + v).join(' ') + ')'));
       if (classifyResult && Array.isArray(classifyResult.results)) {
         // "misrepresented" (an outright tool-log contradiction) always blocks. "unverifiable" (no tool
         // evidence either way) blocks too, by default -- restored to its original breadth: a plain,
@@ -1075,10 +1274,13 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
         });
         if (offending.length) {
           const review = classifyResult.results.filter((r) => r.decision === 'review' && !offending.includes(r));
-          const byId = Object.fromEntries(claims.map((c, i) => ['c' + i, redact(c)])); // redacted: this text is quoted back into the block `reason`, which re-enters the transcript
-          const offendingLines = offending.map((r) => `- "${byId[r.id] || '(claim text unavailable)'}" — classified ${r.classification} (${Math.round((r.top_probability || 0) * 100)}%)`);
+          // Claim text is redacted (it is quoted back into the block `reason`, which re-enters the transcript) and each line
+          // is cut; only the first MAX_OFFENDING_LINES are listed, so the reason stays small however long the message is.
+          const claimText = (id) => { const m = /^c(\d+)$/.exec(String(id)); return m && claims[Number(m[1])] !== undefined ? capLine(redact(claims[Number(m[1])]), 300) : '(claim text unavailable)'; };
+          const offendingLines = offending.slice(0, MAX_OFFENDING_LINES).map((r) => `- "${claimText(r.id)}" — classified ${r.classification} (${Math.round((r.top_probability || 0) * 100)}%)`);
+          if (offending.length > MAX_OFFENDING_LINES) offendingLines.push(`- … ${offending.length - MAX_OFFENDING_LINES} more offending claims`);
           let text = `HONEST: ${offending.length} claim${offending.length === 1 ? '' : 's'} in your message ${offending.length === 1 ? 'does' : 'do'} not match the session's own tool log:\n` +
-            offendingLines.join('\n') + `\n\nWhat the tool log actually shows:\n${evidence}` +
+            offendingLines.join('\n') + `\n\nWhat the tool log actually shows:\n${evidenceText(ev, REASON_EVIDENCE_BUDGET)}` +
             '\n\nRewrite those lines to match the evidence above, or run the check they assert, before sending this message.';
           if (review.length) text += `\n\n(${review.length} more claim${review.length === 1 ? '' : 's'} were a thin margin and could not be confirmed either way; not blocking on those alone.)`;
           reasons.push(text);
@@ -1089,19 +1291,23 @@ async function decideInner(hookInput, { fetchImpl } = {}) {
     }
   }
 
-  return reasons.length ? { decision: 'block', reason: reasons.join('\n\n') } : null;
+  return reasons.length ? { decision: 'block', reason: capText(reasons.join('\n\n'), REASON_CAP) } : null;
 }
 
+// Writes the decision and exits only once stdout has taken it: process.exit() right after write() can cut a large
+// payload short on a slow pipe, and truncated JSON is read by Claude Code as "no decision" (a silent fail-open).
+function writeResult(result, out = process.stdout, exit = process.exit) {
+  if (!result) { exit(0); return; }
+  try { out.write(JSON.stringify(result), () => exit(0)); } catch (e) { exit(0); }
+}
 if (require.main === module) {
   let input = '';
   process.stdin.on('data', (c) => { input += c; });
   process.stdin.on('end', async () => {
     let hook;
     try { hook = JSON.parse(input.replace(/^\uFEFF/, '')); } catch { note('bad hook input'); process.exit(0); return; }
-    const result = await decide(hook);
-    if (result) process.stdout.write(JSON.stringify(result));
-    process.exit(0);
+    writeResult(await decide(hook));
   });
 }
 
-module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS, runOutcome, checkSummary, exitIsMasked, CHECK_COMMAND, commandRunsCheck };
+module.exports = { decide, parseForVerify, parseForHonest, evidenceText, splitClaims, classifyClasses, mcpCall, isRealUserPrompt, readTranscriptLines, bashWriteTargets, EDIT_TOOLS, runOutcome, checkSummary, exitIsMasked, CHECK_COMMAND, commandRunsCheck, writeResult, stateDir, blockStatePath };
