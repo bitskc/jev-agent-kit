@@ -11,7 +11,7 @@ can be held accountable for.
 
 ## Latest: 2026-10-28, offline (no Jev credentials in this environment)
 
-424 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
+620 cases (`evals/guard.jsonl`) across independent adversarial review rounds on
 PR #30 (reassignment-ordering, cloud-CLI flag-shift, `openssl -out -`, dd allowlist gaps in round 2; a
 shared bash -c/sh -c/eval/xargs wrapper-unwrap canonicalization layer plus curl/wget/httpie attached-option
 forms, dd/rm/chmod `.`/`..`-segment path tricks, terraform/helm option-alias gaps, versioned-interpreter
