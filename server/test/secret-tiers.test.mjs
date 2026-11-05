@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { guardCommand } from "../src/kit/guard.mjs";
-import { words } from "../src/kit/shell.mjs";
+import { words, peelCommand, programOf } from "../src/kit/shell.mjs";
 
 // Secret reads are decided by token shape, not argv position. Every test here asserts the guard's DECISION (and rule)
 // for a command string passed to guardCommand(); no command in this file is ever executed, and no fixture files are
@@ -802,4 +802,78 @@ test("round 21 B1': words() splits grouping parens and keeps substitution, call,
     'echo ")" "(x)"': ["echo", ")", "(x)"],
   };
   for (const [src, want] of Object.entries(cases)) assert.deepEqual(words(src), want, src);
+});
+
+// ── Round 21b ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Deep grouping used to cost a copy of the argv per paren (quadratic): 9000 nested parens took 6 s, past the hook's timeout,
+// which fails open. The bounds are generous (the guard needs ~10 ms); they fail only on a super-linear walk.
+test("round 21b: deeply nested grouping is decided in well under a second and a blocked body still blocks", async () => {
+  const P = (n, body) => "(".repeat(n) + body + ")".repeat(n);
+  const timed = async (cmd) => {
+    const t = performance.now();
+    const r = await guard(cmd, PROJ, HOME);
+    const ms = performance.now() - t;
+    assert.ok(ms < 500, `${ms.toFixed(0)} ms for ${cmd.slice(0, 20)}... (${cmd.length} chars)`);
+    return r;
+  };
+  for (const [body, rule] of [["rm -rf /", "R7-root-delete"], ["cat ~/.ssh/id_rsa", "R1-secret-exposure"], ["cat .env", "R1-secret-exposure"]]) {
+    for (const cmd of [P(9000, body), "( ".repeat(2000) + body + " )".repeat(2000), "{ ".repeat(3000) + body + " }".repeat(3000), "! ".repeat(5000) + body, "time ".repeat(3000) + body]) {
+      const r = await timed(cmd);
+      assert.equal(r.decision, "block", `${body}: ${cmd.slice(0, 12)}`);
+      assert.equal(r.rule, rule, `${body}: ${cmd.slice(0, 12)}`);
+    }
+  }
+  // a harmless body is not blocked, and never allowed once the nesting passes the cap
+  for (const cmd of [P(9000, "ls"), "( ".repeat(2000) + "ls" + " )".repeat(2000), "{ ".repeat(3000) + "ls" + " }".repeat(3000)]) {
+    const r = await timed(cmd);
+    assert.equal(r.decision, "ask", cmd.slice(0, 12));
+    assert.equal(r.rule, "R10-general-risk", cmd.slice(0, 12));
+    assert.match(r.reason, /nests grouping/);
+  }
+});
+
+test("round 21b: nesting up to the cap is analyzed normally; past it only a harmless command asks", async () => {
+  const P = (n, body) => "(".repeat(n) + body + ")".repeat(n);
+  assert.equal((await guard(P(60, "ls"), PROJ, HOME)).decision, "allow");
+  assert.equal((await guard(P(64, "ls"), PROJ, HOME)).decision, "allow");
+  assert.equal((await guard(P(65, "ls"), PROJ, HOME)).decision, "ask");
+  assert.equal((await guard(P(65, "cat .env"), PROJ, HOME)).decision, "block");
+  // quoted parens do not count, and closers lower the count
+  assert.equal((await guard(`echo "${"(".repeat(200)}"`, PROJ, HOME)).decision, "allow");
+  assert.equal((await guard("(ls); ".repeat(200), PROJ, HOME)).decision, "allow");
+});
+
+// P3 regression vs main: a glob that spells `credentials` and then has a `*` can expand to credentials.json or .bak.
+test("round 21b: a credentials glob with a star asks, and a source file named credentials stays allowed", async () => {
+  for (const cmd of [
+    "cat credentials*", "cat credentials.*", "cat credentials.js*", "cat credentials.j*n", "cat credentials.json.*", "cat credentials.json.b*",
+    "cat app-credentials*", "cat app-credentials.*", "cat *credentials*", "git add credentials*", "sort credentials.*",
+  ]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "ask", cmd);
+  }
+  for (const cmd of ["cat src/auth/credentials.ts", "cat src/credentials*.ts", "cat creds*", "cat src/credentials/*.ts", "ls credentials*"]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.notEqual(r.decision, "block", cmd);
+  }
+  assert.equal((await guard("cat creds*", PROJ, HOME)).decision, "allow");
+  assert.equal((await guard("cat src/credentials*.ts", PROJ, HOME)).decision, "allow");
+  // only the last component: a directory glob is not the file
+  assert.equal((await guard("cat credentials*/notes.txt", PROJ, HOME)).decision, "allow");
+});
+
+test("round 21b: the peel walk skips a run of grouping marks and keywords, and keeps a glued head", () => {
+  assert.deepEqual(peelCommand(["(", "(", "!", "{", "time", "-p", "time", "cat", ".env", ")", ")"]), ["cat", ".env", ")", ")"]);
+  assert.deepEqual(peelCommand(["((cat", ".env"]), ["cat", ".env"]);
+  assert.deepEqual(peelCommand(["(", "(((cat", ".env"]), ["cat", ".env"]);
+  assert.deepEqual(programOf("time -p cat .env"), ["cat", [".env"]]);
+  assert.deepEqual(programOf("select x in a b; do cat .env"), ["cat", [".env"]]);
+  assert.deepEqual(programOf("select x in a b"), [null, []]);
+  assert.deepEqual(programOf("FOO=1 ! ( time cat .env )"), ["cat", [".env", ")"]]);
+});
+
+test("round 21b: past the nesting cap a soft ask keeps its own reason", async () => {
+  const r = await guard("(".repeat(65) + "sort credentials" + ")".repeat(65), PROJ, HOME);
+  assert.equal(r.decision, "ask");
+  assert.match(r.reason, /bare credential word/);
 });

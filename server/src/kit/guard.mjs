@@ -313,6 +313,8 @@ function expandStars(comp) {
 // name a star merely trails or pads are still found). Linear in the component and never budgeted, so a secret name is found
 // however much padding came first; the component still asks (it was not fully checked), but a hit found here blocks.
 const emptyStars = (comp) => comp.filter((u) => u !== STAR);
+const CRED_STAR_RE = /credentials[^]*\*/;
+const CRED_STAR_SOURCE_RE = /\*[^*]*\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|rb|sh|md|rst)$/;
 // What one path component can be, over all its spellings. Levels: 0 = no, 1 = only through wildcards alone (ask), 2 = fixed
 // by at least one literal unit (block).
 function classifyComp(comp, last) {
@@ -330,7 +332,11 @@ function classifyComp(comp, last) {
     cands = [emptyStars(comp)];
     wide = true;
   }
-  const f = { ssh: 0, cfg: 0, gh: 0, df: SECRET_DIR_FILES.map(() => [0, 0]), base: 0, ask: wide };
+  // A last component that spells `credentials` and then has a `*` (`credentials*`, `credentials.js*`, `credentials.json.*`,
+  // `app-credentials.*`, `*credentials*`) can expand to credentials.json, credentials.bak, ...: the star supplies letters the
+  // spellings above do not follow, so it asks. A star followed by a source-file extension (`credentials*.ts`) does not.
+  const credStar = last && CRED_STAR_RE.test(key) && !CRED_STAR_SOURCE_RE.test(key);
+  const f = { ssh: 0, cfg: 0, gh: 0, df: SECRET_DIR_FILES.map(() => [0, 0]), base: 0, ask: wide || credStar };
   for (const c of cands) {
     f.ssh = Math.max(f.ssh, anyName(c, DIR_IDX) === 2 || nameMatch(c, ".credentials.json") === 2 || credDotName(c) ? 2 : 0);
     f.cfg = Math.max(f.cfg, nameMatch(c, ".config"));
@@ -2070,6 +2076,25 @@ export function readChoice(a, keys) {
   return { choice: a.choice, confidence, margin };
 }
 
+// ── nesting cap ──────────────────────────────────────────────────────────────
+const MAX_GROUPING_DEPTH = 64;
+/** Deepest run of unquoted open `(` / `{` in a command (one linear scan; closers lower the count, never below 0). */
+function groupingDepth(command) {
+  if (command.length <= MAX_GROUPING_DEPTH) return 0;
+  let depth = 0;
+  let max = 0;
+  let quote = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote) { if (ch === "\\" && quote === '"') i++; else if (ch === quote) quote = null; continue; }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "(" || ch === "{") { if (++depth > max) max = depth; }
+    else if ((ch === ")" || ch === "}") && depth > 0) depth--;
+  }
+  return max;
+}
+
 // ── the decision ─────────────────────────────────────────────────────────────
 /**
  * @param input {tool?, command?, file_path?, cwd?, description?, home?, user_request?, ask_at?, disable_rules?}
@@ -2155,6 +2180,11 @@ export async function guardCommand(input, deps = {}) {
     out.decided_by = "prefilter";
     out.jev = { used: false, status: "not_needed" };
     return out;
+  }
+  // Deeply nested grouping is not something a person types and not something the segment walk reasons about: whatever no
+  // rule blocked asks instead of passing (a block above still wins).
+  if (!softAsk && SHELL_TOOLS.has(tool) && groupingDepth(command) > MAX_GROUPING_DEPTH) {
+    softAsk = { rule: "R10-general-risk", reason: `the command nests grouping (parentheses or braces) more than ${MAX_GROUPING_DEPTH} deep, which the guard does not analyze; confirm it is intended`, suggestion: null };
   }
   if (softAsk) {
     out.decision = "ask"; out.score = 0.7;

@@ -270,17 +270,20 @@ export function peelCommand(toksIn, opts = {}) {
   const stopAt = opts.stopAt || null;
   let toks = toksIn;
   for (;;) {
-    if (!toks.length) return [];
-    const head = stripHeadMarks(toks[0]);
-    if (head !== toks[0]) {
-      // `!( cmd` / `{ cmd` / `( cmd`: the grouping marker rides the first token. If stripping it empties
-      // the token (a bare `(`/`{`/`!` word) or leaves a keyword, fall through to the keyword branch.
-      toks = [head, ...toks.slice(1)];
+    // Consume the whole leading run of grouping marks and keywords in one linear pass (an index, not a slice per token):
+    // `((((...rm -rf /...))))`, `( ( (`, `{ { {` and `! ! !` runs would otherwise cost a copy of the argv per mark.
+    let pos = 0;
+    let t0 = "";
+    while (pos < toks.length) {
+      // `!( cmd` / `{ cmd` / `( cmd`: the grouping marker rides the first token; stripping it can leave nothing (a bare
+      // `(`/`{`/`!` word) or a keyword, which is skipped like any other.
+      t0 = stripHeadMarks(toks[pos]);
+      if (!t0 || t0 === ")" || isCaseLabel(t0) || (KEYWORD_SKIP.has(t0) && t0 !== "select") || ASSIGN_RE.test(t0)) { pos++; continue; }
+      if (t0 === "time") { pos++; while (pos < toks.length && toks[pos] === "-p") pos++; continue; }
+      break;
     }
-    const t0 = toks[0];
-    if (!t0) { toks = toks.slice(1); continue; }
-    if (t0 === ")") { toks = toks.slice(1); continue; }
-    if (isCaseLabel(t0)) { toks = toks.slice(1); continue; }
+    if (pos >= toks.length) return [];
+    if (pos > 0 || t0 !== toks[0]) toks = [t0, ...toks.slice(pos + 1)];
     if (t0 === "for" || t0 === "select") {
       // `for v in a b; do ...`: the words between `in` and `do` are the list, not commands.
       let i = 1;
@@ -294,9 +297,6 @@ export function peelCommand(toksIn, opts = {}) {
       toks = k >= 0 ? toks.slice(k + 1) : [];
       continue;
     }
-    if (t0 === "time") { let k = 1; while (k < toks.length && toks[k] === "-p") k++; toks = toks.slice(k); continue; }
-    if (KEYWORD_SKIP.has(t0)) { toks = toks.slice(1); continue; }
-    if (ASSIGN_RE.test(t0)) { toks = toks.slice(1); continue; }
     const prog = base(t0);
     if (stopAt && stopAt.has(prog)) return toks;
     if (prog === "ip" && toks[1] === "netns" && toks[2] === "exec" && toks.length > 3) { toks = toks.slice(4); continue; }
