@@ -123,14 +123,15 @@ const PASSING_TITLE = /^\s*(?:[✓✔√]|PASS\b|ok\b)/;
 // from its head and can never earn a pass.
 const ANALYSIS_CAP = 2000;
 const NPM_OPT = String.raw`(?:\s+(?:(?:-w|-C|-F|--prefix|--workspace|--filter|--dir|--cwd)\s+\S+|-{1,2}(?!(?:w|C|F|prefix|workspace|filter|dir|cwd)(?:\s|$))[A-Za-z][\w-]*(?:=\S+)?))*`;
-// Only `test` takes a `:suffix` (`npm run test:unit`); `lint:fix`, `build:docs`, `test-seed-db` are not checks, and `npm ci`
-// is an install (`ci` counts only as a script: `npm run ci`).
-const SCRIPT_VERB = String.raw`(?:test(?::[\w-]+)*|check|lint|typecheck|build|verify)`;
+// Only `test` takes a `:suffix`, and only from a short list of conventional suite names (`npm run test:unit`, `test:e2e`,
+// `test:integration`, `test:coverage`, ...): `test:watch`, `test:db:reset`, `test:update-snapshots`, `test:install-browsers` and
+// `test-seed-db` are not checks, nor are `lint:fix`, `build:docs`, `format`. `npm ci` is an install (`ci` counts only as a script).
+const SCRIPT_VERB = String.raw`(?:test(?::(?:unit|e2e|integration|int|ci|coverage|all|ui|api|server|client))?|check|lint|typecheck|build|verify)`;
 const RUNNER_OPT = String.raw`(?:\s+(?:(?:-p|--package)(?:=|\s+)\S+|--?(?!(?:p|package)(?:\s|$))[A-Za-z][\w-]*|--))*`;
 const MAKE_OPT = String.raw`(?:\s+(?:(?:-C|-f|-I|--directory|--file)(?:\s+|=)\S+|-j\s*\d+|-(?!(?:C|f|I)(?:\s|$))[A-Za-z]+|--(?!(?:directory|file)(?:\s|$))[a-z][\w-]*(?:=\S+)?|[A-Za-z_]\w*=\S*))*`;
 const PM_CHECK = String.raw`(?:npm|pnpm|yarn|bun)${NPM_OPT}\s+(?:(?:run(?:-script)?${NPM_OPT}\s+)?${SCRIPT_VERB}|run(?:-script)?${NPM_OPT}\s+ci)`;
 const PKG_RUNNER_CHECK = String.raw`(?:npx|bunx|pnpm(?:\s+(?:exec|dlx))?|yarn(?:\s+dlx)?|npm\s+(?:exec|x)|bun\s+x)${RUNNER_OPT}\s+(?:tsc|jest|vitest|mocha|eslint|biome|prettier\s+--check)`;
-const OTHER_CHECK = String.raw`(?:python3?|pypy3?)\s+-m\s+(?:pytest|unittest)|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make${MAKE_OPT}\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build)`;
+const OTHER_CHECK = String.raw`(?:python3?|pypy3?)\s+-m\s+(?:pytest|unittest)|pytest|jest|vitest|mocha|tsc|eslint|biome\s+check|ruff(?!\s+(?:version|format|rule|config|linter|clean|server|help|generate-shell-completion)(?:\s|$))|mypy|flake8|pylint|black\s+--check|cargo\s+(?:test|check|build|clippy)|go\s+(?:test|vet|build)|make${MAKE_OPT}\s+(?:test|check|lint|build)|mvn\s+(?:test|verify)|gradle\w*\s+(?:test|check|build)|dotnet\s+(?:test|build)|node\s+--test|deno\s+(?:test|check|lint)|rspec|rake\s+test|mix\s+test|phpunit|swift\s+(?:test|build)|xcodebuild\s+test|ctest|zig\s+(?:test|build)`;
 const CHECK_COMMAND = new RegExp(String.raw`\b(?:${PM_CHECK}|${PKG_RUNNER_CHECK}|${OTHER_CHECK})(?=\s|$|[&<>)])`);
 // Prefix elements: one parse per token, so a long run of dashes cannot make the regex backtrack exponentially.
 const PREFIX_ELEMENTS = [
@@ -150,9 +151,24 @@ const PREFIX_ELEMENTS = [
 const EXEC_PREFIX = new RegExp(String.raw`^(?:(?:${PREFIX_ELEMENTS})\s+)*`);
 // `exec <program>` replaces the shell with the program: its status IS the program's, so `exec npm test` is the check.
 const EXEC_BUILTIN = /^exec(?:\s+-\S+)*\s+(?=\S)/;
-const NON_RUN_FLAG = /(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--listTests|--dry-run)(?=\s|$|=)/;
-// `ctest -V` is verbose, not version.
-const isNonRun = (s) => NON_RUN_FLAG.test(/^(?:\S*\/)?ctest(?=\s)/.test(s) ? s.replace(/(?:^|\s)-V(?=\s|$)/g, ' ') : s);
+// Flags that make a runner print something other than a suite run (see the server copy), plus make's own non-running modes.
+const NON_RUN_FLAG = /(?:^|\s)(?:--help|-h|--version|-V|--collect-only|--co|--listTests|--dry-run|--if-present|--showConfig|--init|--print-config|--no-run|--fixtures|--markers|--list|-list)(?=\s|$|=)/;
+const MAKE_NON_RUN_LONG = /(?:^|\s)--(?:just-print|dry-run|recon|touch|question|print-data-base)(?=\s|$|=)/;
+function makeShortNonRun(s) {
+  for (const m of s.matchAll(/(?:^|\s)-([A-Za-z]+)(?=\s|$)/g)) {
+    for (const ch of m[1]) {
+      if ('CfIoWlOj'.includes(ch)) break;
+      if ('ntqp'.includes(ch)) return true;
+    }
+  }
+  return false;
+}
+function isNonRun(s) {
+  const t = /^(?:\S*\/)?ctest(?=\s)/.test(s) ? s.replace(/(?:^|\s)-V(?=\s|$)/g, ' ') : s; // `ctest -V` is verbose, not version
+  if (NON_RUN_FLAG.test(t)) return true;
+  if (/(?:^|[\s/])(?:tsc|eslint)(?=\s)/.test(s) && /(?:^|\s)-v(?=\s|$)/.test(s)) return true; // tsc -v / eslint -v print the version
+  return /^(?:\S*\/)?make(?=\s)/.test(s) && (MAKE_NON_RUN_LONG.test(s) || makeShortNonRun(s));
+}
 // What Claude Code answers a Bash call started with run_in_background: the command has not finished.
 const BACKGROUND_RESULT = /^\s*Command running in background\b/i;
 function hidesNestedCode(norm) {
@@ -384,6 +400,44 @@ function pipefailOn(norm, preset) {
   }
   return on;
 }
+// Elements that run BEFORE the check decide whether it runs at all, so they are trusted only when harmless (mirror of
+// server/src/kit/verify.mjs; see the comment there): safe builtins, well-known external or path-qualified programs, and
+// recognised checks/builds. source, ., eval, hash, alias, shopt, enable, ulimit, wait, unalias, `set -n`/`-o noexec`,
+// function definitions and assignments to PATH/BASH_ENV/... mask.
+const DANGEROUS_VAR = /^(?:PATH|BASH_ENV|ENV|IFS|SHELL|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|CDPATH|GLOBIGNORE|FUNCNEST|HISTFILE|LD_\w+|DYLD_\w+|NODE_OPTIONS|NODE_PATH|PYTHON\w*|RUBY\w*|PERL5?\w*|JAVA_TOOL_OPTIONS|_?JAVA_OPTIONS|JDK_JAVA_OPTIONS|CLASSPATH|GIT_\w+|(?:NPM|npm)_config_\w+|BASH_\w+|COMP\w*)$/;
+const SAFE_SET_NAMES = new Set(['pipefail', 'errexit', 'nounset', 'xtrace']);
+function isSafeSet(words) {
+  for (let i = 0; i < words.length; i++) {
+    const m = /^([-+])([euxo]+)$/.exec(words[i]);
+    if (!m) return false;
+    for (const ch of m[2]) if (ch === 'o' && !SAFE_SET_NAMES.has(words[++i])) return false;
+  }
+  return true;
+}
+// An element that only sets up the environment for what follows: cd/pushd/popd, export NAME[=val], plain NAME=val, safe `set`.
+function prefixLike(el) {
+  const s = el.trim();
+  if (BARE_PIPE.test(s)) return false;
+  const name = (a) => a.replace(/\+?=.*$/, '');
+  if (/^(?:[A-Za-z_]\w*\+?=\S*\s*)+$/.test(s)) return s.split(/\s+/).every((a) => !DANGEROUS_VAR.test(name(a)));
+  const [word, ...args] = s.split(/\s+/);
+  if (word === 'cd' || word === 'pushd' || word === 'popd') return true;
+  if (word === 'export') return args.every((a) => /^[A-Za-z_]\w*(?:\+?=\S*)?$/.test(a) && !DANGEROUS_VAR.test(name(a)));
+  return word === 'set' && isSafeSet(args);
+}
+const SAFE_PROGRAMS = new Set(['echo', 'pwd', 'true', ':', '[', 'test', 'mkdir', 'rm', 'cp', 'mv', 'touch', 'ls', 'cat', 'git', 'make', 'cmake', 'cargo', 'rustc', 'go', 'node',
+  'npx', 'npm', 'pnpm', 'yarn', 'bun', 'deno', 'python', 'python3', 'pip', 'pip3', 'uv', 'poetry', 'bundle', 'gem', 'rake', 'mvn', 'gradle', 'dotnet', 'swift', 'zig', 'docker',
+  'docker-compose', 'curl', 'wget', 'sleep', 'ln', 'chmod', 'tar', 'unzip', 'sed', 'awk', 'grep', 'head', 'tail', 'sort', 'wc', 'find', 'diff', 'tee', 'date', 'which',
+  'dirname', 'basename', 'mktemp', 'rsync', 'tsc', 'eslint', 'prettier']);
+function stageHarmless(stage) {
+  if (prefixLike(stage) || stageCheckCommand(stage) !== null) return true;
+  const s = stage.trim().replace(EXEC_PREFIX, '');
+  if (s === '' || /^[A-Za-z_]\w*\+?=/.test(s)) return false; // a leftover assignment: to a variable that changes what runs
+  const [word, ...args] = s.split(/\s+/);
+  if (word === 'printf') return !args.some((a) => /^-[A-Za-z]*v/.test(a)); // printf -v assigns a shell variable
+  return word.includes('/') || SAFE_PROGRAMS.has(word);
+}
+const harmless = (el) => el.split(BARE_PIPE).every(stageHarmless);
 function exitIsMasked(command, pipefail = false) {
   if (command.length > ANALYSIS_CAP) return true;
   const sc = scanShell(command);
@@ -404,14 +458,25 @@ function exitIsMasked(command, pipefail = false) {
   const groups = listGroups(norm);
   if (groups.flat().some((s) => /^!(?:\s|$)/.test(s))) return true;
   if (groups.flat().some((el) => el.split(BARE_PIPE).some(masksStatus))) return true;
-  const real = groups.map((g) => g.filter((s) => !PREFIX_SEGMENT.test(s)));
-  const withCommand = real.filter((g) => g.length);
-  if (!withCommand.length || !real[real.length - 1].length) return true;
-  if (withCommand.length === 1) return false;
-  // A group "holds the check" only when a stage of one of its elements runs a check in program position —
-  // a check verb inside an argument or a quoted string does not hold the exit status either.
-  const holdsCheck = (g) => g.some((el) => el.split(BARE_PIPE).some((stage) => stageCheckCommand(stage) !== null));
-  return withCommand.slice(0, -1).some(holdsCheck) || !holdsCheck(real[real.length - 1]);
+  // The check must sit in the LAST `;`/newline group and no earlier group may hold one (`npm test ; echo done`). What runs
+  // before it must be harmless: a builtin that stops the shell or changes what runs next (`set -n`, `eval exit 0`,
+  // `source`, `hash`, `alias`, ...) would make a later exit 0 not the check's own. Elements after the check only run when
+  // it passed (`&&`), so they cannot hide a failure. With no check at all (a custom runner), only prefix-like elements may
+  // precede it and the command must be that one runner.
+  const holdsEl = (el) => el.split(BARE_PIPE).some((stage) => stageCheckCommand(stage) !== null);
+  const last = groups[groups.length - 1];
+  if (!last) return true;
+  const earlier = groups.slice(0, -1);
+  let anchor;
+  if (groups.flat().some(holdsEl)) {
+    anchor = last.findIndex(holdsEl);
+    if (anchor < 0 || earlier.some((g) => g.some(holdsEl))) return true;
+    if (!earlier.every((g) => g.every(harmless))) return true;
+  } else {
+    anchor = last.length - 1;
+    if (!earlier.every((g) => g.every(prefixLike)) || prefixLike(last[anchor])) return true;
+  }
+  return !last.slice(0, anchor).every(harmless);
 }
 const TAIL_ARGS = /^\s*tail(?:\s+-n\s*\d+|\s+-\d+)?\s*$/;
 const FD_MERGE_STDERR = /(?<!\d)2>&1(?!\d)/g;
@@ -431,8 +496,8 @@ function maskedByTailPipeOnly(command) {
   const parts = norm.split(BARE_PIPE);
   if (parts.length !== 2 || !TAIL_ARGS.test(parts[1])) return false;
   const segs = listGroups(parts[0]).flat();
-  if (segs.length === 0 || PREFIX_SEGMENT.test(segs[segs.length - 1])) return false;
-  if (!segs.slice(0, -1).every((s) => PREFIX_SEGMENT.test(s))) return false;
+  if (segs.length === 0 || prefixLike(segs[segs.length - 1])) return false;
+  if (!segs.slice(0, -1).every(prefixLike)) return false;
   const last = segs[segs.length - 1];
   if (stageCheckCommand(last) !== null) return true;
   const prog = last.trim().replace(EXEC_PREFIX, '');
@@ -445,8 +510,13 @@ function zeroPassSummary(output) {
   if (typeof output !== 'string' || !output) return false;
   const tail = output.slice(-6000);
   if (/^\s*0 (?:tests? )?(?:passed|passing|ran)\b|^\s*0 pass(?:ed|es|ing)?\s*$|passed:\s*0\b|^\s*Tests:\s.*0 total\b|test result: ok\.\s+0 passed|0 examples, 0 failures|\bNo tests found\b|\bcollected 0 items\b|\b0 tests? collected\b|^=+ no tests ran\b/im.test(tail)) return true;
-  // go test: every package printed `[no test files]` and none printed an `ok` line.
-  return /^\?\s+\S+\s+\[no test files\]/m.test(tail) && !/^ok\s/m.test(tail);
+  // Everything skipped, todo or deselected: jest/vitest `Tests: N skipped, N total`, pytest `= 2 skipped in 0.1s =`.
+  const jt = /^\s*Tests(?::|\s{2,})[^\n]*/m.exec(tail);
+  if (jt && !/[1-9]\d* (?:passed|failed)/.test(jt[0])) return true;
+  if (/^=+ (?:\d+ (?:skipped|deselected|warnings?|xfailed|xpassed),? ?)+ in [\d.]+s/m.test(tail)) return true;
+  // go test: every package printed `[no test files]` or `[no tests to run]` and none printed a real `ok` line.
+  const noTests = /^\?\s+\S+\s+\[no test files\]/m.test(tail) || /^ok\s+\S+\s+[\d.]+s\s+\[no tests to run\]/m.test(tail);
+  return noTests && !/^ok\s+\S+\s+[\d.]+s\s*(?:\(cached\))?$/m.test(tail);
 }
 /** What a runner's own output summary reports: "pass" | "fail" | undefined. */
 function checkSummary(output) {
@@ -464,13 +534,19 @@ function checkSummary(output) {
   const nodePass = /[ℹi] pass ([1-9]\d*)/.exec(tail);
   if (nodePass) return 'pass';
   const jest = /^Tests:\s+(?:(\d+) failed, )?.*?([1-9]\d*) total/m.exec(tail);
-  if (jest) return jest[1] && Number(jest[1]) > 0 ? 'fail' : 'pass';
+  if (jest) {
+    if (jest[1] && Number(jest[1]) > 0) return 'fail';
+    if (/^Tests:[^\n]*[1-9]\d* passed/m.test(tail)) return 'pass'; // only skipped/todo tests: nothing was verified
+  }
   const pytest = /^=+ .*?(?:(\d+) failed|(\d+) error).*?in [\d.]+s/m.exec(tail) ?? /^=+ ([1-9]\d*) passed.*? in [\d.]+s/m.exec(tail);
   if (pytest) return /\d+ (?:failed|error)/.test(pytest[0]) ? 'fail' : 'pass';
   const cargoOrGo = /^test result: (ok|FAILED)\.\s+[1-9]\d* passed/m.exec(tail) ?? /^test result: (FAILED)\./m.exec(tail) ?? /^(ok|FAIL)\s+\S+\s+[\d.]+s$/m.exec(tail);
   if (cargoOrGo) return cargoOrGo[1] === 'ok' ? 'pass' : 'fail';
   const vitest = /^\s*Tests\s{2,}([^\n]*\([1-9]\d*\))\s*$/m.exec(tail);
-  if (vitest) return /[1-9]\d* failed/.test(vitest[1]) ? 'fail' : 'pass';
+  if (vitest) {
+    if (/[1-9]\d* failed/.test(vitest[1])) return 'fail';
+    if (/[1-9]\d* passed/.test(vitest[1])) return 'pass';
+  }
   const bunFail = /^\s*([1-9]\d*) fail\s*$/m.exec(tail);
   if (bunFail && /^\s*\d+ pass\s*$/m.test(tail)) return 'fail';
   const mix = /^(?:\d+ doctests?, )?\d+ tests?, (\d+) failures?/m.exec(tail);

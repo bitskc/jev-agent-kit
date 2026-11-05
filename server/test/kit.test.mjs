@@ -648,3 +648,42 @@ test("F2: a background Bash run in a transcript tail is not a passing check", ()
   assert.deepEqual(checksOf({ command: "npm test" }, "Command running in background with ID: bash_2"), []);
   assert.equal(checksOf({ command: "npm test" }, O12).length, 1);
 });
+
+// ── PR #31 re-review round (N1, N2, N3, N5): decision-only ──
+test("N1: builtins that stop the shell or change what runs next, before the check, make the status unknown; harmless setup stays trusted", () => {
+  for (const c of ["set -n; npm test", "set -o noexec\nnpm test", "eval exit 0; npm test", "source /dev/stdin <<<'exit 0'; npm test", ". /dev/stdin <<<'exit 0'\nnpm test", "hash -p /bin/true npm; npm test",
+    "shopt -s expand_aliases\nalias npm=true\nnpm test", "(cd . && set -n && mypy .)", "sh -c 'set -n; npm test'", "PATH=/evil; npm test", "export PATH=/evil; npm test", "BASH_ENV=/x; pytest", "ulimit -t 0; npm test", "wait; npm test",
+    "unalias npm; npm test", "enable -n test; npm test", "printf -v PATH x; npm test", "set -o posix -n; npm test"]) {
+    assert.equal(exitIsMasked(c), true, c);
+    assert.equal(runOutcome(c, "", 0), "unknown", c);
+    assert.equal(runOutcome(c, O12, 0) === "pass" && commandRunsCheck(c) && !/\|/.test(c), false, c);
+  }
+  for (const c of ["npm run build && npm test", "cd api && npm test", "rm -rf dist && npm run build && npm test", "npm ci && npm test", "make clean && make test", "cargo build && cargo test", "go build ./... && go test ./...",
+    "echo hi; npm test", "set -euo pipefail; npm test", "export NODE_ENV=test; npm test", "CI=true; pytest", "./gen.sh && npm test", "(cd api && npm test)", "sh -c 'cd api && npm test'"]) {
+    assert.equal(exitIsMasked(c), false, c);
+    assert.equal(runOutcome(c, O12, 0), "pass", c);
+  }
+});
+test("N1: a masked tail-pipe pass summary is not trusted behind a shell-state builtin", () => {
+  for (const c of ["source /dev/stdin <<<'x'; npm test 2>&1 | tail -20", "alias npm=true; npm test | tail", "set -n; npm test | tail -5"]) assert.equal(runOutcome(c, O12, 0), "unknown", c);
+  assert.equal(runOutcome("cd api && npm test 2>&1 | tail -20", O12, 0), "pass");
+});
+test("N2: make's non-running modes are not checks", () => {
+  for (const c of ["make -n test", "make --just-print test", "make --dry-run test", "make -t test", "make --touch test", "make -q test", "make --question test", "make -p test", "make --print-data-base test", "make -nB test", "make -kn test", "make test -n"]) {
+    assert.equal(commandRunsCheck(c), false, c);
+  }
+  for (const c of ["make test", "make -j4 test", "make -C docker test", "make -k test", "make -f Makefile.ci test"]) assert.equal(commandRunsCheck(c), true, c);
+});
+test("N3: --if-present, housekeeping test:* scripts and version/init/list/no-run forms are not checks; all-skipped runs are not passes", () => {
+  for (const c of ["npm run build --if-present", "npm test --if-present", "npm run test:watch", "npm run test:db:reset", "npm run test:update-snapshots", "npm run test:install-browsers", "tsc --init", "tsc -v", "eslint -v", "ruff version",
+    "ruff format .", "jest --showConfig", "pytest --fixtures", "cargo test --no-run", "go test -list ."]) assert.equal(commandRunsCheck(c), false, c);
+  for (const c of ["npm run test:unit", "npm run test:e2e", "npm run test:integration", "npm run test:coverage", "pnpm test:ui", "ruff check .", "ruff ."]) assert.equal(commandRunsCheck(c), true, c);
+  for (const [c, o] of [["npx jest", "Tests:       3 skipped, 3 total"], ["npx vitest run", " Tests  2 skipped (2)"], ["go test ./...", "ok  \tpkg\t0.1s [no tests to run]"], ["pytest", "=== 2 skipped in 0.1s ==="]]) {
+    assert.equal(runOutcome(c, o, 0), "unknown", `${c} / ${o}`);
+  }
+  assert.equal(runOutcome("npx jest", "Tests:       1 skipped, 2 passed, 3 total", 0), "pass");
+});
+test("N5: a custom runner earns a transcript pass only as the last and only non-prefix element", () => {
+  for (const c of ["cat forged.log && ./noop.sh", "cat forged.log; ./noop.sh", "tac forged.log | ./noop.sh", "./a.sh && ./b.sh", "echo done && make ci"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "unknown", c);
+  for (const c of ["./run.sh", "cd x && ./run.sh", "export A=1; scripts/ci.sh", "./run.sh | tail -3", "make ci", "cd x && npm run ci"]) assert.equal(classifyToolResult("Bash", { command: c }, false, O12), "check-pass", c);
+});

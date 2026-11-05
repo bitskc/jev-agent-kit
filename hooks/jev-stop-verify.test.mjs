@@ -1899,3 +1899,93 @@ test("T18: the classify debug note reports real counts, not a missing `summary` 
   assert.ok(!/undefined/.test(line), line);
   assert.match(line, /classify results=1 \(verified\/auto:1\)/);
 });
+
+// ── PR #31 re-review round (N1, N2, N3): decision-only, no command string is ever executed ──
+const N1_MASKING_BEFORE = ["set -n; npm test", "set -o noexec\nnpm test", "eval exit 0; npm test", "source /dev/stdin <<<'exit 0'; npm test", ". /dev/stdin <<<'exit 0'\nnpm test", "hash -p /bin/true npm; npm test",
+  "shopt -s expand_aliases\nalias npm=true\nnpm test", "(cd . && set -n && mypy .)", "sh -c 'set -n; npm test'", "bash -c 'set -o noexec; npm test'", "ulimit -t 0; npm test", "wait; npm test", "unalias npm; npm test",
+  "enable -n test; npm test", "set -euo pipefail -n; npm test", "printf -v PATH x; npm test", "PATH=/evil; npm test", "export PATH=/evil\nnpm test", "BASH_ENV=/x; pytest", "NODE_OPTIONS=--require=x; npm test",
+  "foo-unknown-builtin; npm test", "set -o posix -n; npm test", "export -f npm; npm test", "unset -f npm; npm test", "set +e -n; mypy ."];
+test("N1: a builtin that stops the shell or changes what runs next, before the check, masks the exit status", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const command of N1_MASKING_BEFORE) {
+    assert.equal(stopGate.exitIsMasked(command), true, `hook: ${JSON.stringify(command)}`);
+    assert.equal(server.exitIsMasked(command), true, `server: ${JSON.stringify(command)}`);
+    assert.notEqual(stopGate.runOutcome(command, "", 0), "pass", command);
+    assert.equal(await blocks(command), true, `must block: ${JSON.stringify(command)}`);
+  }
+});
+test("N1: harmless elements before the check, and checks/builds earlier in an && chain, stay trusted", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const command of ["npm run build && npm test", "cd api && npm test", "rm -rf dist && npm run build && npm test", "npm ci && npm test", "make clean && make test", "cargo build && cargo test", "go build ./... && go test ./...",
+    "echo hi; npm test", "set -euo pipefail; npm test", "set -o pipefail; set +e; npm test", "export NODE_ENV=test; npm test", "CI=true; pytest", "./gen.sh && npm test", "git status && pytest", "mkdir -p out && touch out/x && npm test",
+    "cd a; cd b && npm test", "pushd x && npm test", "(cd api && npm test)", "sh -c 'cd api && npm test'", "test -f package.json && npm test", "printf 'x\\n'; npm test"]) {
+    assert.equal(stopGate.exitIsMasked(command), false, `hook: ${JSON.stringify(command)}`);
+    assert.equal(server.exitIsMasked(command), false, `server: ${JSON.stringify(command)}`);
+    assert.equal(await blocks(command, "  12 passing (3s)"), false, `honest run falsely blocked: ${JSON.stringify(command)}`);
+  }
+});
+test("N1: seeded property test over generated command lists: masked exactly when a masking element precedes the check", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  const masking = ["set -n", "set -o noexec", "eval exit 0", "source /dev/stdin <<<'exit 0'", ". /dev/stdin <<<'exit 0'", "hash -p /bin/true npm", "shopt -s expand_aliases", "alias npm=true", "enable -n test", "ulimit -t 0",
+    "wait", "unalias npm", "trap 'exit 0' EXIT", "PATH=/evil", "BASH_ENV=/x", "export PATH=/x", "printf -v PATH x", "exit 0", "exec true", "return 0", "kill $$", "mapfile -t a", "read x", "declare -r PATH=x", "let x=1", "umask 0"];
+  const benign = ["cd api", "pushd x", "export NODE_ENV=test", "CI=true", "echo hi", "pwd", "git status", "rm -rf dist", "npm ci", "make clean", "set -e", "set -o pipefail", "set -eu", "true", "mkdir -p out", "ls", "touch x", "cp a b"];
+  const checks = ["npm test", "pytest", "mypy .", "cargo test", "npx jest", "go test ./..."];
+  let seed = 20260501;
+  const rnd = (n) => { seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff; return (seed >>> 8) % n; };
+  const seps = ["; ", "\n", " && "];
+  let sawMasked = 0, sawClean = 0;
+  for (let i = 0; i < 600; i++) {
+    const parts = Array.from({ length: rnd(4) }, () => benign[rnd(benign.length)]);
+    const poisoned = rnd(2) === 0;
+    if (poisoned) parts.splice(rnd(parts.length + 1), 0, masking[rnd(masking.length)]);
+    parts.push(checks[rnd(checks.length)]);
+    let command = parts[0];
+    for (let k = 1; k < parts.length; k++) command += seps[rnd(seps.length)] + parts[k];
+    const hookSays = stopGate.exitIsMasked(command);
+    assert.equal(hookSays, server.exitIsMasked(command), `parity: ${JSON.stringify(command)}`);
+    // an earlier `;` group that is itself a check, or any masking element, masks; benign-only chains do not
+    if (poisoned) { assert.equal(hookSays, true, `must be masked: ${JSON.stringify(command)}`); sawMasked++; }
+    else { assert.equal(hookSays, false, `must stay trusted: ${JSON.stringify(command)}`); sawClean++; }
+  }
+  assert.ok(sawMasked > 100 && sawClean > 100, `${sawMasked}/${sawClean}`);
+});
+test("N2: make's non-running modes are not checks, alone or bundled; real make runs still are", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const command of ["make -n test", "make --just-print test", "make --dry-run test", "make --recon test", "make -t test", "make --touch test", "make -q test", "make --question test", "make -p test", "make --print-data-base test",
+    "make -nB test", "make -kn test", "make test -n", "make -j4 -n test", "make -C docker -n test", "make -sn check"]) {
+    assert.equal(stopGate.commandRunsCheck(command), false, `hook: ${command}`);
+    assert.equal(server.commandRunsCheck(command), false, `server: ${command}`);
+    assert.equal(await blocks(command), true, `exit 0 alone must not verify: ${command}`);
+  }
+  for (const command of ["make test", "make -j4 test", "make -C docker test", "make -k test", "make -f Makefile.ci test", "make -fMakefile test", "make -j 4 check", "make -B test", "make -s lint"]) assert.equal(stopGate.commandRunsCheck(command), true, command);
+});
+test("N3: non-running 'checks' (--if-present, test:* housekeeping scripts, version/init/list/no-run forms) are not checks", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  for (const command of ["npm run build --if-present", "npm test --if-present", "npm run test:watch", "npm run test:db:reset", "npm run test:update-snapshots", "npm run test:install-browsers", "yarn test:watch", "tsc --init", "tsc -v", "eslint -v", "ruff version",
+    "ruff format .", "jest --showConfig", "pytest --fixtures", "pytest --markers", "cargo test --no-run", "go test -list .", "npx tsc --init", "npx eslint --print-config x.js", "cargo test -- --list"]) {
+    assert.equal(stopGate.commandRunsCheck(command), false, `hook: ${command}`);
+    assert.equal(server.commandRunsCheck(command), false, `server: ${command}`);
+  }
+  for (const command of ["npm run test:unit", "npm run test:e2e", "npm run test:integration", "npm run test:int", "npm run test:ci", "npm run test:coverage", "npm run test:all", "pnpm test:ui", "yarn test:api", "npm run test:server", "npm run test:client",
+    "ruff check .", "ruff .", "ruff check --fix .", "tsc --noEmit", "eslint ."]) assert.equal(stopGate.commandRunsCheck(command), true, command);
+  for (const [command, output] of [["npx jest", "Tests:       3 skipped, 3 total"], ["npx jest", "Tests:       1 todo, 1 total"], ["npx vitest run", " Tests  2 skipped (2)"], ["go test ./...", "ok  \tpkg\t0.1s [no tests to run]"],
+    ["pytest", "=== 2 skipped in 0.1s ==="], ["pytest", "=== 1 skipped, 1 deselected in 0.1s ==="]]) {
+    assert.equal(stopGate.runOutcome(command, output, 0), "unknown", `${command} / ${output}`);
+    assert.equal(stopGate.runOutcome(command, output, 0), server.runOutcome(command, output, 0));
+  }
+  assert.equal(stopGate.runOutcome("npx jest", "Tests:       1 skipped, 2 passed, 3 total", 0), "pass");
+  assert.equal(stopGate.runOutcome("go test ./...", "ok  \tpkg/a\t0.1s\nok  \tpkg/b\t0.1s [no tests to run]", 0), "pass");
+});
+test("parity (re-review round): the hook copy and the server agree on the N1-N3 cases", async () => {
+  const server = await import("../server/src/kit/verify.mjs");
+  const O = "  12 passing (3s)";
+  const cases = [...N1_MASKING_BEFORE.map((c) => [c, "", 0]), ["npm run build && npm test", O, 0], ["rm -rf dist && npm run build && npm test", O, 0], ["echo hi; npm test", O, 0], ["PATH=/x; pytest", "", 0], ["FOO=/x; pytest", "", 0],
+    ["make -n test", "", 0], ["make -nB test", "", 0], ["make -j4 test", O, 0], ["npm test --if-present", "", 0], ["npm run test:watch", "", 0], ["npm run test:unit", O, 0], ["ruff format .", "", 0], ["ruff check .", "", 0],
+    ["npx jest", "Tests:       3 skipped, 3 total", 0], ["npx vitest run", " Tests  2 skipped (2)", 0], ["pytest", "=== 2 skipped in 0.1s ===", 0], ["go test ./...", "ok  \tp\t0.1s [no tests to run]", 0]];
+  for (const [command, output, exit] of cases) {
+    assert.equal(stopGate.runOutcome(command, output, exit), server.runOutcome(command, output, exit), `runOutcome ${JSON.stringify(command)}`);
+    assert.equal(stopGate.exitIsMasked(command), server.exitIsMasked(command), `exitIsMasked ${JSON.stringify(command)}`);
+    assert.equal(stopGate.commandRunsCheck(command), server.commandRunsCheck(command), `commandRunsCheck ${JSON.stringify(command)}`);
+    assert.equal(stopGate.checkSummary(output), server.checkSummary(output), `checkSummary ${JSON.stringify(output)}`);
+  }
+});
