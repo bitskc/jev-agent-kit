@@ -16,6 +16,7 @@ import {
   splitPipelines, splitSegments, stripHeredocs, stripRedirects, substLiteral, substitutedSegments,
   unwrapScripts, words,
 } from "./shell.mjs";
+import { safeRegexTest } from "./safere.mjs";
 
 export const DEFAULT_ASK_AT = 0.65;
 export const USER_REQUESTED_SOFTEN_AT = 0.75; // kit R10_USER_REQUESTED_SOFTEN_AT
@@ -83,8 +84,9 @@ const SECRET_VAR_NAME_RE = new RegExp([
   "|.*(?:^|_)(?:SERVICE|ADMIN|ROOT|SUPER|ELEVATED|PRIV)(?:_[A-Z0-9]+)*_ROLE$",
   // a key whose stem names a credential (SUPABASE_SERVICE_ROLE_KEY, SIGNING_KEY), not CACHE_KEY or AUTHOR_KEY
   "|.*(?:^|_)(?:ROLE|SECRET|PRIVATE|SIGNING|ENCRYPT|AUTH|SESSION|MASTER|ACCESS|SERVICE|CREDENTIAL)(?:_[A-Z0-9]+)*_KEY$",
-  // a database/service password variable (MYSQL_PWD), not CURRENT_PWD; bare $PWD/$OLDPWD never match
-  "|.*(?:^|_)(?:MYSQL|DB|DATABASE|POSTGRES|PG|LDAP|SMTP|REDIS|MONGO|ADMIN|ROOT|SERVICE)_PWD$",
+  // a database/service password variable (MYSQL_PWD, MYSQLPASSWORD, PGPASSWORD, DBPASSWORD, PGPASS): a
+  // known service/db prefix, separator optional, glued to PWD/PASS/PASSWD/PASSWORD (#66); bare $PWD/$OLDPWD never match
+  "|.*(?:^|_)(?:MYSQL|DB|DATABASE|POSTGRES|PG|LDAP|SMTP|REDIS|MONGO|ADMIN|ROOT|SERVICE)_?(?:PWD|PASS|PASSWD|PASSWORD)$",
   ")",
 ].join(""), "i");
 export const R1_SUGGESTION =
@@ -584,9 +586,10 @@ function isBroadRoot(root, cwd = "", home = "") {
 const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
 function patternMatchesValueName(p) {
   if (GENERIC_CRED_WORD_RE.test(p)) return false;
-  let re;
-  try { re = new RegExp(p); } catch { return false; }
-  return VALUE_NAME_SAMPLES.some((s) => re.test(s));
+  // The pattern is untrusted text, so it never reaches a backtracking engine: safeRegexTest
+  // (safere.mjs) compiles it to a Thompson NFA and answers test() in O(pattern x sample).
+  // An invalid or unsupported pattern can't select a value-name line, so it does not match.
+  return VALUE_NAME_SAMPLES.some((s) => safeRegexTest(p, s) === true);
 }
 // Splits a grep/rg argv the way getopt does: short options take their value from the rest of the cluster or the next
 // token (`-drecurse`, `-d recurse`, `-ePAT`, `-e PAT`), so no option value is read as a flag. Returns the -e/--regexp
@@ -1229,16 +1232,32 @@ const ALIAS_COLON_FILE_KEYS = new Set(["file", "open"]);
 // httpie). The whole token is tried first, then each suffix after an `@`, or after an `=`/`:` that follows a file key.
 // Surrounding quotes and parens are kept, so the rewritten segment still parses.
 function aliasedToken(t, alias) {
+  // Longest file-key name: any `=`/`:` past prefix length ALIAS_KEY_MAX + dashes can't follow a
+  // file key, so the key slice is only taken for short prefixes (the old code lowercased the
+  // whole prefix per delimiter — quadratic on a token of repeated `=`/`:`).
+  const ALIAS_KEY_MAX = Math.max(...[...ALIAS_EQ_FILE_KEYS, ...ALIAS_COLON_FILE_KEYS].map((k) => k.length)) + 2;
   const cuts = [0];
+  let dashes = 0;
+  while (dashes < t.length && t[dashes] === "-") dashes++;
   for (let i = 0; i < t.length; i++) {
     const c = t[i];
     if (c === "@") cuts.push(i + 1);
-    else if (c === "=" || c === ":") {
+    else if ((c === "=" || c === ":") && i - dashes <= ALIAS_KEY_MAX) {
       const key = t.slice(0, i).replace(/^-+/, "").toLowerCase();
       if ((c === "=" ? ALIAS_EQ_FILE_KEYS : ALIAS_COLON_FILE_KEYS).has(key)) cuts.push(i + 1);
     }
   }
+  // Work bound: normalizing a candidate suffix is O(suffix). A token of N delimiters makes N
+  // candidates, so the old code was O(N^2) — the hook's ~2 s timeout then skipped the guard
+  // entirely. Each candidate keeps its exact old semantics inside a per-token budget of
+  // max(4N, 4096) chars; past it the token is rewritten to the first alias's source, so an
+  // adversarial token that hid a copy alias behind normalization padding still flags (a
+  // pessimistic rewrite only ever over-flags a token a person does not type).
+  let budget = Math.max(t.length * 4, 4096);
   for (const s of cuts) {
+    const remaining = t.length - s;
+    if (remaining > budget) return alias.values().next().value;
+    budget -= remaining;
     const raw = t.slice(s);
     const key = raw && normalizePath(operandText(raw));
     if (key && alias.has(key)) {
