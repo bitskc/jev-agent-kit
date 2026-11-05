@@ -69,7 +69,7 @@ User-authored standing checks, injected at every level except off as a `## Rules
 
 **Format:** `{"id": "<kebab>", "when": "<situation>", "ask": "<question>", "evidence": "<what proves it>"}`. `when` and `ask` are required; `id` is generated from `when` if you don't give one; `evidence` is optional.
 
-**Layers**, later wins on the same id: built-in examples shipped with the plugin → user global (`~/.config/jev/rules.json`) → repo (`.jev/rules.json` in the cwd, so a team can commit shared rules). A `{"id": "...", "disabled": true}` entry at a later layer removes an earlier layer's same-id rule.
+**Layers**, later wins on the same id: built-in examples shipped with the plugin → user global (`rules.json` in `userConfigDir()`: `$CLAUDE_CONFIG_DIR/jev/` if set, else `$XDG_CONFIG_HOME/jev/`, else `~/.config/jev/`) → repo (`.jev/rules.json` in the cwd, so a team can commit shared rules). A `{"id": "...", "disabled": true}` entry at a later layer removes an earlier layer's same-id rule.
 
 **Author on the fly**, no file editing: `honest-jev rule add "<when>" -> "<ask>" [evidence: "<evidence>"]`, or natural language: `honest-jev rule add: when <...> ask <...> evidence <...>`. Repo scope is explicit only — add a trailing `--repo` or `(repo)`, or lead with `repo` right after `add`/`remove`/`disable` (e.g. `honest-jev rule remove repo <id>`) — to write `.jev/rules.json` instead of the user-global file; a `when`/`ask` that merely mentions "the repo" stays user-global. `honest-jev rule list` shows what's active; `honest-jev rule remove <id>` / `honest-jev rule disable <id>` mask a rule (built-in or user-added) at the layer you're writing to.
 
