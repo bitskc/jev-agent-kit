@@ -16,7 +16,7 @@ import {
   splitPipelines, splitSegments, stripHeredocs, stripRedirects, substLiteral, substitutedSegments,
   unwrapScripts, words,
 } from "./shell.mjs";
-import { safeRegexTest } from "./safere.mjs";
+import { safeRegexAny } from "./safere.mjs";
 
 export const DEFAULT_ASK_AT = 0.65;
 export const USER_REQUESTED_SOFTEN_AT = 0.75; // kit R10_USER_REQUESTED_SOFTEN_AT
@@ -552,9 +552,21 @@ function quietGrep(args) {
 // A grep/rg whose pattern names a secret prints each matching line whole, and that line often carries the value
 // (`SECRET_X=hunter2`). Recursive, or fed by find/xargs, it prints those lines from every file it reaches.
 const SECRET_NAME_RE = /SECRET|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|SIGNING|CRED|SERVICE_ROLE|API_KEY|DATABASE_URL|ACCESS_KEY|_PASS$|_TOKEN$/i;
-// A bare credential word names a family, not a secret: `grep -rn auth src` is a source search. Searched from a broad
-// root (`.`, `~`, `/`, or no path), it still asks: that root holds the .env files whose lines carry the values.
-const GENERIC_CRED_WORD_RE = /^(?:auth|token)$/i;
+// A bare lowercase (or Capitalized) dictionary word names a family, not a secret: `grep -rn auth src` is a source
+// search. Searched from a broad root (`.`, `~`, `/`, or no path), it still asks: that root holds the .env files whose
+// lines carry the values. An UPPERCASE `TOKEN`/`AUTH` is an environment-variable name, not a dictionary word, so it is
+// never exempt (CRED_IDENT_RE below asks on any root).
+const GENERIC_CRED_WORD_RE = /^(?:auth|token|Auth|Token)$/;
+// A pattern that is itself a credential NAME asks on any root, even a narrow one (`apps`, `src`): a narrow root
+// can still hold `.env` files, and the matching lines carry the values. Name-shaped means (a) an UPPERCASE
+// identifier containing TOKEN/AUTH/SECRET/PASSWORD/PASSWD, or ending in `_KEY` (`NPM_TOKEN`, `NEXTAUTH`,
+// `STRIPE_KEY`); (b) under -i, the same words glued by an underscore in any case (`npm_token`, `auth_url`); or
+// (c) a pattern that ends in an assignment `=` (`token=`, `NPM_TOKEN=`, `REDIS_PASS\s*=`, `X=.*`), which selects
+// assignment lines. Lowercase words with no `=` and no underscore (`tokenize`, `author`, `auth`) are not names.
+const CRED_IDENT_RE = /[A-Z0-9_]*(?:TOKEN|AUTH|SECRET|PASSWORD|PASSWD)|[A-Z0-9]_KEY(?![A-Za-z])/;
+const CRED_IDENT_CI_RE = /[a-z0-9]_(?:token|auth|secret|password|passwd|key)(?![a-z0-9])|(?:token|auth|secret|password|passwd)_[a-z0-9]/i;
+const ASSIGN_TAIL_RE = /[A-Za-z0-9_\])*]=(?:\.[*+]|\\S\*|\[\^[^\]]*\][*+])?$/;
+const namesCredential = (p, ignoreCase) => CRED_IDENT_RE.test(p) || ASSIGN_TAIL_RE.test(p) || (ignoreCase && CRED_IDENT_CI_RE.test(p));
 // A root is broad when it is, or can reach, a directory that holds .env files: the cwd, home, `/`, or any ancestor of
 // them. It is resolved lexically against the cwd and home the caller passed in: `~`, `$HOME`, `$PWD`, `$(pwd)`, `` `pwd` ``
 // and `~+` become those directories, `.` and `..` segments are folded, and an absolute root is broad when it equals or
@@ -582,23 +594,27 @@ function isBroadRoot(root, cwd = "", home = "") {
   return within(cwd) || within(home);
 }
 // Assignment-name samples. A pattern that is a regex matching one of these names (`SECR.T_X`), or the assignment
-// operator (`=`), selects the assignment lines of every .env file it reaches.
+// operator (`=`), selects the assignment lines of every .env file it reaches. Under -i the samples are also probed
+// lowercased. All probes of one pattern share a single work budget.
 const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
-function patternMatchesValueName(p) {
+const VALUE_NAME_SAMPLES_CI = VALUE_NAME_SAMPLES.map((s) => s.toLowerCase());
+function patternMatchesValueName(p, ignoreCase = false) {
   if (GENERIC_CRED_WORD_RE.test(p)) return false;
-  // safeRegexTest uses a Thompson NFA and never runs the untrusted pattern through a backtracker.
-  // An invalid pattern cannot match; a valid but unsupported/over-budget pattern is unknown and
-  // treated as potentially selecting a value-bearing assignment (the recursive-root rule asks).
-  return VALUE_NAME_SAMPLES.some((s) => safeRegexTest(p, s) !== false);
+  // safeRegexAny uses a Thompson NFA with a work budget and never runs the untrusted pattern through a backtracker.
+  // An invalid pattern cannot match; a valid but unsupported/over-budget pattern (lookaround, backreference, too
+  // large) is unknown and treated as potentially selecting a value-bearing assignment (the recursive rule asks).
+  return safeRegexAny(p, ignoreCase ? [...VALUE_NAME_SAMPLES, ...VALUE_NAME_SAMPLES_CI] : VALUE_NAME_SAMPLES) !== false;
 }
 // Splits a grep/rg argv the way getopt does: short options take their value from the rest of the cluster or the next
 // token (`-drecurse`, `-d recurse`, `-ePAT`, `-e PAT`), so no option value is read as a flag. Returns the -e/--regexp
-// texts, the operands, and whether a -f/--file pattern file is named. `rg` also takes values on -g/-t/-j/-M/-E.
+// texts, the operands, whether a -f/--file pattern file is named, and whether matching is case-insensitive. `rg` also
+// takes values on -g/-t/-T/-j/-M/-E/-r (`rg -T js PAT .`: `js` is the type, not the pattern).
 function grepArgv(prog, args) {
-  const valueShort = prog === "rg" ? "ABCDdefmgtjME" : "ABCDdefm";
+  const valueShort = prog === "rg" ? "ABCDdefmgtTjMEr" : "ABCDdefm";
   const patterns = [];
   const operands = [];
   let fileMode = false;
+  let ignoreCase = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") { operands.push(...args.slice(i + 1)); break; }
@@ -608,12 +624,14 @@ function grepArgv(prog, args) {
       const inline = eq > 0 ? a.slice(eq + 1) : null;
       if (name === "--regexp") patterns.push(inline ?? args[++i] ?? "");
       else if (name === "--file") { fileMode = true; if (inline === null) i++; }
+      else if (name === "--ignore-case") ignoreCase = true;
       else if (GREP_VALUE_OPTS.has(name) && inline === null) i++;
       continue;
     }
     if (a.length > 1 && a.startsWith("-")) {
       for (let k = 1; k < a.length; k++) {
         const c = a[k];
+        if (c === "i" || c === "y") ignoreCase = true;
         if (!valueShort.includes(c)) continue;
         const rest = a.slice(k + 1);
         const value = rest.length > 0 ? rest : (args[++i] ?? "");
@@ -625,15 +643,15 @@ function grepArgv(prog, args) {
     }
     operands.push(a);
   }
-  return { patterns, operands, fileMode };
+  return { patterns, operands, fileMode, ignoreCase };
 }
 function grepNamesSecret(prog, args, cwd, home) {
   if (!GREP_PATTERN_PROGS.has(prog)) return false;
-  const { patterns, operands, fileMode } = grepArgv(prog, args);
+  const { patterns, operands, fileMode, ignoreCase } = grepArgv(prog, args);
   // -f/--file: the pattern is a file's contents, so every token is name-checked and no pattern text is probed.
   const pats = fileMode ? args : patterns.length > 0 ? patterns : operands.slice(0, 1);
   const roots = patterns.length > 0 || fileMode ? operands : operands.slice(1);
-  if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && patternMatchesValueName(p)))) return true;
+  if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && (namesCredential(p, ignoreCase) || patternMatchesValueName(p, ignoreCase))))) return true;
   const broad = roots.length === 0 || roots.some((r) => isBroadRoot(r, cwd, home));
   return broad && pats.some((p) => GENERIC_CRED_WORD_RE.test(p));
 }
@@ -1456,8 +1474,10 @@ function writeRedirectTargets(seg) {
   return out;
 }
 
-function ruleDestructive(ctx) {
-  if (!SHELL_TOOLS.has(ctx.tool)) return null;
+/** Every R7 match of the command, in order, as a lazy sequence: a caller that disables one rule id skips only that
+ *  id's matches and still sees the rest (`dd of=/dev/sda; git push --force` with R7-irreversible disabled). */
+function* destructiveMatches(ctx) {
+  if (!SHELL_TOOLS.has(ctx.tool)) return;
   const m = (reason) => ({ rule: "R7-destructive", severity: "ask", reason, suggestion: R7_SUGGESTION });
   const block = (reason) => ({ rule: "R7-irreversible", severity: "block", reason, suggestion: R7_IRREVERSIBLE_SUGGESTION });
   for (const seg of ctx.expandedSegments) {
@@ -1471,32 +1491,32 @@ function ruleDestructive(ctx) {
       if (!args.length) continue;
       const sub = args[0];
       const joined = " " + args.join(" ");
-      if (sub === "push" && /(^|\s)(--force|-f)(\s|$)/.test(joined)) return m("`git push --force` overwrites published history");
-      if (sub === "reset" && args.includes("--hard")) return m("`git reset --hard` discards uncommitted work irreversibly");
-      if (sub === "branch" && args.some((a) => a === "-D" || (a === "--delete" && args.includes("--force")))) return m("`git branch -D` force-deletes a branch");
-      if (sub === "clean" && args.some((a) => a.startsWith("-") && a.includes("f"))) return m("`git clean -f` deletes untracked files irreversibly");
-      if (sub === "filter-branch" || sub === "filter-repo") return m(`\`git ${sub}\` rewrites history`);
+      if (sub === "push" && /(^|\s)(--force|-f)(\s|$)/.test(joined)) yield m("`git push --force` overwrites published history");
+      if (sub === "reset" && args.includes("--hard")) yield m("`git reset --hard` discards uncommitted work irreversibly");
+      if (sub === "branch" && args.some((a) => a === "-D" || (a === "--delete" && args.includes("--force")))) yield m("`git branch -D` force-deletes a branch");
+      if (sub === "clean" && args.some((a) => a.startsWith("-") && a.includes("f"))) yield m("`git clean -f` deletes untracked files irreversibly");
+      if (sub === "filter-branch" || sub === "filter-repo") yield m(`\`git ${sub}\` rewrites history`);
       // push --delete/-d/:ref and --force-with-lease mutate published refs; update-ref -d deletes a ref
       // in place -- same "hard to reverse" tier as the existing push --force/branch -D asks.
       if (sub === "push" && (/(^|\s)(--delete|-d)(\s|$)/.test(joined) || /--force-with-lease/.test(joined) ||
           args.slice(1).some((a) => a.startsWith(":")))) {
-        return m("\`git push\` deleting or lease-forcing published refs rewrites shared history");
+        yield m("\`git push\` deleting or lease-forcing published refs rewrites shared history");
       }
       if (sub === "update-ref" && args.some((a) => a === "-d" || a === "--delete")) {
-        return m("\`git update-ref -d\` deletes a ref in place");
+        yield m("\`git update-ref -d\` deletes a ref in place");
       }
       if (sub === "tag" && args.some((a) => a === "-d" || a === "--delete")) {
-        return m("\`git tag -d\` deletes a tag");
+        yield m("\`git tag -d\` deletes a tag");
       }
     }
     if (prog === "rm") {
       if (!isRecursiveRm(args)) continue;
       for (const a of args) {
         if (a.startsWith("-")) continue;
-        if (wholeTreeTarget(a, ctx.home)) return m(`\`rm -rf ${a}\` would delete a whole tree`);
+        if (wholeTreeTarget(a, ctx.home)) yield m(`\`rm -rf ${a}\` would delete a whole tree`);
       }
       const subst = substWholeTreeGlob(args, ctx.home);
-      if (subst) return m(`\`rm -rf\` on a command substitution that expands \`${subst}\` would delete a whole tree`);
+      if (subst) yield m(`\`rm -rf\` on a command substitution that expands \`${subst}\` would delete a whole tree`);
     }
     // Item-feeding indirections (xargs/parallel) and find -exec/-execdir/-ok/-okdir: the invoked argv is
     // what resolveCommand() returned above (already the effective [prog,args] for every OTHER check in
@@ -1506,7 +1526,7 @@ function ruleDestructive(ctx) {
     if (progRaw === "xargs" || progRaw === "parallel" || progRaw === "find") {
       const what = progRaw === "find" ? "every match" : "whatever is piped in";
       if (prog === "rm" && isRecursiveRm(args)) {
-        return m(`\`${progRaw} rm -r\` recursively deletes ${what}`);
+        yield m(`\`${progRaw} rm -r\` recursively deletes ${what}`);
       }
       const script = scriptOf(prog, args, { interp: false });
       if (script !== null) {
@@ -1514,7 +1534,7 @@ function ruleDestructive(ctx) {
           for (const innerSeg of splitSegments(inner)) {
             const [p2, a2] = resolveCommand(innerSeg);
             if (p2 === "rm" && isRecursiveRm(a2)) {
-              return m(`\`${progRaw} ${prog} -c\` recursively deletes ${what}`);
+              yield m(`\`${progRaw} ${prog} -c\` recursively deletes ${what}`);
             }
           }
         }
@@ -1522,11 +1542,11 @@ function ruleDestructive(ctx) {
     }
     if (SQL_CLIENTS.has(prog)) {
       const mm = SQL_DROP_RE.exec(seg);
-      if (mm) return m(`\`DROP ${mm[1].toUpperCase()}\` deletes data irreversibly`);
+      if (mm) yield m(`\`DROP ${mm[1].toUpperCase()}\` deletes data irreversibly`);
     }
     if (prog === "redis-cli") {
       const i = firstPositional(args, REDIS_VALUE_OPTS);
-      if (i !== null && ["FLUSHALL", "FLUSHDB"].includes(args[i].toUpperCase())) return m("`redis-cli FLUSHALL`/`FLUSHDB` wipes the database");
+      if (i !== null && ["FLUSHALL", "FLUSHDB"].includes(args[i].toUpperCase())) yield m("`redis-cli FLUSHALL`/`FLUSHDB` wipes the database");
     }
     if (prog === "terraform" || prog === "tofu") {
       const i = firstPositional(args, new Set());
@@ -1534,17 +1554,17 @@ function ruleDestructive(ctx) {
       // `-auto-approve=true`/`--auto-approve=true` is valid Go-flag boolean syntax (common in scripted/CI
       // invocations) and applies exactly like the bare flag; only an explicit `=false` turns it off.
       const isAutoApprove = (a) => a === "-auto-approve" || a === "--auto-approve" || /^--?auto-approve=(?!false$)/.test(a);
-      if (sub === "destroy" || (sub === "apply" && args.slice(i + 1).includes("-destroy"))) return m(`\`${prog} destroy\` tears down real infrastructure`);
-      if (sub === "apply" && args.slice(i + 1).some(isAutoApprove)) return m(`\`${prog} apply -auto-approve\` applies infrastructure changes with no confirmation`);
+      if (sub === "destroy" || (sub === "apply" && args.slice(i + 1).includes("-destroy"))) yield m(`\`${prog} destroy\` tears down real infrastructure`);
+      if (sub === "apply" && args.slice(i + 1).some(isAutoApprove)) yield m(`\`${prog} apply -auto-approve\` applies infrastructure changes with no confirmation`);
     }
     if (prog === "pulumi") {
       const i = firstPositional(args, new Set());
-      if (i !== null && args[i] === "destroy") return m("`pulumi destroy` tears down real infrastructure");
+      if (i !== null && args[i] === "destroy") yield m("`pulumi destroy` tears down real infrastructure");
     }
     if (prog === "helm") {
       const i = firstPositional(args, new Set());
       // delete/del/un are Helm 3's own documented aliases for uninstall, not a separate, lesser command.
-      if (i !== null && HELM_UNINSTALL_SUBS.has(args[i])) return m(`\`helm ${args[i]}\` removes a deployed release`);
+      if (i !== null && HELM_UNINSTALL_SUBS.has(args[i])) yield m(`\`helm ${args[i]}\` removes a deployed release`);
     }
     // Any write landing on a raw block device is the dd case, regardless of which program produces
     // the bytes: dd's own of=, a `>`/`>>` redirect onto the device, or tee/cp/mv/install's last
@@ -1553,50 +1573,50 @@ function ruleDestructive(ctx) {
     if (prog === "dd") {
       for (const a of args) {
         if (!a.startsWith("of=")) continue;
-        if (isBlockDeviceTok(a.slice(3), ctx.home)) return block(`\`dd ${a}\` overwrites a device`);
+        if (isBlockDeviceTok(a.slice(3), ctx.home)) yield block(`\`dd ${a}\` overwrites a device`);
       }
     }
     for (const t of writeRedirectTargets(seg)) {
-      if (isBlockDeviceTok(t, ctx.home)) return block(`\`${prog} ... > ${t}\` overwrites a block device`);
+      if (isBlockDeviceTok(t, ctx.home)) yield block(`\`${prog} ... > ${t}\` overwrites a block device`);
     }
     if (["tee", "cp", "mv", "install"].includes(prog)) {
       const positional = nonRedirPositionals(args).filter((a) => !a.startsWith("-"));
       const dest = positional[positional.length - 1];
       if (dest && isBlockDeviceTok(dest, ctx.home)) {
-        return block(`\`${prog} ${dest}\` overwrites a block device`);
+        yield block(`\`${prog} ${dest}\` overwrites a block device`);
       }
     }
     if (prog === "shred") {
       const target = args.find((a) => !a.startsWith("-") && isBlockDeviceTok(a, ctx.home));
-      if (target) return block(`\`shred ${target}\` destroys a block device's contents`);
+      if (target) yield block(`\`shred ${target}\` destroys a block device's contents`);
       const store = secretStoreIn(args, ctx.home);
-      if (store) return m(`\`shred ${store.hit}\` destroys a secret file beyond recovery`);
+      if (store) yield m(`\`shred ${store.hit}\` destroys a secret file beyond recovery`);
     }
     if (DEVICE_DEST_PREFIX.test(prog) ||
         (DEVICE_TOOLS[prog] && DEVICE_TOOLS[prog].destructive(args))) {
       const target = args.find((a) => !a.startsWith("-") && isBlockDeviceTok(a, ctx.home));
-      if (target) return block(`\`${prog} ${target}\` rewrites a block device`);
+      if (target) yield block(`\`${prog} ${target}\` rewrites a block device`);
     }
     if (prog === "hdparm" && args.some((a) => /security|sanitize/i.test(a))) {
       const target = args.find((a) => !a.startsWith("-") && a.startsWith("/dev/"));
-      return block(`\`hdparm ${target || ""} ${args.find((a) => /security|sanitize/i.test(a))}\` runs a drive-erase/security operation`);
+      yield block(`\`hdparm ${target || ""} ${args.find((a) => /security|sanitize/i.test(a))}\` runs a drive-erase/security operation`);
     }
     // Cloud-CLI destructive verbs: ask tier (kubectl delete/terraform apply precedent), resolved
     // through cleanPositionals so global flag-shift can't hide the subcommand.
     if (cloudDestructiveVerb(prog, args)) {
-      return m(`\`${prog}\` delete/terminate/purge-class operation destroys cloud resources`);
+      yield m(`\`${prog}\` delete/terminate/purge-class operation destroys cloud resources`);
     }
     if (prog === "pulumi" && args.includes("--yes") && args.some((a) => a === "up" || a === "destroy")) {
-      return m("\`pulumi --yes\` applies infrastructure changes with no confirmation");
+      yield m("\`pulumi --yes\` applies infrastructure changes with no confirmation");
     }
     if (["pip", "pip3"].includes(prog) && args.some((a) => a === "install") &&
         args.some((a) => /^file:\/\/|^--index-url(?:=|\s)/.test(a) || (a === "--index-url" && args[args.indexOf("--index-url") + 1]))) {
-      return m("\`pip install\` from a file path or custom index runs arbitrary setup code at install time");
+      yield m("\`pip install\` from a file path or custom index runs arbitrary setup code at install time");
     }
     if ((prog === "chmod" || prog === "chown") && args.some((a) => a === "--recursive" || (a.startsWith("-") && !a.startsWith("--") && a.includes("R")))) {
       for (const a of args.slice(1)) {
         if (a.startsWith("-")) continue;
-        if (wholeTreeTarget(a, ctx.home)) return block(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
+        if (wholeTreeTarget(a, ctx.home)) yield block(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
       }
     }
   }
@@ -1607,12 +1627,17 @@ function ruleDestructive(ctx) {
     for (const bseg of splitSegments(b.crontab ? crontabCommands(b.body).join("\n") : b.body)) {
       const [p2, a2] = resolveCommand(bseg);
       if (p2 === "rm" && isRecursiveRm(a2)) {
-        return m("a heredoc-fed script runs a recursive delete per piped/matched item");
+        yield m("a heredoc-fed script runs a recursive delete per piped/matched item");
       }
     }
   }
   const shellPipe = detectShellPipe(ctx);
-  if (shellPipe) return m(`\`${shellPipe.first} ... | ${shellPipe.target}\` runs a downloaded script unread`);
+  if (shellPipe) yield m(`\`${shellPipe.first} ... | ${shellPipe.target}\` runs a downloaded script unread`);
+
+}
+
+function ruleDestructive(ctx) {
+  for (const hit of destructiveMatches(ctx)) if (!ctx.disabled.has(hit.rule)) return hit;
   return null;
 }
 
@@ -2125,7 +2150,7 @@ function groupingDepth(command) {
 export async function guardCommand(input, deps = {}) {
   resetGlobWork();
   const askAt = typeof input.ask_at === "number" ? input.ask_at : DEFAULT_ASK_AT;
-  const disabled = new Set(input.disable_rules || []);
+  const disabled = new Set(Array.isArray(input.disable_rules) ? input.disable_rules : []);
   const tool = input.tool || "Bash";
   const command = SHELL_TOOLS.has(tool) ? String(input.command || "") : "";
   // ctx.segments: the command's genuine top-level segments only -- the one thing R7-root-delete's
@@ -2162,7 +2187,8 @@ export async function guardCommand(input, deps = {}) {
   const expandedSegments = [...foldedSegments, ...bodySegments.flat(), ...outerLaunder.extra, ...bodyLaunders.flatMap((b) => b.extra)];
   const ctx = {
     tool, command, filePath: input.file_path || "", cwd: input.cwd || "", home: input.home || "",
-    description: input.description || "", userRequest: (input.user_request || "").trim(),
+    description: input.description || "", userRequest: typeof input.user_request === "string" ? input.user_request.trim() : "",
+    disabled,
     segments: rawSegments,
     unwrappedScripts,
     inputScripts: inScripts,
@@ -2185,13 +2211,13 @@ export async function guardCommand(input, deps = {}) {
   let ambiguousSecret = null;
   let softAsk = null;
   for (const [id, fn] of rules) {
-    if (disabled.has(id)) continue;
+    // R7-destructive's function reports R7-irreversible too and filters its own disabled ids (ctx.disabled), so
+    // disabling one of the two never hides the other's matches; every other function reports only its own id.
+    if (id !== "R7-destructive" && disabled.has(id)) continue;
     let m = null;
     try { m = fn(ctx); } catch { m = null; /* a rule bug must never block: fail open */ }
     if (!m) continue;
-    // A single registered function can report more than one rule id (R7-destructive's own function also
-    // returns R7-irreversible for its block-severity dd/chmod-R matches) — disable_rules names the id a
-    // caller actually SAW in a response, so honor the match's own id too, not just the array's.
+    // disable_rules names the id a caller actually SAW in a response, so honor the match's own id too.
     if (disabled.has(m.rule)) continue;
     if (m.severity === "ambiguous") { ambiguousSecret ??= m; continue; }
     // "soft": a deterministic ask (bare credential word, consumer-fed secret glob). A block from any later rule still wins.

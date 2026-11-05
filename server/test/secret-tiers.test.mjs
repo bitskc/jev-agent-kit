@@ -5,6 +5,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { guardCommand } from "../src/kit/guard.mjs";
 import { words, peelCommand, programOf, splitKeep, foldLiterals, substitutedSegments, processSubBodies, PROC_SUB_CHAR_BUDGET, SUBST_EXACT_LIMIT } from "../src/kit/shell.mjs";
+import { safeRegexTest, safeRegexAny } from "../src/kit/safere.mjs";
 
 // Secret reads are decided by token shape, not argv position. Every test here asserts the guard's DECISION (and rule)
 // for a command string passed to guardCommand(); no command in this file is ever executed, and no fixture files are
@@ -948,6 +949,113 @@ test("round 22b: assignment folding keeps its semantics", () => {
   assert.equal(foldLiterals("x=1 ls $x"), "x=1 ls $x"); // a prefix assignment persists nothing
   assert.equal(foldLiterals("export x=rm; $x -rf /"), "export x='rm'; rm -rf /");
   assert.equal(foldLiterals("x=rm; unset x; $x -rf /"), "x='rm'; unset x; $x -rf /");
+});
+
+// ── Round 23 ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// #131: safere.mjs re-evaluated nested lookarounds with a fresh memo per call (~10x per level: 3.97 s through the guard at
+// depth 7, past the hook's 2 s timeout, which fails open for the whole command). Lookaround is now unsupported (unknown),
+// and every probe also runs under a work budget.
+test("round 23 (#131): nested lookaround of any depth is decided quickly, never allow, and a later block still blocks", async () => {
+  for (let d = 4; d <= 10; d++) {
+    for (const open of ["(?=.*", "(?!.*", "(?<=a.*", "(?<!a.*"]) {
+      const pat = `${rep(open, d)}Q${rep(")", d)}`;
+      const hit = await timedGuard(`grep -rnP '${pat}' app.ts; cat .env`);
+      assert.equal(hit.decision, "block", `${open} d=${d}`);
+      assert.equal(hit.rule, "R1-secret-exposure", `${open} d=${d}`);
+      const alone = await timedGuard(`grep -rnP '${pat}' .`);
+      assert.notEqual(alone.decision, "allow", `${open} d=${d}`);
+      assert.equal(alone.rule, "R1-secret-exposure", `${open} d=${d}`);
+    }
+  }
+  // one lookaround is unsupported too: unknown (null), so the recursive rule asks
+  assert.equal(safeRegexTest("(?=.*Q)", "SECRET_X="), null);
+  assert.equal(safeRegexTest("(?<=SECRET)_X", "SECRET_X="), null);
+  assert.equal((await timedGuard("grep -rnP '(?=.*Q)' .")).decision, "ask");
+  // the same pattern without recursion reads nothing: still allowed
+  assert.equal((await timedGuard("grep -nP '(?=.*Q)' app.ts")).decision, "allow");
+});
+
+test("round 23 (#131): the NFA work budget turns a huge lookaround-free pattern into unknown, and ordinary patterns are unchanged", async () => {
+  const samples = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
+  const t0 = performance.now();
+  assert.equal(safeRegexAny("(?:.*){1000}Q", samples), null);
+  assert.equal(safeRegexAny("(?:(?:.*){30}){30}Q", samples), null);
+  const took = performance.now() - t0;
+  assert.ok(took < 500, `${took.toFixed(0)} ms`);
+  assert.equal(safeRegexTest("a*b", "aaab", { left: 3 }), null); // a tiny budget is spent immediately
+  assert.equal(safeRegexTest("a*b", "aaab"), true);
+  assert.equal(safeRegexAny("SECR.T_X", samples), true);
+  assert.equal(safeRegexAny("(.*.*)*Q", samples), false);
+  assert.equal(safeRegexAny("NOT_A_NAME", samples), false);
+  assert.equal(safeRegexAny("(a)\\1", samples), null); // backreference: valid but unsupported
+  assert.equal((await timedGuard(`grep -rn '(?:.*){1000}Q' .`)).decision, "ask");
+  assert.equal((await timedGuard("grep -rn 'SECR.T_X' src")).decision, "ask");
+  assert.equal((await timedGuard("grep -rn 'foo(bar|baz)+' src")).decision, "allow");
+});
+
+// #110: a recursive grep/rg whose pattern is a credential NAME asks on any root; a bare lowercase dictionary word keeps
+// the round-18 rule (asks only from a broad root).
+test("round 23 (#110): recursive greps for a credential name or assignment ask, even on a narrow root", async () => {
+  for (const cmd of [
+    "grep -rn NPM_TOKEN= .", "grep -rni token= .", "grep -rn TOKEN apps", "grep -rn NEXTAUTH .", "rg -T js GITHUB_TOKEN .",
+    "rg -t js GITHUB_TOKEN src", "rg -T js -i token= apps", "grep -rn NPM_TOKEN apps", "grep -rn STRIPE_KEY src", "grep -rn DB_PASS= src",
+    "grep -rn 'REDIS_PASS\\s*=' src", "grep -rn 'NPM_TOKEN=.*' src", "grep -rni npm_token apps", "grep -rniE 'auth_url' src", "grep -rn --ignore-case next_auth src",
+    "grep -rn -e NEXTAUTH src", "grep -rn -- TOKEN apps", "grep -rn OAUTH src",
+  ]) {
+    const r = await guard(cmd, PROJ, HOME);
+    assert.equal(r.decision, "ask", cmd);
+    assert.equal(r.rule, "R1-secret-exposure", cmd);
+  }
+});
+
+test("round 23 (#110): dictionary words, source identifiers and non-recursive greps stay allowed", async () => {
+  for (const cmd of [
+    "grep -rn tokenize src", "grep -rn author src", "grep -n TOKEN README.md", "grep -n NPM_TOKEN= config.sh", "grep -rn auth src", "grep -rn token src",
+    "grep -rni token src", "grep -rn Token src", "grep -rn useAuth src", "grep -rn AuthService src", "grep -rn token_count src", "grep -rn 'x ==' src",
+    "grep -rn 'a<=b' src", "rg -T js foo src", "rg -t js -g '*.ts' handler src", "grep -rn tokenizer apps",
+  ]) {
+    assert.equal((await guard(cmd, PROJ, HOME)).decision, "allow", cmd);
+  }
+  // the bare lowercase word still asks from a broad root (round-18 design)
+  for (const cmd of ["grep -rn auth .", "grep -rni token .", "grep -rn token ~"]) {
+    assert.equal((await guard(cmd, PROJ, HOME)).decision, "ask", cmd);
+  }
+});
+
+// #80: a non-string user_request / non-array disable_rules threw a TypeError; the hook fails open on a throw.
+test("round 23 (#80): non-string user_request and non-array disable_rules are ignored, not thrown", async () => {
+  for (const bad of [5, 0, true, { a: 1 }, ["x"], null, undefined]) {
+    const r = await guardCommand({ command: "ls", cwd: PROJ, home: HOME, tool: "Bash", user_request: bad }, noJev);
+    assert.equal(r.decision, "allow", JSON.stringify(bad));
+    const blocked = await guardCommand({ command: "cat .env", cwd: PROJ, home: HOME, tool: "Bash", user_request: bad }, noJev);
+    assert.equal(blocked.decision, "block", JSON.stringify(bad));
+  }
+  for (const bad of [5, "R7-irreversible", { a: 1 }, true]) {
+    const r = await guardCommand({ command: "cat .env", cwd: PROJ, home: HOME, tool: "Bash", disable_rules: bad }, noJev);
+    assert.equal(r.decision, "block", JSON.stringify(bad));
+  }
+  const ok = await guardCommand({ command: "ls", cwd: PROJ, home: HOME, tool: "Bash", user_request: " list files " }, noJev);
+  assert.equal(ok.decision, "allow");
+});
+
+// #99: disabling one rule id must skip only that id's matches. R7-destructive's function also reports R7-irreversible.
+test("round 23 (#99): disabling one R7 id still evaluates the other R7 matches in the same command", async () => {
+  const both = "dd if=/dev/zero of=/dev/sda; git push --force origin main";
+  const g2 = (extra) => guardCommand({ command: both, cwd: PROJ, home: HOME, tool: "Bash", ...extra }, noJev);
+  const none = await g2({});
+  assert.equal(none.decision, "block"); assert.equal(none.rule, "R7-irreversible");
+  const noIrrev = await g2({ disable_rules: ["R7-irreversible"] });
+  assert.equal(noIrrev.decision, "ask"); assert.equal(noIrrev.rule, "R7-destructive"); // the force-push still asks
+  const noDestr = await g2({ disable_rules: ["R7-destructive"] });
+  assert.equal(noDestr.decision, "block"); assert.equal(noDestr.rule, "R7-irreversible"); // the device write still blocks
+  assert.equal((await g2({ disable_rules: ["R7-destructive", "R7-irreversible"] })).decision, "allow"); // both named: both skipped
+  // reversed order and unrelated first matches
+  const rev = "git push --force origin main; dd if=/dev/zero of=/dev/sda";
+  assert.equal((await guardCommand({ command: rev, cwd: PROJ, home: HOME, tool: "Bash", disable_rules: ["R7-destructive"] }, noJev)).rule, "R7-irreversible");
+  assert.equal((await guardCommand({ command: rev, cwd: PROJ, home: HOME, tool: "Bash", disable_rules: ["R7-irreversible"] }, noJev)).rule, "R7-destructive");
+  // other rules are untouched by disabling an R7 id
+  assert.equal((await guardCommand({ command: "cat .env; terraform destroy", cwd: PROJ, home: HOME, tool: "Bash", disable_rules: ["R7-destructive"] }, noJev)).rule, "R1-secret-exposure");
+  assert.equal((await guardCommand({ command: "sudo ls; terraform destroy", cwd: PROJ, home: HOME, tool: "Bash", disable_rules: ["R5-sudo"] }, noJev)).rule, "R7-destructive");
 });
 
 test("round 21c: small substitutions decide as before", async () => {

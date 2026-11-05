@@ -3,12 +3,14 @@
 // pattern selects secret assignment lines. Running `new RegExp(userInput)` on the pattern makes a hostile
 // nested quantifier (`(a|a)*$`-style) catastrophic on the engine's backtracker, and the hook's timeout
 // then fails the guard open. This module compiles the pattern to a Thompson NFA and simulates it by
-// subset construction: work is O(pattern-states x sample-length), never exponential.
+// subset construction: work is O(pattern-states x sample-length), never exponential, and every closure
+// and consume step is also charged to a work budget (MAX_WORK) so no pattern can run unbounded.
 // Supported: literals, `.`, character classes (ranges, negation, \d\w\s class escapes), alternation,
 // capturing and non-capturing groups, `*`/`+`/`?`/`{m,n}` (lazy suffixes read as greedy — only
-// match/no-match is ever asked), anchors `^` `$` `\b` `\B`, `(?i:`/`(?m:`/`(?s:` scoped flag groups,
-// and lookahead/lookbehind via bounded sub-simulation. Unsupported but valid syntax (e.g. backreferences)
-// and patterns over MAX_PATTERN_LEN or MAX_STATES return unknown, which the caller treats conservatively
+// match/no-match is ever asked), anchors `^` `$` `\b` `\B`, and `(?i:`/`(?m:`/`(?s:` scoped flag groups.
+// Lookahead/lookbehind, named groups and backreferences are valid syntax this engine does not model
+// (nested lookarounds are exponential to simulate); like patterns over MAX_PATTERN_LEN or MAX_STATES, or
+// a probe that exhausts the work budget, they return unknown, which the caller treats conservatively
 // as possibly selecting a credential assignment. Invalid regex syntax returns no-match.
 
 const MAX_PATTERN_LEN = 512;
@@ -24,7 +26,6 @@ class ReSyntax extends Error {
 // ── parser → AST ────────────────────────────────────────────────────────────
 // {t:'lit',c,ci} {t:'class',neg,ci,items:[lo,hi] pairs or predicates} {t:'any',nl}
 // {t:'cat',xs} {t:'alt',xs} {t:'rep',x,min,max} {t:'anchor',k:'start'|'end'|'wb'|'nwb'}
-// {t:'look',neg,ahead,x,ci}
 function parse(src) {
   let i = 0;
   const peek = () => src[i];
@@ -130,21 +131,16 @@ function parse(src) {
       case "(": {
         if (src[i] === "?") {
           const k1 = src[i + 1];
-          if (k1 === ":" || k1 === "=" || k1 === "!") {
+          if (k1 === ":") {
             i += 2;
             const body = alt(flags);
             if (take() !== ")") err("unclosed group");
-            if (k1 === ":") return body;
-            return { t: "look", neg: k1 === "!", ahead: true, x: body, ci: flags.i };
+            return body;
           }
-          if (k1 === "<") {
-            if (src[i + 2] !== "=" && src[i + 2] !== "!") err("named group", true);
-            const neg = src[i + 2] === "!";
-            i += 3;
-            const body = alt(flags);
-            if (take() !== ")") err("unclosed group");
-            return { t: "look", neg, ahead: false, x: body, ci: flags.i };
-          }
+          // Lookahead/lookbehind and named groups are valid JS syntax this engine does not model. Nested
+          // lookarounds cost exponential sub-simulations, and a grep pattern is POSIX text that never needs them.
+          // Flag the pattern unsupported without descending into the body, so the caller treats it as unknown.
+          if (k1 === "=" || k1 === "!" || k1 === "<") err("lookaround or named group", true);
           // (?flags:...) — scoped i/m/s flags
           {
             let j = i + 1;
@@ -198,7 +194,7 @@ function parse(src) {
 
 // ── compiler → NFA ──────────────────────────────────────────────────────────
 // {kind:'lit',c,ci,out} {kind:'class',f,out} {kind:'any',nl,out} {kind:'eps',out}
-// {kind:'split',a,b} {kind:'pred',k,sub,subStates,out} {kind:'match'}
+// {kind:'split',a,b} {kind:'pred',k,out} (anchors only) {kind:'match'}
 function compile(ast) {
   const states = [];
   const add = (s) => { if (states.length >= MAX_STATES) throw new ReSyntax("too many states", true); states.push(s); return s; };
@@ -280,13 +276,6 @@ function compile(ast) {
         const s = add({ kind: "pred", k: n.k, out: null });
         return { start: s, outs: [{ st: s, f: "out" }] };
       }
-      case "look": {
-        const inner = compile(n.x);
-        const s = add({ kind: "pred", k: n.ahead ? (n.neg ? "nla" : "la") : (n.neg ? "nlb" : "lb"), sub: inner.start, subStates: inner.states, out: null });
-        states.push(...inner.states); // inner states count against the same cap
-        if (states.length > MAX_STATES) throw new ReSyntax("too many states", true);
-        return { start: s, outs: [{ st: s, f: "out" }] };
-      }
     }
     throw new ReSyntax("node");
   }
@@ -297,30 +286,28 @@ function compile(ast) {
 }
 
 // ── simulation ──────────────────────────────────────────────────────────────
-// epsilon/predicate closure, iterative. Lookaround predicates run a bounded sub-simulation and are
-// memoized per (pred state, position) inside predMemo.
-function closure(list, text, pos, set, predMemo) {
+// Every closure pop and every consume step is charged to a shared budget; a probe that exhausts it is unknown.
+class OverBudget extends Error {}
+const charge = (budget) => { if (--budget.left < 0) throw new OverBudget(); };
+
+// epsilon/anchor closure, iterative.
+function closure(list, text, pos, set, budget) {
   const stack = [...list];
   while (stack.length) {
     const s = stack.pop();
     if (set.has(s)) continue;
+    charge(budget);
     set.add(s);
     switch (s.kind) {
       case "split": stack.push(s.a, s.b); break;
       case "eps": stack.push(s.out); break;
       case "pred": {
-        let ok;
+        let ok = false;
         switch (s.k) {
           case "start": ok = pos === 0; break;
           case "end": ok = pos === text.length; break;
           case "wb": ok = (pos > 0 && WORD.test(text[pos - 1])) !== (pos < text.length && WORD.test(text[pos])); break;
           case "nwb": ok = (pos > 0 && WORD.test(text[pos - 1])) === (pos < text.length && WORD.test(text[pos])); break;
-          default: { // la / nla / lb / nlb
-            let rec = predMemo.get(s);
-            if (!rec) { rec = new Map(); predMemo.set(s, rec); }
-            if (!rec.has(pos)) rec.set(pos, lookResult(s, text, pos));
-            ok = rec.get(pos);
-          }
         }
         if (ok) stack.push(s.out);
         break;
@@ -328,76 +315,61 @@ function closure(list, text, pos, set, predMemo) {
     }
   }
 }
-function stepConsume(set, ch) {
+function stepConsume(set, ch, budget) {
   const move = [];
   for (const s of set) {
+    charge(budget);
     if (s.kind === "lit" && (s.ci ? s.c === ch.toLowerCase() : s.c === ch)) move.push(s.out);
     else if (s.kind === "class" && s.f(ch)) move.push(s.out);
     else if (s.kind === "any" && (s.nl || ch !== "\n")) move.push(s.out);
   }
   return move;
 }
-// Does the lookaround sub-automaton hold at pos?
-//   la:  some match starts at pos (consuming forward; may consume zero chars)
-//   nla: no match starts at pos
-//   lb:  some match ends exactly at pos
-//   nlb: no match ends exactly at pos
-function lookResult(pred, text, pos) {
-  const predMemo = new Map();
-  const starts = [pred.sub];
-  if (pred.k === "la" || pred.k === "nla") {
-    let set = new Set();
-    closure(starts, text, pos, set, predMemo);
-    for (let p = pos; ; p++) {
-      for (const s of set) if (s.kind === "match") return pred.k === "la";
-      if (p >= text.length) break;
-      const move = stepConsume(set, text[p]);
-      if (!move.length) break;
-      const next = new Set();
-      closure(move, text, p + 1, next, predMemo);
-      set = next;
-    }
-    return pred.k === "nla";
-  }
-  // behind: unanchored match over text[0..pos] that accepts ending exactly at pos
-  let set = new Set();
-  closure([pred.sub], text, 0, set, predMemo); // an attempt may begin at position 0
-  for (let p = 0; p <= pos; p++) {
-    for (const s of set) if (s.kind === "match") return pred.k === "lb";
-    if (p === pos) break;
-    const move = stepConsume(set, text[p]);
-    move.push(pred.sub); // a new attempt may begin at every position
-    const next = new Set();
-    closure(move, text, p + 1, next, predMemo);
-    set = next;
-  }
-  for (const s of set) if (s.kind === "match") return pred.k === "lb";
-  return pred.k === "nlb";
-}
+
+/** Work counter shared by every simulation step of one probe: closure pops and consume steps each cost one. */
+export const MAX_WORK = 400000;
 
 /** test(pattern, text): does `pattern` match a substring of `text` — RegExp.prototype.test semantics
  *  without the backtracker. Returns null for valid but unsupported/over-budget patterns and false
- *  for syntax errors; callers must not silently allow the null case. Never throws on user input. */
-export function safeRegexTest(pattern, text) {
+ *  for syntax errors; callers must not silently allow the null case. Never throws on user input.
+ *  `budget` ({left}) may be shared across several probes of one pattern so their total work is bounded. */
+export function safeRegexTest(pattern, text, budget = { left: MAX_WORK }) {
   if (typeof pattern !== "string") return false;
   if (pattern.length > MAX_PATTERN_LEN) return null;
   let nfa;
   try { nfa = compile(parse(pattern)); }
   catch (e) { return e instanceof ReSyntax ? (e.unsupported ? null : false) : null; }
-  const predMemo = new Map();
-  // Inject a fresh start state at each input position instead of re-running a search from every
-  // possible start. That preserves unanchored RegExp.test semantics while keeping work linear in
-  // sample length times NFA state count.
-  let set = new Set();
-  closure([nfa.start], text, 0, set, predMemo);
-  for (let pos = 0; ; pos++) {
-    for (const s of set) if (s.kind === "match") return true;
-    if (pos >= text.length) break;
-    const move = stepConsume(set, text[pos]);
-    move.push(nfa.start);
-    const next = new Set();
-    closure(move, text, pos + 1, next, predMemo);
-    set = next;
+  try {
+    // Inject a fresh start state at each input position instead of re-running a search from every
+    // possible start. That preserves unanchored RegExp.test semantics while keeping work linear in
+    // sample length times NFA state count.
+    let set = new Set();
+    closure([nfa.start], text, 0, set, budget);
+    for (let pos = 0; ; pos++) {
+      for (const s of set) if (s.kind === "match") return true;
+      if (pos >= text.length) break;
+      const move = stepConsume(set, text[pos], budget);
+      move.push(nfa.start);
+      const next = new Set();
+      closure(move, text, pos + 1, next, budget);
+      set = next;
+    }
+    return false;
+  } catch (e) {
+    if (e instanceof OverBudget) return null;
+    throw e;
   }
-  return false;
+}
+
+/** Probe `pattern` against every sample under ONE shared work budget. true: some sample matches;
+ *  null: nothing matched but the pattern is unknown (unsupported, too large, or over budget); false: none match. */
+export function safeRegexAny(pattern, samples) {
+  const budget = { left: MAX_WORK };
+  let unknown = false;
+  for (const s of samples) {
+    const r = safeRegexTest(pattern, s, budget);
+    if (r === true) return true;
+    if (r === null) unknown = true;
+  }
+  return unknown ? null : false;
 }
