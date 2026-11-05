@@ -145,7 +145,10 @@ function parse(src) {
           {
             let j = i + 1;
             const nf = { ...flags };
-            while (/[ims]/.test(src[j])) { nf[src[j]] = true; j++; }
+            // `src[j]` is undefined at the end of the pattern, and /[ims]/.test(undefined) tests the string "undefined",
+            // which holds an `i`: the scan must stop at the end, and a pattern cut off inside `(?` is invalid syntax.
+            while (j < src.length && /[ims]/.test(src[j])) { nf[src[j]] = true; j++; }
+            if (j >= src.length) err("unterminated group");
             if (src[j] === ":") { i = j + 1; const body = alt(nf); if (take() !== ")") err("unclosed group"); return body; }
           }
           err("unsupported group", true); // valid/unknown group syntax is conservatively flagged
