@@ -10,6 +10,16 @@
 import { posix as posixPath } from "node:path";
 export const ASSIGN_RE = /^[A-Za-z_][A-Za-z_0-9]*=/;
 
+/** Is the `&` at s[i] part of a redirect operator rather than a command separator? `2>&1`, `>&2`, `<&3` (fd duplication) and
+ *  `&>file`, `&>>file` (stdout+stderr redirect): splitting there turned `npm test 2>&1` into `npm test 2>` and `1`, and
+ *  `2>&1 rm -rf /` into a segment whose program was `1`. `&&` and `|&` are not redirect operators. */
+function isRedirectAmp(s, i) {
+  const prev = s[i - 1];
+  const next = s[i + 1];
+  if ((prev === ">" || prev === "<") && next !== "&" && next !== "|") return true;
+  return next === ">" && prev !== "&" && prev !== "|";
+}
+
 /** The cut points of a (line-continuation-folded) command: for each separator, where the content before it ends, where the
  *  separator ends, and its text. One linear scan; content k is s.slice(k === 0 ? 0 : sepEnds[k - 1], contentEnds[k]). */
 function scanCuts(s) {
@@ -34,6 +44,7 @@ function scanCuts(s) {
     if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
     if (ch === "\\" && i + 1 < n) { i += 2; continue; }
     if (ch === ";" || ch === "\n") { cut(i, i + 1); i++; continue; }
+    if (ch === "&" && isRedirectAmp(s, i)) { i++; continue; }
     if (ch === "&" || ch === "|") {
       const start = i;
       while (i < n && (s[i] === "&" || s[i] === "|")) i++;
@@ -83,6 +94,9 @@ const RUNUSER_VALUE_OPTS = new Set(["-u", "--user", "-s", "--shell", "-g", "--gr
  *  an exotic literal. */
 // Words after which a `(` opens a grouping subshell (`if (cmd)`, `{ (cmd); }`, `! (cmd)`) rather than continuing the word.
 const PAREN_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "time", "coproc", "select", "{", "!"]);
+// The part of a redirect operator already read when the next `<`/`>` arrives: an fd number or `&`, then the operator's own
+// characters so far (`2`, `&`, `2>`, `>`, `<<`).
+const REDIR_PREFIX_RE = /^(?:\d+|&)?[<>]*$/;
 // A long segment is tokenized many times (every rule asks for the same command's words); keep the last few results.
 const WORDS_MEMO_MIN = 512;
 const wordsMemo = new Map();
@@ -133,6 +147,12 @@ export function words(segment) {
     if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
     const code = ch.charCodeAt(0); // ASCII whitespace without a regex per character; non-ASCII falls back to \s
     if (code === 32 || (code >= 9 && code <= 13) || (code > 127 && /\s/.test(ch))) { flush(); continue; }
+    // An unquoted redirect operator ends the word before it: `cat<.env` is `cat` then `<.env`, and `rm -rf />/dev/null` is
+    // `rm -rf /` then `>/dev/null`. An fd number or `&` glued in front belongs to the operator (`2>x`, `&>x`), the operator's own
+    // characters stay together (`>>`, `<<<`), and nothing splits inside `$(...)` or `${...}`. The target stays glued to the
+    // operator when it follows without a space (`<.env`), exactly like a spaced redirect's `<` `.env` pair.
+    if (ch === "&" && substDepth === 0 && s[i + 1] === ">" && s[i - 1] !== ">" && s[i - 1] !== "&") { flush(); buf = "&"; inWord = true; continue; }
+    if ((ch === "<" || ch === ">") && substDepth === 0 && inWord && !REDIR_PREFIX_RE.test(buf) && buf.lastIndexOf("${") <= buf.lastIndexOf("}")) flush();
     if (ch === "(") {
       // A `(` right after a word that is not a shell keyword is not shell grouping (`name(` is a function head or an
       // interpreter call such as `console.log(process.env.HOME)` inside a `node -e` payload): it stays in the word.
@@ -282,6 +302,18 @@ const KEYWORD_SKIP = new Set(["if", "then", "elif", "else", "fi", "do", "done", 
 const base = (p) => p.slice(p.lastIndexOf("/") + 1);
 const stripHeadMarks = (t) => t.replace(/^[({!]+/, "");
 const isCaseLabel = (t) => t.endsWith(")") && !t.includes("(");
+// A word that opens a redirect (`<f`, `2>/dev/null`, `&>x`, `>&2`, `<<EOF`), but not a process substitution `<(cmd)`; and one
+// that is the bare operator, whose target is the next word.
+const REDIR_WORD_RE = /^(?:\d+|&)?(?:<<<|<<-?|<>|>>|>\||>&|<&|[<>])(?!\()/;
+const REDIR_ONLY_RE = /^(?:\d+|&)?(?:<<<|<<-?|<>|>>|>\||>&|<&|[<>])$/;
+/** Is everything from `from` on a redirect with its target (`env 2>&1`, `xargs <list >out`)? */
+function onlyRedirects(toks, from) {
+  for (let k = from; k < toks.length; k++) {
+    if (!REDIR_WORD_RE.test(toks[k])) return false;
+    if (REDIR_ONLY_RE.test(toks[k])) k++;
+  }
+  return true;
+}
 
 /** The single argv peel walk. Consumes leading VAR=val assignments, shell keywords/grouping markers,
  *  and every WRAPPER_SPECS wrapper -- each wrapper's own flags, value-taking options, operands and
@@ -293,40 +325,60 @@ const isCaseLabel = (t) => t.endsWith(")") && !t.includes("(");
  *  Returns the remaining argv ([] when nothing concrete is left). Never throws; worst case stops early. */
 export function peelCommand(toksIn, opts = {}) {
   const stopAt = opts.stopAt || null;
-  let toks = toksIn;
+  // One private copy of the argv, then an offset `o` into it: peeling a wrapper or a case label moves `o` forward and never
+  // re-slices, so a command that peels thousands of wrappers (`env A=1 env A=1 ...`) costs O(n), not a copy per wrapper.
+  // Every index below is relative to `o`; the few paths that rebuild the argv (env -S splicing) keep `o` valid.
+  let toks = toksIn.slice();
+  let o = 0;
+  const redirs = [];
+  const rest = (from = 0) => {
+    const r = toks.slice(o + from);
+    return redirs.length && r.length ? r.concat(redirs) : r;
+  };
   for (;;) {
     // Consume the whole leading run of grouping marks and keywords in one linear pass (an index, not a slice per token):
     // `((((...rm -rf /...))))`, `( ( (`, `{ { {` and `! ! !` runs would otherwise cost a copy of the argv per mark.
-    let pos = 0;
+    let pos = o;
     let t0 = "";
     while (pos < toks.length) {
       // `!( cmd` / `{ cmd` / `( cmd`: the grouping marker rides the first token; stripping it can leave nothing (a bare
       // `(`/`{`/`!` word) or a keyword, which is skipped like any other.
       t0 = stripHeadMarks(toks[pos]);
+      // A leading redirect (`2>/dev/null rm -rf /`, `<.env cat`, `> out rm x`) is not the command word: skip it and its
+      // target. The skipped tokens ride along at the END of the returned argv (`cat <.env`), where every rule already reads
+      // a redirect, so a stdin source or output target is never lost and no rule sees the redirect as the program.
+      if (REDIR_WORD_RE.test(t0)) {
+        redirs.push(t0);
+        pos++;
+        if (REDIR_ONLY_RE.test(t0) && pos < toks.length) redirs.push(toks[pos++]);
+        continue;
+      }
       if (!t0 || t0 === ")" || isCaseLabel(t0) || (KEYWORD_SKIP.has(t0) && t0 !== "select") || ASSIGN_RE.test(t0)) { pos++; continue; }
       if (t0 === "time") { pos++; while (pos < toks.length && toks[pos] === "-p") pos++; continue; }
       break;
     }
-    if (pos >= toks.length) return [];
-    if (pos > 0 || t0 !== toks[0]) toks = [t0, ...toks.slice(pos + 1)];
+    if (pos >= toks.length) return redirs.slice(); // only redirects: the first one stands as the "program" (`> /dev/sda`)
+    o = pos;
+    toks[o] = t0;
+    const n = () => toks.length - o;
     if (t0 === "for" || t0 === "select") {
       // `for v in a b; do ...`: the words between `in` and `do` are the list, not commands.
       let i = 1;
-      while (i < toks.length && toks[i] !== "in" && toks[i] !== "do") i++;
-      while (i < toks.length && toks[i] !== "do") i++;
-      toks = i < toks.length ? toks.slice(i + 1) : [];
+      while (i < n() && toks[o + i] !== "in" && toks[o + i] !== "do") i++;
+      while (i < n() && toks[o + i] !== "do") i++;
+      o = i < n() ? o + i + 1 : toks.length;
       continue;
     }
     if (t0 === "case") {
-      const k = toks.indexOf("in");
-      toks = k >= 0 ? toks.slice(k + 1) : [];
+      const k = toks.indexOf("in", o);
+      o = k >= 0 ? k + 1 : toks.length;
       continue;
     }
     const prog = base(t0);
-    if (stopAt && stopAt.has(prog)) return toks;
-    if (prog === "ip" && toks[1] === "netns" && toks[2] === "exec" && toks.length > 3) { toks = toks.slice(4); continue; }
+    if (stopAt && stopAt.has(prog)) return rest();
+    if (prog === "ip" && toks[o + 1] === "netns" && toks[o + 2] === "exec" && n() > 3) { o += 4; continue; }
     const spec = WRAPPER_SPECS[prog];
-    if (!spec) return toks;
+    if (!spec) return rest();
     if (spec.runuserStyle) {
       // runuser [opts] [-] [user] cmd...: the first bare positional is the USER only when a command still
       // follows it and -u/--user hasn't already named one; options may sit on either side of the user
@@ -337,9 +389,9 @@ export function peelCommand(toksIn, opts = {}) {
       let i = 1;
       let namedUser = false;
       let sawUser = false;
-      while (i < toks.length) {
-        const t = toks[i];
-        if (cmdOpt(t)) return ["runuser", ...toks.slice(1)];
+      while (i < n()) {
+        const t = toks[o + i];
+        if (cmdOpt(t)) return ["runuser", ...rest(1)];
         if (t === "--") { i++; break; }
         if (t === "-") { i++; continue; }
         if (t.startsWith("-")) {
@@ -347,58 +399,58 @@ export function peelCommand(toksIn, opts = {}) {
           i += RUNUSER_VALUE_OPTS.has(t) ? 2 : 1;
           continue;
         }
-        if (namedUser || sawUser || i + 1 >= toks.length) break;
+        if (namedUser || sawUser || i + 1 >= n()) break;
         sawUser = true;
         i++;
       }
-      if (i < toks.length && cmdOpt(toks[i])) return ["runuser", ...toks.slice(1)];
-      if (i < toks.length && toks[i] === "--") i++;
-      toks = toks.slice(i);
+      if (i < n() && cmdOpt(toks[o + i])) return ["runuser", ...rest(1)];
+      if (i < n() && toks[o + i] === "--") i++;
+      o = Math.min(o + i, toks.length);
       continue;
     }
     let i = 1;
     let sawValueOpt = false;
-    while (i < toks.length) {
-      const t = toks[i];
+    while (i < n()) {
+      const t = toks[o + i];
       if (t === "--") {
         i++;
-        if (spec.joinAfterDashDash) return toks.slice(i).length ? ["bash", ...toks.slice(i)] : [];
+        if (spec.joinAfterDashDash) return rest(i).length ? ["bash", ...rest(i)] : [];
         break;
       }
       if (spec.scriptOpts) {
         // script/sg/flock -c 'cmd': the option's value IS a shell script; hand it to bash -c so the
         // script-unwrap canonicalization reads it exactly as an explicit bash -c.
-        if (spec.scriptOpts.has(t) && i + 1 < toks.length) return ["bash", "-c", toks[i + 1]];
+        if (spec.scriptOpts.has(t) && i + 1 < n()) return ["bash", "-c", toks[o + i + 1]];
         if (t.startsWith("--command=")) return ["bash", "-c", t.slice("--command=".length)];
       }
       if (!t.startsWith("-") || t === "-") break;
       if (spec.envAssignments && ASSIGN_RE.test(t)) { i++; continue; }
       if (spec.spliceOpts) {
         // --split-string=x / -S=x: the attached value is still a command line to splice.
-        const eq = spec.spliceOpts && [...spec.spliceOpts].find((o) => t.startsWith(o + "="));
+        const eq = spec.spliceOpts && [...spec.spliceOpts].find((o2) => t.startsWith(o2 + "="));
         if (eq) {
           const val = t.slice(eq.length + 1);
           if (opts.splice) opts.splice.push(val);
-          toks = [...toks.slice(0, i), ...words(val), ...toks.slice(i + 1)];
+          toks = [...toks.slice(0, o + i), ...words(val), ...toks.slice(o + i + 1)];
           i = 1;
           continue;
         }
       }
       if (t.includes("=")) { i++; continue; } // --opt=val: value attached, nothing more to consume
-      if (spec.spliceOpts && spec.spliceOpts.has(t) && i + 1 < toks.length) {
+      if (spec.spliceOpts && spec.spliceOpts.has(t) && i + 1 < n()) {
         // env -S/--split-string: the value IS a command line. Splice its words back into the argv walk
         // (env -S 'rm -rf /' resolves to rm) AND record the raw text for script-level consumers.
-        if (opts.splice) opts.splice.push(toks[i + 1]);
-        toks = [...toks.slice(0, i), ...words(toks[i + 1]), ...toks.slice(i + 2)];
+        if (opts.splice) opts.splice.push(toks[o + i + 1]);
+        toks = [...toks.slice(0, o + i), ...words(toks[o + i + 1]), ...toks.slice(o + i + 2)];
         i = 1;
         continue;
       }
       if (spec.valueOpts && spec.valueOpts.has(t)) { i += 2; sawValueOpt = true; continue; }
       // Attached short-form value for a spliceOpt (env -S'cmd args').
-      if (spec.spliceOpts && !t.startsWith("--") && t.length > 2 && [...spec.spliceOpts].some((o) => o.length === 2 && t.startsWith(o))) {
+      if (spec.spliceOpts && !t.startsWith("--") && t.length > 2 && [...spec.spliceOpts].some((o2) => o2.length === 2 && t.startsWith(o2))) {
         const val = t.slice(2);
         if (opts.splice) opts.splice.push(val);
-        toks = [...toks.slice(0, i), ...words(val), ...toks.slice(i + 1)];
+        toks = [...toks.slice(0, o + i), ...words(val), ...toks.slice(o + i + 1)];
         i = 1;
         continue;
       }
@@ -415,14 +467,14 @@ export function peelCommand(toksIn, opts = {}) {
     }
     const operands = spec.operandsIfNoOpts && sawValueOpt ? 0 : (spec.operands || 0);
     i += operands;
-    if (spec.flagsAfterOperands) while (i < toks.length && toks[i].startsWith("-") && toks[i] !== "-") i++;
-    if (spec.scriptOpts && i + 1 < toks.length && spec.scriptOpts.has(toks[i])) return ["bash", "-c", toks[i + 1]];
-    if (i >= toks.length) {
+    if (spec.flagsAfterOperands) while (i < n() && toks[o + i].startsWith("-") && toks[o + i] !== "-") i++;
+    if (spec.scriptOpts && i + 1 < n() && spec.scriptOpts.has(toks[o + i])) return ["bash", "-c", toks[o + i + 1]];
+    if (i >= n() || onlyRedirects(toks, o + i)) {
       // The wrapper IS the command (bare `env` dumps the environment, bare `xargs` echoes stdin):
       // surface it as the program with its own args, not as a resolved-nothing.
-      return toks;
+      return rest();
     }
-    toks = toks.slice(i);
+    o += i;
   }
 }
 
@@ -442,7 +494,7 @@ export function programOf(segment) {
 // Only values provable from the command text fold; a value computed at runtime stays opaque (disclosed limit).
 const FOLD_SUBST_RE = /\$\(\s*(?:echo(?:\s+-[neE]+)*|printf)\s+('[^']*'|"[^"$`\\]*"|[^\s()$`'"\\;&|<>%]+)\s*\)|`\s*(?:echo(?:\s+-[neE]+)*|printf)\s+('[^']*'|"[^"$`\\]*"|[^\s()$`'"\\;&|<>%]+)\s*`/g;
 const FOLD_VAR_RE = /\$\{([A-Za-z_]\w*)\}|\$([A-Za-z_]\w*)/g;
-const FOLD_WORD_RE = /^(\s*[({!]*\s*)((?:\$\([^()]*\)|`[^`]*`|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|[^\s;&|()$`'"<>\\])+)/;
+const FOLD_WORD_RE = /^(\s*(?:[({!]+\s*)?)((?:\$\([^()]*\)|`[^`]*`|\$\{[A-Za-z_]\w*\}|\$[A-Za-z_]\w*|[^\s;&|()$`'"<>\\])+)/;
 // A folded value: text a shell re-reads as the same words, with no expansion, quoting or operator characters.
 const LITERAL_VALUE_RE = /^[^$`"'\\;&|<>()%\n]*$/;
 const DECL_BUILTINS = new Set(["export", "local", "readonly", "declare", "typeset"]);
@@ -1206,6 +1258,7 @@ export function splitPipelines(command) {
     if (ch === "'" || ch === '"') { quote = ch; buf.push(ch); i++; continue; }
     if (ch === "\\" && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
     if (ch === ";" || ch === "\n") { flushPipeline(); i++; continue; }
+    if (ch === "&" && isRedirectAmp(s, i)) { buf.push(ch); i++; continue; }
     if (ch === "&" || ch === "|") {
       let j = i;
       while (j < n && (s[j] === "&" || s[j] === "|")) j++;

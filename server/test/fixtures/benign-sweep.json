@@ -503,5 +503,45 @@
  "command": "cp notes.txt n && npm test -- --name=n",
  "decision": "allow",
  "rule": null
+},
+{
+ "command": "chmod -R 755 .",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "chown -R $USER:$USER .",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "chmod -R u+rwX .",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "chmod -R 755 ./",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "chmod -R 755 *",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "npm test 2>&1",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "echo done >out.txt",
+ "decision": "allow",
+ "rule": null
+},
+{
+ "command": "ls 2>/dev/null",
+ "decision": "allow",
+ "rule": null
 }
 ]

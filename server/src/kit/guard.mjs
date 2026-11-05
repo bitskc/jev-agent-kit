@@ -596,14 +596,69 @@ function isBroadRoot(root, cwd = "", home = "") {
 // Assignment-name samples. A pattern that is a regex matching one of these names (`SECR.T_X`), or the assignment
 // operator (`=`), selects the assignment lines of every .env file it reaches. Under -i the samples are also probed
 // lowercased. All probes of one pattern share a single work budget.
-const VALUE_NAME_SAMPLES = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
+const VALUE_NAME_BASE = ["SECRET_X=", "DATABASE_URL=", "AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=", "DB_PASSWORD=", "API_KEY=", "PRIVATE_KEY=", "SERVICE_ROLE_KEY=", "AUTH_TOKEN=", "GITHUB_TOKEN="];
+// Each name is probed bare (`=$` anchors) and carrying a value (`[A-Z_]+=[^ ]+` needs something after the `=`). The value is
+// one uppercase letter, so a lowercase-word pattern (`[a-z]+`, `=[0-9]`) does not match it by accident.
+const VALUE_NAME_SAMPLES = [...VALUE_NAME_BASE, ...VALUE_NAME_BASE.map((s) => `${s}X`)];
 const VALUE_NAME_SAMPLES_CI = VALUE_NAME_SAMPLES.map((s) => s.toLowerCase());
-function patternMatchesValueName(p, ignoreCase = false) {
+// grep/rg patterns are POSIX/PCRE text, and the NFA reads JS regex syntax. Translate what differs and cannot be read the same
+// way: a bracket expression's `[:class:]` becomes its ranges, a GNU `\<`/`\>` word edge becomes `\b`, and in a basic regex the
+// escaped operators `\( \) \{ \} \| \+ \?` become the operators JS spells without a backslash. Bare `( ) | + ?` in a basic
+// regex stay operators, which only widens what the pattern can match (a person who types `grep 'A|B'` expecting alternation
+// gets the ask). `[[=x=]]`/`[[.x.]]` and an unknown class name are left unread: null means ask.
+const POSIX_CLASSES = {
+  alpha: "a-zA-Z", upper: "A-Z", lower: "a-z", digit: "0-9", alnum: "a-zA-Z0-9", xdigit: "0-9A-Fa-f", space: "\\s", blank: " \\t",
+  punct: "!-\\/:-@\\[-`{-~", word: "\\w", cntrl: "\\x00-\\x1f\\x7f", print: "\\x20-\\x7e", graph: "\\x21-\\x7e",
+};
+function posixToJsRegex(p, { extended, gnuEdges }) {
+  let out = "";
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i];
+    if (c === "[") {
+      let j = i + 1;
+      let cls = "[";
+      if (p[j] === "^") { cls += "^"; j++; }
+      if (p[j] === "]") { cls += "\\]"; j++; }
+      for (;;) {
+        if (j >= p.length) return p; // unterminated: invalid regex, left for the engine to reject
+        const d = p[j];
+        if (d === "[" && (p[j + 1] === "=" || p[j + 1] === ".")) return null;
+        if (d === "[" && p[j + 1] === ":") {
+          const k = p.indexOf(":]", j + 2);
+          if (k < 0) return p;
+          const cls2 = POSIX_CLASSES[p.slice(j + 2, k)];
+          if (cls2 === undefined) return null;
+          cls += cls2;
+          j = k + 2;
+          continue;
+        }
+        if (d === "]") break;
+        cls += d;
+        j++;
+      }
+      out += `${cls}]`;
+      i = j;
+      continue;
+    }
+    if (c === "\\" && i + 1 < p.length) {
+      const d = p[++i];
+      if (!extended && "(){}|+?".includes(d)) out += d;
+      else if (gnuEdges && (d === "<" || d === ">")) out += "\\b";
+      else out += c + d;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+function patternMatchesValueName(p, ignoreCase = false, syntax = { extended: true, gnuEdges: false }) {
   if (GENERIC_CRED_WORD_RE.test(p)) return false;
+  const js = posixToJsRegex(p, syntax);
+  if (js === null) return true;
   // safeRegexAny uses a Thompson NFA with a work budget and never runs the untrusted pattern through a backtracker.
   // An invalid pattern cannot match; a valid but unsupported/over-budget pattern (lookaround, backreference, too
   // large) is unknown and treated as potentially selecting a value-bearing assignment (the recursive rule asks).
-  return safeRegexAny(p, ignoreCase ? [...VALUE_NAME_SAMPLES, ...VALUE_NAME_SAMPLES_CI] : VALUE_NAME_SAMPLES) !== false;
+  return safeRegexAny(js, ignoreCase ? [...VALUE_NAME_SAMPLES, ...VALUE_NAME_SAMPLES_CI] : VALUE_NAME_SAMPLES) !== false;
 }
 // Splits a grep/rg argv the way getopt does: short options take their value from the rest of the cluster or the next
 // token (`-drecurse`, `-d recurse`, `-ePAT`, `-e PAT`), so no option value is read as a flag. Returns the -e/--regexp
@@ -615,6 +670,7 @@ function grepArgv(prog, args) {
   const operands = [];
   let fileMode = false;
   let ignoreCase = false;
+  let extended = prog !== "grep"; // egrep, rg and ag read extended syntax; plain grep reads a basic regex unless -E/-P
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--") { operands.push(...args.slice(i + 1)); break; }
@@ -625,6 +681,7 @@ function grepArgv(prog, args) {
       if (name === "--regexp") patterns.push(inline ?? args[++i] ?? "");
       else if (name === "--file") { fileMode = true; if (inline === null) i++; }
       else if (name === "--ignore-case") ignoreCase = true;
+      else if (name === "--extended-regexp" || name === "--perl-regexp") extended = true;
       else if (GREP_VALUE_OPTS.has(name) && inline === null) i++;
       continue;
     }
@@ -632,6 +689,7 @@ function grepArgv(prog, args) {
       for (let k = 1; k < a.length; k++) {
         const c = a[k];
         if (c === "i" || c === "y") ignoreCase = true;
+        if ((c === "E" || c === "P") && prog !== "rg") extended = true; // grep -E / -P: operators are unescaped
         if (!valueShort.includes(c)) continue;
         const rest = a.slice(k + 1);
         const value = rest.length > 0 ? rest : (args[++i] ?? "");
@@ -643,15 +701,16 @@ function grepArgv(prog, args) {
     }
     operands.push(a);
   }
-  return { patterns, operands, fileMode, ignoreCase };
+  return { patterns, operands, fileMode, ignoreCase, extended };
 }
 function grepNamesSecret(prog, args, cwd, home) {
   if (!GREP_PATTERN_PROGS.has(prog)) return false;
-  const { patterns, operands, fileMode, ignoreCase } = grepArgv(prog, args);
+  const { patterns, operands, fileMode, ignoreCase, extended } = grepArgv(prog, args);
   // -f/--file: the pattern is a file's contents, so every token is name-checked and no pattern text is probed.
   const pats = fileMode ? args : patterns.length > 0 ? patterns : operands.slice(0, 1);
   const roots = patterns.length > 0 || fileMode ? operands : operands.slice(1);
-  if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && (namesCredential(p, ignoreCase) || patternMatchesValueName(p, ignoreCase))))) return true;
+  const syntax = { extended, gnuEdges: prog === "grep" || prog === "egrep" };
+  if (pats.some((p) => SECRET_NAME_RE.test(p) || (!fileMode && (namesCredential(p, ignoreCase) || patternMatchesValueName(p, ignoreCase, syntax))))) return true;
   const broad = roots.length === 0 || roots.some((r) => isBroadRoot(r, cwd, home));
   return broad && pats.some((p) => GENERIC_CRED_WORD_RE.test(p));
 }
@@ -814,17 +873,19 @@ function ruleSecret(ctx) {
         if (SECRET_VAR_NAME_RE.test(m[1])) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog}\` would print $${m[1]}, whose name says it holds a secret`, suggestion: R1_SUGGESTION };
       }
     }
+    // A redirect (`printenv 2>&1`, `2>&1 printenv`) is not an operand: dropped, so the dump checks see only real arguments.
+    const argsNR = nonRedirPositionals(args);
     if (prog === "printenv") {
-      const names = args.filter((a) => !a.startsWith("-"));
+      const names = argsNR.filter((a) => !a.startsWith("-"));
       if (!names.length) return { rule: "R1-secret-exposure", severity: "block", reason: "bare `printenv` dumps every variable, secrets included", suggestion: R1_SUGGESTION };
       for (const a of names) if (SECRET_VAR_NAME_RE.test(a)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`printenv ${a}\` would print a secret value`, suggestion: R1_SUGGESTION };
     }
-    if ((prog === "env" && envPrintsEnvironment(args)) || (prog === "set" && !args.length)) return { rule: "R1-secret-exposure", severity: "block", reason: `bare \`${prog}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
-    if (prog === "export" && args.every((a) => a.startsWith("-")) && (!args.length || args.includes("-p"))) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${args.length ? "export -p" : "export"}\` dumps every exported variable, secrets included`, suggestion: R1_SUGGESTION };
+    if ((prog === "env" && envPrintsEnvironment(argsNR)) || (prog === "set" && !argsNR.length)) return { rule: "R1-secret-exposure", severity: "block", reason: `bare \`${prog}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
+    if (prog === "export" && argsNR.every((a) => a.startsWith("-")) && (!argsNR.length || argsNR.includes("-p"))) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${argsNR.length ? "export -p" : "export"}\` dumps every exported variable, secrets included`, suggestion: R1_SUGGESTION };
     if (prog === "declare" || prog === "typeset") {
-      const flags = args.filter((a) => /^[-+][A-Za-z]+$/.test(a)).join("");
-      const names = args.filter((a) => !/^[-+]/.test(a)).map((a) => a.split("=")[0]);
-      if (!names.length && /[px]/.test(flags)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog} ${args.join(" ")}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
+      const flags = argsNR.filter((a) => /^[-+][A-Za-z]+$/.test(a)).join("");
+      const names = argsNR.filter((a) => !/^[-+]/.test(a)).map((a) => a.split("=")[0]);
+      if (!names.length && /[px]/.test(flags)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog} ${argsNR.join(" ")}\` dumps every variable, secrets included`, suggestion: R1_SUGGESTION };
       if (flags.includes("p")) for (const n of names) if (SECRET_VAR_NAME_RE.test(n)) return { rule: "R1-secret-exposure", severity: "block", reason: `\`${prog} -p ${n}\` would print a secret value`, suggestion: R1_SUGGESTION };
     }
     if (["curl", "http", "wget"].includes(prog)) {
@@ -1312,36 +1373,44 @@ const WHOLE_TREE_GLOB_LEAF_RE = /\/(\*|\.(?:\[[^\]/]*\]|\?|\*)*\*)$/;
 // Cwd-level and parent-level whole-tree globs: `*`, `./*`, `.??*`, `./.??*`, `../*`, `../.??*`, `../../*`, `../..*`.
 const CWD_GLOB_RE = /^(?:\.\/)*(?:\*|\.(?:\[[^\]/]*\]|\?|\*)*\*)$/;
 const UP_GLOB_RE = /^(?:\.\.\/)+(?:\*|\.(?:\[[^\]/]*\]|\.|\?|\*)*\*)$/;
+// A chain of parent directories (`../..`, `../../..`): the ancestors of the cwd, as `..` alone already is.
+const UP_CHAIN_RE = /^(?:\.\.\/)+\.\.$/;
 /** Does `a` lexically resolve to `/`, to `home`, or to a top-level system tree once `.`/`..` segments and duplicate
  *  slashes are collapsed (shell.mjs's normalizePath -- string-level only, no fs access)? `/tmp/..` and
  *  `~/projects/../..` both resolve to / or home the same way an unguarded literal does; a literal-string
- *  comparison never sees past the dot-segment trick. A relative path (no leading `/` and not home-relative)
- *  can't be resolved without a known cwd, so it's left alone. */
-function resolvesToRootOrHome(a, home) {
+ *  comparison never sees past the dot-segment trick. With a known absolute `cwd`, a relative operand (`../../..`, `.`, `*`,
+ *  `build`) and a `$PWD`/`$(pwd)`/`` `pwd` ``/`~+` anchor resolve against it the same way (`rm -rf $PWD/..` from the home
+ *  directory's child is the home directory). Without a cwd a relative path can't be resolved and is left alone. A word that
+ *  starts with `$`, `~` or a backtick is a variable or substitution the text cannot resolve, so it is left alone too. */
+function resolvesToRootOrHome(a, home, cwd = "") {
   const homeRoot = home || UNKNOWN_HOME;
-  const p = a.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, homeRoot);
+  let p = a.replace(/^\$\{HOME\}|^\$HOME|^~(?=\/|$)/, homeRoot);
+  if (cwd.startsWith("/")) {
+    if (PWD_ANCHOR_RE.test(p)) p = p.replace(PWD_ANCHOR_RE, cwd);
+    else if (p !== "" && !/^[/$~`(]/.test(p)) p = `${cwd}/${p}`;
+  }
   if (!p.startsWith("/")) return false;
   // `/usr/*` and `/usr/.*` empty the whole tree just as `/usr` does: the trailing whole-tree glob doesn't change the target.
   const n = trimSlash(normalizePath(p.replace(/\/+$/, "").replace(WHOLE_TREE_GLOB_LEAF_RE, "") || "/"));
   return n === "/" || n === trimSlash(normalizePath(homeRoot)) || SYSTEM_TREE_ROOTS.has(n);
 }
-function wholeTreeTarget(a, home) {
+function wholeTreeTarget(a, home, cwd = "") {
   if (["/", "/*", "~", "~/", "$HOME", "${HOME}", "*", ".", "./", "..", "../", "./*", ".*", "./.*", ".[!.]*", "./.[!.]*"].includes(a)) return a;
   const t = a.replace(/(?<=.)\/+$/, "");
-  if (CWD_GLOB_RE.test(t) || UP_GLOB_RE.test(t)) return a;
+  if (CWD_GLOB_RE.test(t) || UP_GLOB_RE.test(t) || UP_CHAIN_RE.test(t)) return a;
   let p = expand(a, home);
   if (p.endsWith("/*")) p = p.slice(0, -2);
   if (p.replace(/\/+$/, "") === "~") return a;
-  if (resolvesToRootOrHome(a, home)) return a;
+  if (resolvesToRootOrHome(a, home, cwd)) return a;
   return null;
 }
 // `rm -rf $(ls -d ../*)`: the substitution's output is unknown lexically, but a whole-tree glob inside it
 // expands to the whole tree. Only glob-bearing words count, so `$(find . -name x)` isn't flagged.
-function substWholeTreeGlob(args, home) {
+function substWholeTreeGlob(args, home, cwd = "") {
   if (!args.some((a) => /\$\(|`/.test(a))) return null;
   for (const a of args) {
     const w = a.replace(/^[\s$(`"']+|[\s)`"']+$/g, "");
-    if (/[*?[]/.test(w) && wholeTreeTarget(w, home)) return w;
+    if (/[*?[]/.test(w) && wholeTreeTarget(w, home, cwd)) return w;
   }
   return null;
 }
@@ -1513,9 +1582,9 @@ function* destructiveMatches(ctx) {
       if (!isRecursiveRm(args)) continue;
       for (const a of args) {
         if (a.startsWith("-")) continue;
-        if (wholeTreeTarget(a, ctx.home)) yield m(`\`rm -rf ${a}\` would delete a whole tree`);
+        if (wholeTreeTarget(a, ctx.home, ctx.cwd)) yield m(`\`rm -rf ${a}\` would delete a whole tree`);
       }
-      const subst = substWholeTreeGlob(args, ctx.home);
+      const subst = substWholeTreeGlob(args, ctx.home, ctx.cwd);
       if (subst) yield m(`\`rm -rf\` on a command substitution that expands \`${subst}\` would delete a whole tree`);
     }
     // Item-feeding indirections (xargs/parallel) and find -exec/-execdir/-ok/-okdir: the invoked argv is
@@ -1614,9 +1683,13 @@ function* destructiveMatches(ctx) {
       yield m("\`pip install\` from a file path or custom index runs arbitrary setup code at install time");
     }
     if ((prog === "chmod" || prog === "chown") && args.some((a) => a === "--recursive" || (a.startsWith("-") && !a.startsWith("--") && a.includes("R")))) {
+      // Only a target that RESOLVES to /, home or a system root is a hard block. `.`, `./`, `*`, `./*` name the cwd: with a
+      // known cwd they resolve like any other path (`chmod -R 755 .` in a project is routine); with no cwd they cannot be
+      // told apart from a catastrophic one, so they ask.
       for (const a of args.slice(1)) {
         if (a.startsWith("-")) continue;
-        if (wholeTreeTarget(a, ctx.home)) yield block(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
+        if (resolvesToRootOrHome(a, ctx.home, ctx.cwd)) yield block(`\`${prog} -R\` on \`${a}\` rewrites permissions on a whole tree`);
+        else if (!ctx.cwd.startsWith("/") && wholeTreeTarget(a, ctx.home)) yield m(`\`${prog} -R ${a}\` rewrites permissions on the current directory tree, and the working directory is unknown`);
       }
     }
   }
@@ -1668,7 +1741,7 @@ function rdUnquote(tok) {
 const UNGUARDED_VAR_PATH_RE = /^\$\{?([A-Za-z_][A-Za-z_0-9]*)\}?(\/?\*?)$/;
 /** Is `value` itself a literal that resolves to / or home (reused so an assigned value can be checked the
  *  same way an operand is: `BUILD_DIR=~; rm -rf $BUILD_DIR` must still block). */
-function isRootOrHomeLiteral(a, home) {
+function isRootOrHomeLiteral(a, home, cwd = "") {
   if (a.replace(/^\/+|\/+$/g, "") === "" && a.startsWith("/")) return true;
   if (["/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*"].includes(a)) return true;
   if (/^~[A-Za-z_][\w.-]*(\/?\*?)$/.test(a)) return true; // ~root/~user: another user's whole home tree
@@ -1677,7 +1750,7 @@ function isRootOrHomeLiteral(a, home) {
   if (p.replace(/\/+$/, "") === "~") return true;
   // `.`/`..`-normalized literals resolve to the same catastrophe (`rm -rf /tmp/..` IS `rm -rf /`):
   // routed here so they hit R7-root-delete's block, not wholeTreeTarget's ask (the g114 parity fix).
-  return resolvesToRootOrHome(a, home);
+  return resolvesToRootOrHome(a, home, cwd);
 }
 /** Does the LAST assignment to `name` across `segments` (in document order) give it a literal, non-empty,
  *  non-root/home value this same command — as its own `VAR=value`/`export VAR=value` segment, or as a
@@ -1716,7 +1789,9 @@ function assignedValue(name, segments, home) {
 function assignedSafeValue(name, segments, home) {
   return assignedValue(name, segments, home) === "safe";
 }
-function rdRootOrHome(aIn, home, segments) {
+function rdRootOrHome(aIn, home, segments, cwd = "") {
+  // A relative operand or a $PWD/$(pwd)/`pwd` anchor that resolves (against the cwd) to /, home or a system tree.
+  if (cwd && resolvesToRootOrHome(aIn, home, cwd)) return true;
   let a = aIn;
   if (a.endsWith(")") && !a.includes("(")) a = a.replace(/\)+$/, "");
   if (a.endsWith(";")) a = a.replace(/;+$/, "");
@@ -1730,7 +1805,7 @@ function rdRootOrHome(aIn, home, segments) {
   const alias = /^([^/]+)(\/.*)?$/.exec(a);
   const targets = alias ? linkAliases(segments || []) : null;
   if (targets && targets.has(alias[1])) a = (targets.get(alias[1]).replace(/\/+$/, "") + (alias[2] || "")) || "/";
-  if (isRootOrHomeLiteral(a, home)) return true;
+  if (isRootOrHomeLiteral(a, home, cwd)) return true;
   const varMatch = UNGUARDED_VAR_PATH_RE.exec(a);
   if (varMatch) return !assignedSafeValue(varMatch[1], segments, home);
   // ${VAR:OPword} parameter modifiers -- each operator substitutes a DIFFERENT thing, so each has
@@ -1755,7 +1830,7 @@ function rdRootOrHome(aIn, home, segments) {
   }
   return false;
 }
-function rdHit(seg, home, depth = 0, segments = [seg]) {
+function rdHit(seg, home, depth = 0, segments = [seg], cwd = "") {
   // The same resolveCommand walk every rule uses (keywords, wrappers, indirections, elevation): the
   // old rdCommand peeled its own subset and silently missed anything outside it (doas worked, stdbuf
   // -o L ate the wrong token, pkexec/systemd-run/keywords never existed).
@@ -1763,7 +1838,7 @@ function rdHit(seg, home, depth = 0, segments = [seg]) {
   const script = depth < 2 ? scriptOf(prog, argsRaw, { interp: false }) : null;
   if (script !== null) {
     for (const inner of splitSegments(script)) {
-      const hit = rdHit(inner, home, depth + 1, segments);
+      const hit = rdHit(inner, home, depth + 1, segments, cwd);
       if (hit) return hit;
     }
     return null;
@@ -1774,7 +1849,7 @@ function rdHit(seg, home, depth = 0, segments = [seg]) {
   const opts = args.slice(0, end).filter((a) => a.startsWith("-"));
   const operands = [...args.slice(0, end).filter((a) => !a.startsWith("-")), ...args.slice(end + 1)];
   if (!opts.some((a) => a === "--recursive" || (!a.startsWith("--") && /r/i.test(a)))) return null;
-  for (const a of operands) if (rdRootOrHome(a, home, segments)) return a;
+  for (const a of operands) if (rdRootOrHome(a, home, segments, cwd)) return a;
   return null;
 }
 function ruleRootDelete(ctx) {
@@ -1793,7 +1868,7 @@ function ruleRootDelete(ctx) {
     // (ctx.segments), never a segment pulled from inside a $(...)/backtick substitution: an assignment
     // that only ran inside a subshell never reaches the outer shell's $VAR, so treating it as proof of
     // safety would be wrong in the unsafe direction.
-    const hit = rdHit(seg, ctx.home, 0, ctx.segments);
+    const hit = rdHit(seg, ctx.home, 0, ctx.segments, ctx.cwd);
     if (hit) return { rule: "R7-root-delete", severity: "block", strict: true, reason: `\`rm -r ${hit}\` would delete the whole filesystem or home directory`, suggestion: R7_ROOT_SUGGESTION };
   }
   return null;

@@ -1264,12 +1264,14 @@ test("round 10 P2-3: full-environment dumps block in every spelling; secret-free
 });
 test("round 10 P2-4: dot-led and ../ globs ask at cwd, block under ~ and /; ../build subtrees stay allowed", async () => {
   for (const c of ["rm -rf .??*", "rm -rf .[a-z]*", "rm -rf .?*", "rm -rf ./.??*", "cd ~ && rm -rf .??*",
-    "rm -rf ../*", "rm -rf ../.*", "rm -rf ../.??*", "rm -rf ../../*", "rm -rf $(ls -d ../*)", "rm -rf $(ls -d *)"]) {
+    "rm -rf ../*", "rm -rf ../.*", "rm -rf ../.??*", "rm -rf $(ls -d ../*)", "rm -rf $(ls -d *)"]) {
     const r = await g(c);
     assert.equal(r.decision, "ask", c);
     assert.equal(r.rule, "R7-destructive", c);
   }
-  for (const c of ["rm -rf ~/.??*", "rm -rf ~/.[a-z]*", "rm -rf ~/.*/", "rm -rf /.??*", "rm -rf ${HOME}/.*"]) {
+  for (const c of ["rm -rf ~/.??*", "rm -rf ~/.[a-z]*", "rm -rf ~/.*/", "rm -rf /.??*", "rm -rf ${HOME}/.*",
+    // from /home/u/proj, `../../*` is the contents of /home (round 24: relative operands resolve against the cwd)
+    "rm -rf ../../*"]) {
     const r = await g(c);
     assert.equal(r.decision, "block", c);
     assert.equal(r.rule, "R7-root-delete", c);
