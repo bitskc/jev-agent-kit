@@ -1730,7 +1730,7 @@ test("F3: 2000 non-check Bash calls decide in linear time, with a capped evidenc
   assert.ok(stopGate.evidenceText(ev).length <= 8000, "default evidence budget is a real cap");
   assert.ok(/commands omitted/.test(stopGate.evidenceText(ev)));
 });
-test("F3: evidence is built only when a block needs it, and keeps the newest failing check when trimmed", async () => {
+test("F3: the capped evidence keeps the newest failing check when 300 long runs are trimmed", async () => {
   const noise = Array.from({ length: 300 }, (_, i) => ["echo " + "y".repeat(120) + i, "out" + i]);
   const ev = stopGate.parseForHonest(editThen(["npm test", "  1 failing", true], ...noise));
   const text = stopGate.evidenceText(ev);
@@ -1738,14 +1738,16 @@ test("F3: evidence is built only when a block needs it, and keeps the newest fai
   assert.match(text, /`npm test` -> failed/);
 });
 test("F4: many unclosed fence openers and a 200 KB message split in linear time; the claim at the tail survives the input cap", () => {
-  const t0 = Date.now();
-  const stray = stopGate.splitClaims("```text\n".repeat(25000) + "All tests pass and the build is clean.");
-  const paired = stopGate.splitClaims("```text\nhello there\n".repeat(7000) + "```\n".repeat(7000) + "All tests pass and the build is clean.");
-  const ms = Date.now() - t0;
-  assert.ok(ms < 2500, `splitClaims took ${ms}ms (each opener rescanned to the end of the message)`);
+  const timed = (message) => { const t0 = Date.now(); const claims = stopGate.splitClaims(message); return { claims, ms: Date.now() - t0 }; };
+  // The input is capped at 60000 characters, so even a quadratic scan is bounded; the bound is set well under what a
+  // per-opener rescan of a capped message costs (~180-320ms) and well over the one-pass scan (a few ms).
+  const { claims: stray, ms: msStray } = timed("```text\n".repeat(25000) + "All tests pass and the build is clean.");
+  const { claims: paired, ms: msPaired } = timed("```text\nhello there\n".repeat(7000) + "```\n".repeat(7000) + "All tests pass and the build is clean.");
+  assert.ok(msStray < 120 && msPaired < 120, `splitClaims took ${msStray}ms / ${msPaired}ms (each opener rescanned to the end of the message)`);
   assert.deepEqual(stray, ["All tests pass and the build is clean."]);
   assert.equal(paired.at(-1), "All tests pass and the build is clean.");
   assert.ok(stopGate.splitClaims("x\n".repeat(200000) + "Done, all tests pass.").includes("Done, all tests pass."));
+  assert.deepEqual(stopGate.splitClaims("Ancient claim at the very top.\n" + "\n".repeat(70000) + "Final claim at the tail."), ["Final claim at the tail."], "only the last 60000 characters are judged");
 });
 test("F4: fence semantics are unchanged by the one-pass scan (prose fence judged, code fence skipped, nested openers, stray openers)", () => {
   assert.deepEqual(stopGate.splitClaims("Intro line here.\n```text\nAll tests pass here.\n```\nOutro line here."), ["Intro line here.", "All tests pass here.", "Outro line here."]);
