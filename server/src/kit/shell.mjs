@@ -10,43 +10,56 @@
 import { posix as posixPath } from "node:path";
 export const ASSIGN_RE = /^[A-Za-z_][A-Za-z_0-9]*=/;
 
-/** Split a command line on ; && || | & and newlines, respecting quotes, KEEPING each separator. Returns
- *  alternating [content, separator, content, ..., content]: even indices are content, odd are separators. */
-export function splitKeep(command) {
-  const parts = [];
-  let buf = [];
-  let quote = null;
-  // Real bash deletes backslash-newline pairs BEFORE tokenizing (line continuation); folding them here,
-  // outside quotes, keeps `rm -rf \<newline>/` one `/` token the way bash sees it.
-  const s = (command || "").replace(/\\\r?\n/g, "");
+/** The cut points of a (line-continuation-folded) command: for each separator, where the content before it ends, where the
+ *  separator ends, and its text. One linear scan; content k is s.slice(k === 0 ? 0 : sepEnds[k - 1], contentEnds[k]). */
+function scanCuts(s) {
+  const contentEnds = [];
+  const sepEnds = [];
+  const seps = [];
   const n = s.length;
+  let quote = null;
   let i = 0;
-  const cut = (sep) => { parts.push(buf.join(""), sep); buf = []; };
+  const cut = (at, end) => { contentEnds.push(at); sepEnds.push(end); seps.push(s.slice(at, end)); };
   while (i < n) {
     const ch = s[i];
     if (quote) {
-      buf.push(ch);
       // `\"` inside a double-quoted run is an escaped quote, not a closer — the same rule words() and
       // splitPipelines() apply. Without it, `bash -c "bash -c \"rm -rf /\""` shredded the inner -c's
       // script at its \" boundary and every downstream rule saw mangled text.
-      if (ch === "\\" && quote === '"' && i + 1 < n) { buf.push(s[i + 1]); i += 2; continue; }
+      if (ch === "\\" && quote === '"' && i + 1 < n) { i += 2; continue; }
       if (ch === quote) quote = null;
       i++;
       continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; buf.push(ch); i++; continue; }
-    if (ch === "\\" && i + 1 < n) { buf.push(ch, s[i + 1]); i += 2; continue; }
-    if (ch === ";" || ch === "\n") { cut(ch); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+    if (ch === "\\" && i + 1 < n) { i += 2; continue; }
+    if (ch === ";" || ch === "\n") { cut(i, i + 1); i++; continue; }
     if (ch === "&" || ch === "|") {
       const start = i;
       while (i < n && (s[i] === "&" || s[i] === "|")) i++;
-      cut(s.slice(start, i));
+      cut(start, i);
       continue;
     }
-    buf.push(ch);
     i++;
   }
-  parts.push(buf.join(""));
+  return { contentEnds, sepEnds, seps };
+}
+// Real bash deletes backslash-newline pairs BEFORE tokenizing (line continuation); folding them here,
+// outside quotes, keeps `rm -rf \<newline>/` one `/` token the way bash sees it.
+const foldContinuations = (command) => (command || "").replace(/\\\r?\n/g, "");
+
+/** Split a command line on ; && || | & and newlines, respecting quotes, KEEPING each separator. Returns
+ *  alternating [content, separator, content, ..., content]: even indices are content, odd are separators. */
+export function splitKeep(command) {
+  const s = foldContinuations(command);
+  const { contentEnds, sepEnds, seps } = scanCuts(s);
+  const parts = [];
+  let from = 0;
+  for (let k = 0; k < contentEnds.length; k++) {
+    parts.push(s.slice(from, contentEnds[k]), seps[k]);
+    from = sepEnds[k];
+  }
+  parts.push(s.slice(from));
   return parts;
 }
 
@@ -70,7 +83,14 @@ const RUNUSER_VALUE_OPTS = new Set(["-u", "--user", "-s", "--shell", "-g", "--gr
  *  an exotic literal. */
 // Words after which a `(` opens a grouping subshell (`if (cmd)`, `{ (cmd); }`, `! (cmd)`) rather than continuing the word.
 const PAREN_KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "time", "coproc", "select", "{", "!"]);
+// A long segment is tokenized many times (every rule asks for the same command's words); keep the last few results.
+const WORDS_MEMO_MIN = 512;
+const wordsMemo = new Map();
 export function words(segment) {
+  if (segment && segment.length >= WORDS_MEMO_MIN) {
+    const hit = wordsMemo.get(segment);
+    if (hit) return hit.slice();
+  }
   const out = [];
   let buf = "";
   let quote = null;
@@ -111,7 +131,8 @@ export function words(segment) {
     }
     if (ch === "'" || ch === '"') { quote = ch; inWord = true; continue; }
     if (ch === "\\" && i + 1 < n) { buf += s[i + 1]; i++; inWord = true; continue; }
-    if (/\s/.test(ch)) { flush(); continue; }
+    const code = ch.charCodeAt(0); // ASCII whitespace without a regex per character; non-ASCII falls back to \s
+    if (code === 32 || (code >= 9 && code <= 13) || (code > 127 && /\s/.test(ch))) { flush(); continue; }
     if (ch === "(") {
       // A `(` right after a word that is not a shell keyword is not shell grouping (`name(` is a function head or an
       // interpreter call such as `console.log(process.env.HOME)` inside a `node -e` payload): it stays in the word.
@@ -137,7 +158,11 @@ export function words(segment) {
     buf += ch; inWord = true;
   }
   flush();
-  return out;
+  if (s.length >= WORDS_MEMO_MIN) {
+    if (wordsMemo.size >= 32) wordsMemo.clear();
+    wordsMemo.set(s, out);
+  }
+  return out.slice(); // callers may keep or edit the array: hand out a copy of the memoized one
 }
 
 /** Decode one ANSI-C escape at s[0]==="\\" inside a $'...' run: \xNN and the common one-char escapes.
@@ -550,19 +575,33 @@ export function pipeFedScripts(command) {
 
 /** Bodies of process substitutions `<(…)` / `>(…)`: bash runs each body as a command whose output feeds the outer
  *  command (`cat <(rm -rf /)`). Balanced-paren scan, quote-unaware on purpose: a body inside quotes is still text
- *  a rule can see, so over-reporting is the safe side. Nested substitutions are found by continuing past the opener. */
+ *  a rule can see, so over-reporting is the safe side. Nested substitutions are found by continuing past the opener.
+ *  One linear pass (a stack matches every `(` to its `)`). Each nested body contains the next, so analyzing all of a deep
+ *  nest costs the square of its depth: bodies are returned outermost first until their total length passes
+ *  PROC_SUB_CHAR_BUDGET, and the array's `truncated` flag says the rest were left out (the caller asks). Flat
+ *  substitutions are short, so every one of them is returned. */
+export const PROC_SUB_CHAR_BUDGET = 64000;
 export function processSubBodies(command) {
   const s = command || "";
+  const n = s.length;
+  const openers = [];
+  const stack = [];
+  const match = new Map();
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
+    if (ch === "(") {
+      stack.push(i);
+      if (i > 0 && (s[i - 1] === "<" || s[i - 1] === ">")) openers.push(i);
+    } else if (ch === ")" && stack.length) match.set(stack.pop(), i);
+  }
   const out = [];
-  for (let i = 0; i + 1 < s.length; i++) {
-    if ((s[i] !== "<" && s[i] !== ">") || s[i + 1] !== "(") continue;
-    let depth = 0;
-    let j = i + 1;
-    for (; j < s.length; j++) {
-      if (s[j] === "(") depth++;
-      else if (s[j] === ")" && --depth === 0) break;
-    }
-    out.push(s.slice(i + 2, j));
+  out.truncated = false;
+  let spent = 0;
+  for (const at of openers) {
+    const end = match.get(at) ?? n;
+    spent += end - at;
+    if (spent > PROC_SUB_CHAR_BUDGET) { out.truncated = true; break; }
+    out.push(s.slice(at + 1, end));
   }
   return out;
 }
@@ -1025,23 +1064,47 @@ export function shellCodeOnly(command) {
 }
 
 const SUBST_RE = /\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)/g;
-/** Segments of every `$(...)` / backtick substitution (an assignment's value is skipped). */
+// Substitutions whose leading segment is checked exactly (an assignment's value is skipped); past this many, the skip is not
+// applied, so every further inner command is reported. That can only add segments to look at, never hide one.
+export const SUBST_EXACT_LIMIT = 128;
+let lastSubst = { command: null, out: [] };
+/** Segments of every `$(...)` / backtick substitution (an assignment's value is skipped). Linear in the command: the segment
+ *  boundaries are scanned once, and each substitution looks up the segment it sits in by position. The result is memoized for
+ *  the last command, since several rules ask for it. */
 export function substitutedSegments(command) {
+  if (lastSubst.command === command) return lastSubst.out;
   const out = [];
   try {
-    const cmd = stripHeredocs(command);
-    for (const m of cmd.matchAll(SUBST_RE)) {
-      const before = splitSegments(cmd.slice(0, m.index));
-      const toks = before.length ? words(before[before.length - 1]) : [];
-      if (toks.length && toks.every((t) => ASSIGN_RE.test(t) || ["export", "local", "readonly", "declare", "typeset"].includes(t))) continue;
+    const s = foldContinuations(stripHeredocs(command));
+    const { contentEnds, sepEnds } = scanCuts(s);
+    const segStart = (k) => (k === 0 ? 0 : sepEnds[k - 1]);
+    const segEnd = (k) => (k < contentEnds.length ? contentEnds[k] : s.length);
+    // last non-blank complete segment at or before k (-1 if none), for a substitution that opens a new segment
+    const nonBlank = [];
+    let lastNb = -1;
+    for (let k = 0; k < contentEnds.length; k++) {
+      if (/\S/.test(s.slice(segStart(k), contentEnds[k]))) lastNb = k;
+      nonBlank.push(lastNb);
+    }
+    let cut = 0; // cuts that end before the current match
+    let count = 0;
+    for (const m of s.matchAll(SUBST_RE)) {
+      if (count++ < SUBST_EXACT_LIMIT) {
+        while (cut < contentEnds.length && contentEnds[cut] < m.index) cut++;
+        let lead = s.slice(segStart(cut), m.index);
+        if (!/\S/.test(lead) && cut > 0) lead = nonBlank[cut - 1] >= 0 ? s.slice(segStart(nonBlank[cut - 1]), segEnd(nonBlank[cut - 1])) : "";
+        const toks = /\S/.test(lead) ? words(lead.trim()) : [];
+        if (toks.length && toks.every((t) => ASSIGN_RE.test(t) || ["export", "local", "readonly", "declare", "typeset"].includes(t))) continue;
+      }
       // <(cmd)/>(cmd) process substitution: the inner command line is literal text that runs
       // (diff <(cat ~/.env) really executes cat on the secret) -- extracted like $(...) since it IS
       // executed code, unlike the opaque data a substitution PRODUCES at runtime.
       let inner = m[1] !== undefined ? m[1] : m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : m[4]);
       if (inner.startsWith("<")) inner = "cat " + inner.slice(1);
-      out.push(...splitSegments(inner));
+      for (const seg of splitSegments(inner)) out.push(seg);
     }
-  } catch { return []; }
+  } catch { lastSubst = { command: null, out: [] }; return []; }
+  lastSubst = { command, out };
   return out;
 }
 

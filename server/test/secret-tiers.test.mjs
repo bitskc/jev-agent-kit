@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { guardCommand } from "../src/kit/guard.mjs";
-import { words, peelCommand, programOf } from "../src/kit/shell.mjs";
+import { words, peelCommand, programOf, splitKeep, substitutedSegments, processSubBodies, PROC_SUB_CHAR_BUDGET, SUBST_EXACT_LIMIT } from "../src/kit/shell.mjs";
 
 // Secret reads are decided by token shape, not argv position. Every test here asserts the guard's DECISION (and rule)
 // for a command string passed to guardCommand(); no command in this file is ever executed, and no fixture files are
@@ -876,4 +876,114 @@ test("round 21b: past the nesting cap a soft ask keeps its own reason", async ()
   const r = await guard("(".repeat(65) + "sort credentials" + ")".repeat(65), PROJ, HOME);
   assert.equal(r.decision, "ask");
   assert.match(r.reason, /bare credential word/);
+});
+
+// ── Round 21c ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+// Repeated and nested substitutions used to cost a re-scan of the command per substitution (quadratic): 2000 `$(ls)` took
+// 2.6 s and 4000 nested `<(` took 4.4 s, past the hook's timeout, which fails open. The bounds are generous.
+const timedGuard = async (cmd, ms = 500) => {
+  const t0 = performance.now();
+  const r = await guard(cmd, PROJ, HOME);
+  const took = performance.now() - t0;
+  assert.ok(took < ms, `${took.toFixed(0)} ms for ${cmd.slice(0, 24)}... (${cmd.length} chars)`);
+  return r;
+};
+const rep = (s, n) => s.repeat(n);
+test("round 21c: repeated command substitution is decided quickly and a later block still blocks", async () => {
+  for (const n of [1000, 2000, 2500]) {
+    const r = await timedGuard(`echo ${rep("$(ls)", n)}; cat .env`);
+    assert.equal(r.decision, "block", String(n));
+    assert.equal(r.rule, "R1-secret-exposure");
+  }
+  assert.equal((await timedGuard(`${rep("$(ls)", 3900)}; cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`${rep("x=$(ls); ", 2000)}cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`${rep("\`ls\`;", 3000)}cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`${rep("\`ls\`", 3300)}; cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`${rep("<(ls) ", 2500)}; cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`echo ${rep("$(ls)", 2000)}; rm -rf /`)).rule, "R7-root-delete");
+  const benign = await timedGuard(`echo ${rep("$(ls)", 2000)}`);
+  assert.equal(benign.decision, "ask");
+  assert.match(benign.reason, /command substitutions/);
+  assert.equal((await timedGuard(rep("\`ls\`", 3000))).decision, "ask");
+  assert.equal((await timedGuard(`echo ${rep("\`", 9000)}`)).decision, "ask");
+});
+
+test("round 21c: nested process substitution is decided quickly and a later block still blocks", async () => {
+  for (const n of [1000, 3000, 4000]) {
+    const r = await timedGuard(`cat ${rep("<(", n)}ls${rep(")", n)}; rm -rf /`);
+    assert.equal(r.decision, "block", String(n));
+    assert.equal(r.rule, "R7-root-delete");
+  }
+  assert.equal((await timedGuard(`cat ${rep("<(", 4000)}ls${rep(")", 4000)}; cat .env`)).decision, "block");
+  assert.equal((await timedGuard(`cat ${rep("<(", 5000)}ls${rep(")", 5000)}`)).decision, "ask");
+  assert.equal((await timedGuard(`cat ${rep(">(", 2000)}ls${rep(")", 2000)}`)).decision, "ask");
+  // the outer bodies are still analyzed: a secret read inside the outermost bodies blocks
+  assert.equal((await timedGuard(`cat ${rep("<(", 5000)}cat .env${rep(")", 5000)}`)).decision, "block");
+});
+
+test("round 21c: small substitutions decide as before", async () => {
+  for (const [cmd, want] of [
+    ["<(cat .env)", "block"], ["cat <(cat .env)", "block"], ["$(cat .env)", "block"], ["diff <(cat .env) b", "block"], ["echo `cat .env`", "block"],
+    ["x=$(cat .env)", "allow"], ["echo $(ls)", "allow"], ["cat <(echo hi)", "allow"], ["cat <(<(cat .env))", "block"], ["echo $(ls); cat .env", "block"],
+  ]) {
+    assert.equal((await guard(cmd, PROJ, HOME)).decision, want, cmd);
+  }
+});
+
+test("round 21c: the ask starts past 256 substitutions or past the process-substitution budget; nothing below it changes", async () => {
+  assert.equal((await guard(`echo ${rep("$(ls)", 256)}`, PROJ, HOME)).decision, "allow");
+  assert.equal((await guard(`echo ${rep("$(ls)", 257)}`, PROJ, HOME)).decision, "ask");
+  // many flat process substitutions are all analyzed: a block in the last one still blocks, and none asks
+  assert.equal((await guard(`cat ${rep("<(ls) ", 20)}<(rm -rf /)`, PROJ, HOME)).rule, "R7-root-delete");
+  assert.equal((await guard(`cat ${rep("<(ls) ", 20)}`, PROJ, HOME)).decision, "allow");
+  const deep = await guard(`cat ${rep("<(", 5000)}ls${rep(")", 5000)}`, PROJ, HOME);
+  assert.equal(deep.decision, "ask");
+  // few substitutions but bodies that nest over long text: past the body budget the process-substitution ask applies
+  const padded = await guard(`cat ${rep("<(", 60)}${rep("x", 1200)}${rep(")", 60)}`, PROJ, HOME);
+  assert.equal(padded.decision, "ask");
+  assert.match(padded.reason, /nests process substitutions/);
+  assert.equal((await guard(`cat ${rep("<(", 60)}${rep("x", 1200)}${rep(")", 60)}; cat .env`, PROJ, HOME)).decision, "block");
+  assert.equal((await guard(`cat ${rep("<(", 60)}${rep("x", 600)}${rep(")", 60)}`, PROJ, HOME)).decision, "allow");
+  // an existing ask keeps its own reason, and the block of a later rule still wins
+  const credAsk = await guard(`sort credentials; echo ${rep("$(ls)", 300)}`, PROJ, HOME);
+  assert.equal(credAsk.decision, "ask");
+  assert.match(credAsk.reason, /bare credential word/);
+  // a block wins over the ask, and a secret read past the exact-check limit is still reported
+  assert.equal((await guard(`echo ${rep("$(ls)", SUBST_EXACT_LIMIT + 50)}$(cat .env)`, PROJ, HOME)).decision, "block");
+  assert.equal((await guard(`echo ${rep("$(ls)", 300)}$(cat .env)`, PROJ, HOME)).decision, "block");
+  assert.equal((await guard(`${rep("$(ls)", SUBST_EXACT_LIMIT + 50)}; x=$(cat .env)`, PROJ, HOME)).decision, "block");
+});
+
+test("round 21c: the single-pass splitters agree with the segment rules", () => {
+  assert.deepEqual(splitKeep("a;b && c\\\n d | 'x;y' \"q\\\";\" e\nf&"), ["a", ";", "b ", "&&", " c d ", "|", " 'x;y' \"q\\\";\" e", "\n", "f", "&", ""]);
+  assert.deepEqual(splitKeep(""), [""]);
+  assert.deepEqual(substitutedSegments("x=$(ls); echo $(cat a) `cat b`"), ["cat a", "cat b"]);
+  assert.deepEqual(substitutedSegments("; ; x=$(ls)"), []);
+  assert.deepEqual(substitutedSegments("echo a;\n\n $(cat a)"), ["cat a"]);
+  // kept as it was (a substitution that opens a segment inherits the previous non-blank segment's assignment check)
+  assert.deepEqual(substitutedSegments("x=1;\n $(cat a)"), []);
+  assert.deepEqual(substitutedSegments("diff <(cat a) >(tee b)"), ["cat a", "tee b"]);
+  assert.deepEqual([...processSubBodies("a <(b <(c) d) e >(f")], ["b <(c) d", "c", "f"]);
+  assert.deepEqual([...processSubBodies("x <(a))) y <(b")], ["a", "b"]);
+  const nest = processSubBodies(rep("<(", 100) + "ls" + rep(")", 100));
+  assert.equal(nest.length, 100);
+  assert.equal(nest.truncated, false);
+  assert.equal(nest[0], rep("<(", 99) + "ls" + rep(")", 99));
+  const deep = processSubBodies(rep("<(", 5000) + "ls" + rep(")", 5000));
+  assert.equal(deep.truncated, true);
+  assert.ok(deep.length >= 1 && deep.length < 10);
+  assert.ok(deep.reduce((n, b) => n + b.length, 0) <= PROC_SUB_CHAR_BUDGET);
+});
+
+test("round 21c: words() of a long segment is memoized without sharing the array", () => {
+  const seg = "echo " + rep("$(ls) ", 200);
+  const a = words(seg);
+  a.push("mutated");
+  a[0] = "changed";
+  const b = words(seg);
+  assert.equal(b[0], "echo");
+  assert.equal(b.length, 201);
+  b[0] = "changed again";
+  assert.equal(words(seg)[0], "echo");
+  assert.deepEqual(words("a\u00a0b\tc\u2003d"), ["a", "b", "c", "d"]);
 });

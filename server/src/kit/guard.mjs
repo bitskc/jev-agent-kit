@@ -2076,6 +2076,9 @@ export function readChoice(a, keys) {
   return { choice: a.choice, confidence, margin };
 }
 
+const MAX_SUBSTITUTIONS = 256;
+/** Count of command-substitution openers (`$(`, `<(`, `>(`, and each backtick). Linear. */
+const substitutionCount = (command) => (command.match(/\$\(|[<>]\(|`/g) || []).length;
 // ── nesting cap ──────────────────────────────────────────────────────────────
 const MAX_GROUPING_DEPTH = 64;
 /** Deepest run of unquoted open `(` / `{` in a command (one linear scan; closers lower the count, never below 0). */
@@ -2185,6 +2188,12 @@ export async function guardCommand(input, deps = {}) {
   // rule blocked asks instead of passing (a block above still wins).
   if (!softAsk && SHELL_TOOLS.has(tool) && groupingDepth(command) > MAX_GROUPING_DEPTH) {
     softAsk = { rule: "R10-general-risk", reason: `the command nests grouping (parentheses or braces) more than ${MAX_GROUPING_DEPTH} deep, which the guard does not analyze; confirm it is intended`, suggestion: null };
+  }
+  // Past these limits the guard stops analyzing inner bodies (see substitutedSegments and processSubBodies), so a command
+  // that no rule blocked asks instead of passing.
+  if (!softAsk && SHELL_TOOLS.has(tool)) {
+    if (command.length > MAX_SUBSTITUTIONS && substitutionCount(command) > MAX_SUBSTITUTIONS) softAsk = { rule: "R10-general-risk", reason: `the command holds more than ${MAX_SUBSTITUTIONS} command substitutions, which the guard does not fully analyze; confirm it is intended`, suggestion: null };
+    else if (procBodies.truncated) softAsk = { rule: "R10-general-risk", reason: "the command nests process substitutions (`<(`, `>(`) too deeply for the guard to analyze every body; confirm it is intended", suggestion: null };
   }
   if (softAsk) {
     out.decision = "ask"; out.score = 0.7;
