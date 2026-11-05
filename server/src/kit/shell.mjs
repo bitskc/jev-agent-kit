@@ -480,14 +480,26 @@ function foldText(text, vars) {
   return cur;
 }
 
-/** A chunk that is a lone assignment: no whitespace left once quoted runs and substitutions are blanked. */
-const assignOnly = (body) => !/\s/.test(body.trim().replace(/'[^']*'|"[^"]*"|\$\([^()]*\)|`[^`]*`/g, ""));
+/** Quoted runs and substitutions blanked to same-length filler, so offsets stay aligned with the chunk. */
+const BLANK_RE = /'[^']*'|"[^"]*"|\$\([^()]*\)|`[^`]*`/g;
+
+/** Offset of the last whitespace that has a non-space character after it, once quoted runs and substitutions are
+ *  blanked: a lone assignment starting after it has no whitespace left. -1 when there is none. Computed once
+ *  per chunk, so the per-word check below is O(1) rather than a re-scan of the whole suffix (quadratic). */
+function lastInnerSpace(seg) {
+  const blanked = seg.replace(BLANK_RE, (m) => "_".repeat(m.length));
+  let i = blanked.length - 1;
+  while (i >= 0 && /\s/.test(blanked[i])) i--;
+  while (i >= 0 && !/\s/.test(blanked[i])) i--;
+  return i;
+}
 
 /** Fold ONE separator-free chunk. Keywords and declaration builtins are skipped; a lone literal assignment is
  *  recorded in `vars` (and re-emitted as NAME='value'); a prefix assignment (`x=1 cmd`) persists nothing. */
 function foldChunk(seg, vars) {
   let out = "";
   let rest = seg;
+  let innerSpace;
   for (;;) {
     const m = FOLD_WORD_RE.exec(rest);
     if (!m) break;
@@ -497,7 +509,8 @@ function foldChunk(seg, vars) {
       const eq = word.indexOf("=");
       const name = word.slice(0, eq);
       const body = rest.slice(prefix.length);
-      if (assignOnly(body)) {
+      innerSpace ??= lastInnerSpace(seg);
+      if (seg.length - body.length > innerSpace) {
         const folded = foldText(body.slice(eq + 1), vars);
         const value = unquoteNoSplit(folded);
         if (value !== "" && LITERAL_VALUE_RE.test(value)) { vars.set(name, value); return `${out}${prefix}${name}='${value}'`; }
